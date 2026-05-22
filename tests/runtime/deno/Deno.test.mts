@@ -971,7 +971,7 @@ suite("SSE streaming (client.sse)");
 await test("SSEClient parses events from a streaming endpoint", async () => {
   // Use a public SSE endpoint that reliably sends events
   // httpbin /sse sends SSE events (if available), otherwise skip gracefully
-  const { SSEClient } = await import("../src/sse.ts");
+  const { SSEClient } = await import("../../../src/sse.ts");
 
   // Test SSEClient with a real SSE-compatible URL
   // We'll use our own local SSE server if external isn't available
@@ -1016,7 +1016,7 @@ await test("client.graphql() returns a GraphQLClient that can query", async () =
 });
 
 await test("gql() standalone shorthand works", async () => {
-  const { gql } = await import("../src/graphql.ts");
+  const { gql } = await import("../../../src/graphql.ts");
   const result = await gql<{ country: { name: string } }>(
     "https://countries.trevorblades.com/",
     `query { country(code: "DE") { name } }`,
@@ -1062,7 +1062,7 @@ await test("client.paginate() iterates pages correctly", async () => {
 });
 
 await test("createPagePaginator() fetches correct items per page", async () => {
-  const { createPagePaginator } = await import("../src/pagination.ts");
+  const { createPagePaginator } = await import("../../../src/pagination.ts");
 
   // Same httpbin echo trick — each page gets items whose IDs are derived from
   // the page number echoed back by /anything, so consecutive pages differ.
@@ -2261,7 +2261,7 @@ await test("MultiTransport distributes to all inner transports equally", async (
 await test("BatchingTransport flushes on explicit flush() call", async () => {
   const written: unknown[] = [];
   const inner = { write: (e: unknown) => written.push(e) };
-  const transport = new BatchingTransport(inner as import("../src/logging.ts").LogTransport, {
+  const transport = new BatchingTransport(inner as import("../../../src/logging.ts").LogTransport, {
     maxBatch: 100,
     flushMs: 60_000,
   });
@@ -2724,7 +2724,7 @@ await test("CLOSED → OPEN after threshold HTTP 503 failures", async () => {
 });
 
 await test("CircuitOpenError thrown when circuit is OPEN — no network call made", async () => {
-  const { CircuitOpenError } = await import("../src/circuit-breaker.ts");
+  const { CircuitOpenError } = await import("../../../src/circuit-breaker.ts");
   const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: T, throwOnError: true });
   client.enableCircuitBreaker({
     failureThreshold: 2,
@@ -2755,13 +2755,13 @@ await test("CircuitOpenError thrown when circuit is OPEN — no network call mad
     `Expected CircuitOpenError, got ${(caught as Error)?.constructor?.name}: ${(caught as Error)?.message}`,
   );
 
-  const snap = (caught as import("../src/circuit-breaker.ts").CircuitOpenError).state;
+  const snap = (caught as import("../../../src/circuit-breaker.ts").CircuitOpenError).state;
   assertStrictEquals(snap.state, "OPEN");
   assert(snap.totalRejected >= 1, "totalRejected counter must be incremented");
 });
 
 await test("Manual trip → CircuitOpenError; manual reset → requests succeed again", async () => {
-  const { CircuitOpenError } = await import("../src/circuit-breaker.ts");
+  const { CircuitOpenError } = await import("../../../src/circuit-breaker.ts");
   const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: T });
   client.enableCircuitBreaker({ failureThreshold: 100 });
 
@@ -2818,7 +2818,7 @@ await test("Circuit OPEN → HALF_OPEN probe after resetTimeoutMs elapses", asyn
 });
 
 await test("Per-origin isolation: one origin's circuit does not affect another", async () => {
-  const { CircuitOpenError } = await import("../src/circuit-breaker.ts");
+  const { CircuitOpenError } = await import("../../../src/circuit-breaker.ts");
 
   // Use two separate clients pointing to different origins
   const clientA = new Kinetex({ baseURL: "https://httpbin.org", timeout: T, throwOnError: true });
@@ -3005,7 +3005,7 @@ async function waitForMatching(
 }
 
 await test("connect(), send(), receive echo — basic round-trip over wss://", async () => {
-  const { WSClient } = await import("../src/ws.ts");
+  const { WSClient } = await import("../../../src/ws.ts");
   const received: WSMessage[] = [];
 
   const ws = new WSClient({
@@ -3035,7 +3035,7 @@ await test("connect(), send(), receive echo — basic round-trip over wss://", a
 });
 
 await test("sendJSON() echoes back parseable JSON with correct fields", async () => {
-  const { WSClient } = await import("../src/ws.ts");
+  const { WSClient } = await import("../../../src/ws.ts");
   const received: WSMessage[] = [];
 
   const ws = new WSClient({
@@ -3069,7 +3069,7 @@ await test("sendJSON() echoes back parseable JSON with correct fields", async ()
 });
 
 await test("sendBinary() echoes back as Uint8Array", async () => {
-  const { WSClient } = await import("../src/ws.ts");
+  const { WSClient } = await import("../../../src/ws.ts");
   const received: WSMessage[] = [];
 
   const ws = new WSClient({
@@ -3101,7 +3101,7 @@ await test("sendBinary() echoes back as Uint8Array", async () => {
 });
 
 await test("onMessage() listener returns a working unsubscribe function", async () => {
-  const { WSClient } = await import("../src/ws.ts");
+  const { WSClient } = await import("../../../src/ws.ts");
   const received: string[] = [];
 
   const ws = new WSClient({
@@ -3134,7 +3134,7 @@ await test("onMessage() listener returns a working unsubscribe function", async 
 });
 
 await test("Async iterator terminates cleanly when close() is called", async () => {
-  const { WSClient } = await import("../src/ws.ts");
+  const { WSClient } = await import("../../../src/ws.ts");
   const collected: string[] = [];
 
   const ws = new WSClient({
@@ -3165,7 +3165,7 @@ await test("Async iterator terminates cleanly when close() is called", async () 
 });
 
 await test("request() resolves with correlated reply matching the predicate", async () => {
-  const { WSClient } = await import("../src/ws.ts");
+  const { WSClient } = await import("../../../src/ws.ts");
   const ws = new WSClient({
     url: "wss://echo.websocket.org/",
     pingIntervalMs: 0,
@@ -3188,7 +3188,7 @@ await test("request() resolves with correlated reply matching the predicate", as
 });
 
 await test("request() rejects with WSError on timeout when no reply matches", async () => {
-  const { WSClient, WSError } = await import("../src/ws.ts");
+  const { WSClient, WSError } = await import("../../../src/ws.ts");
   const ws = new WSClient({
     url: "wss://echo.websocket.org/",
     pingIntervalMs: 0,
@@ -3218,7 +3218,7 @@ await test("request() rejects with WSError on timeout when no reply matches", as
 });
 
 await test("Metrics: messagesSent/bytesReceived increment correctly", async () => {
-  const { WSClient } = await import("../src/ws.ts");
+  const { WSClient } = await import("../../../src/ws.ts");
   const ws = new WSClient({
     url: "wss://echo.websocket.org/",
     pingIntervalMs: 0,
@@ -3251,7 +3251,7 @@ await test("Metrics: messagesSent/bytesReceived increment correctly", async () =
 });
 
 await test("drainBuffer() returns buffered messages and clears the queue", async () => {
-  const { WSClient } = await import("../src/ws.ts");
+  const { WSClient } = await import("../../../src/ws.ts");
   // Create a client that will fail to connect — so sends go to buffer
   const ws = new WSClient({
     url: "wss://127.0.0.1:19999/never-exists",
@@ -3281,7 +3281,7 @@ await test("drainBuffer() returns buffered messages and clears the queue", async
 });
 
 await test("AbortSignal closes the socket permanently", async () => {
-  const { WSClient } = await import("../src/ws.ts");
+  const { WSClient } = await import("../../../src/ws.ts");
   const ctrl = new AbortController();
   const closedWith: Array<{ code: number; will: boolean }> = [];
 
@@ -3309,7 +3309,7 @@ await test("AbortSignal closes the socket permanently", async () => {
 });
 
 await test("connectWS() factory resolves to OPEN client", async () => {
-  const { connectWS } = await import("../src/ws.ts");
+  const { connectWS } = await import("../../../src/ws.ts");
   const ws = await connectWS({
     url: "wss://echo.websocket.org/",
     pingIntervalMs: 0,
@@ -3329,7 +3329,7 @@ suite("OpenTelemetry trace propagation");
 // The proof is: httpbin.org/headers echoes back the headers we sent, so we can
 // verify the actual traceparent value the server received.
 
-function makeTracer(): import("../src/client.ts").OTelTracer {
+function makeTracer(): import("../../../src/client.ts").OTelTracer {
   return {
     startSpan(name: string) {
       // Generate cryptographically random trace/span IDs matching OTel SDK output
@@ -3409,7 +3409,7 @@ await test("Each request gets a unique traceparent (no ID reuse)", async () => {
 
 await test("OTel span setAttribute receives standard HTTP semantic convention fields", async () => {
   const attrs: Record<string, string | number | boolean>[] = [];
-  const tracer: import("../src/client.ts").OTelTracer = {
+  const tracer: import("../../../src/client.ts").OTelTracer = {
     startSpan() {
       const a: Record<string, string | number | boolean> = {};
       attrs.push(a);
@@ -3455,7 +3455,7 @@ await test("OTel span setAttribute receives standard HTTP semantic convention fi
 
 await test("OTel span is ended with ERROR status on TimeoutError", async () => {
   const spans: Array<{ code: number; ended: boolean }> = [];
-  const tracer: import("../src/client.ts").OTelTracer = {
+  const tracer: import("../../../src/client.ts").OTelTracer = {
     startSpan() {
       const traceId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
         .map((b) => b.toString(16).padStart(2, "0"))
@@ -3507,7 +3507,7 @@ await test("OTel span is ended with ERROR status on TimeoutError", async () => {
 suite("HookRegistry integration");
 
 await test("beforeRequest + afterResponse hooks fire and have correct context", async () => {
-  const { HookRegistry } = await import("../src/lifecycle.ts");
+  const { HookRegistry } = await import("../../../src/lifecycle.ts");
   const fired: Array<{ phase: string; method?: string; status?: number }> = [];
 
   const reg = new HookRegistry();
@@ -3533,7 +3533,7 @@ await test("beforeRequest + afterResponse hooks fire and have correct context", 
 });
 
 await test("Priority ordering: lower number fires first", async () => {
-  const { HookRegistry } = await import("../src/lifecycle.ts");
+  const { HookRegistry } = await import("../../../src/lifecycle.ts");
   const order: number[] = [];
 
   const reg = new HookRegistry();
@@ -3574,7 +3574,7 @@ await test("Priority ordering: lower number fires first", async () => {
 });
 
 await test("once:true hook fires exactly once across multiple requests", async () => {
-  const { HookRegistry } = await import("../src/lifecycle.ts");
+  const { HookRegistry } = await import("../../../src/lifecycle.ts");
   let count = 0;
 
   const reg = new HookRegistry();
@@ -3596,7 +3596,7 @@ await test("once:true hook fires exactly once across multiple requests", async (
 });
 
 await test("eject() from attachHookRegistry() stops all hooks immediately", async () => {
-  const { HookRegistry } = await import("../src/lifecycle.ts");
+  const { HookRegistry } = await import("../../../src/lifecycle.ts");
   const fired: string[] = [];
 
   const reg = new HookRegistry();
@@ -3621,7 +3621,7 @@ await test("eject() from attachHookRegistry() stops all hooks immediately", asyn
 });
 
 await test("condition: () => false hook never fires", async () => {
-  const { HookRegistry } = await import("../src/lifecycle.ts");
+  const { HookRegistry } = await import("../../../src/lifecycle.ts");
   let count = 0;
 
   const reg = new HookRegistry();
@@ -3640,7 +3640,7 @@ await test("condition: () => false hook never fires", async () => {
 });
 
 await test("beforeRequest hook can mutate request headers — mutation reaches server", async () => {
-  const { HookRegistry } = await import("../src/lifecycle.ts");
+  const { HookRegistry } = await import("../../../src/lifecycle.ts");
 
   const reg = new HookRegistry();
   reg.addBeforeRequest((req) => ({

@@ -466,6 +466,7 @@ await test("connect() while RECONNECTING queues waiter", async () => {
   (ws as any)._state = "RECONNECTING";
   const p = ws.connect();
   assert.ok(p instanceof Promise);
+  p.catch(() => {});
   ws.destroy();
 });
 

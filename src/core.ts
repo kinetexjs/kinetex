@@ -1128,8 +1128,8 @@ export function parseBody<T>(
 ): T | Promise<T> {
   if (customParser) return customParser(raw, headers ?? {}, url ?? "");
 
-  // Empty body returns undefined
-  if (!raw.byteLength) return undefined as T;
+  // Empty body returns null
+  if (!raw.byteLength) return null as T;
 
   const ct = contentType?.split(";")[0]?.trim().toLowerCase() ?? "";
 
