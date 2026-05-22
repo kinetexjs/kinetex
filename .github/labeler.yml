@@ -1,0 +1,109 @@
+# Auto-label configuration for PRs based on changed file paths
+# Used by .github/workflows/labeler.yml
+
+# Core client and transport
+core:
+  - changed-files:
+      - any-glob-to-any-file: src/core.ts
+client:
+  - changed-files:
+      - any-glob-to-any-file: src/client.ts
+types:
+  - changed-files:
+      - any-glob-to-any-file: src/types.ts
+
+# Modules
+cache:
+  - changed-files:
+      - any-glob-to-any-file: src/cache.ts
+cookies:
+  - changed-files:
+      - any-glob-to-any-file: src/cookie-*.ts
+      - any-glob-to-any-file: src/cookiejar.ts
+sse:
+  - changed-files:
+      - any-glob-to-any-file: src/sse.ts
+websocket:
+  - changed-files:
+      - any-glob-to-any-file: src/ws.ts
+graphql:
+  - changed-files:
+      - any-glob-to-any-file: src/graphql.ts
+pagination:
+  - changed-files:
+      - any-glob-to-any-file: src/pagination.ts
+auth:
+  - changed-files:
+      - any-glob-to-any-file: src/aws-sigv4.ts
+      - any-glob-to-any-file: src/digest.ts
+      - any-glob-to-any-file: src/auth*.ts
+proxy:
+  - changed-files:
+      - any-glob-to-any-file: src/socks5.ts
+url:
+  - changed-files:
+      - any-glob-to-any-file: src/url.ts
+headers:
+  - changed-files:
+      - any-glob-to-any-file: src/headers.ts
+response:
+  - changed-files:
+      - any-glob-to-any-file: src/response.ts
+progress:
+  - changed-files:
+      - any-glob-to-any-file: src/progress.ts
+interceptors:
+  - changed-files:
+      - any-glob-to-any-file: src/interceptors.ts
+lifecycle:
+  - changed-files:
+      - any-glob-to-any-file: src/lifecycle.ts
+logging:
+  - changed-files:
+      - any-glob-to-any-file: src/logging.ts
+
+# Reliability patterns
+circuit-breaker:
+  - changed-files:
+      - any-glob-to-any-file: src/circuit-breaker.ts
+dedup:
+  - changed-files:
+      - any-glob-to-any-file: src/dedup.ts
+
+# Cross-runtime
+worker:
+  - changed-files:
+      - any-glob-to-any-file: src/worker.ts
+      - any-glob-to-any-file: src/globals.d.ts
+
+# Tests
+tests:
+  - changed-files:
+      - any-glob-to-any-file: tests/**/*
+
+# Build and config
+build:
+  - changed-files:
+      - any-glob-to-any-file: scripts/**/*
+      - any-glob-to-any-file: tsconfig*.json
+      - any-glob-to-any-file: deno.json
+      - any-glob-to-any-file: package.json
+
+# CI/CD
+ci:
+  - changed-files:
+      - any-glob-to-any-file: .github/**/*
+
+# Documentation
+documentation:
+  - changed-files:
+      - any-glob-to-any-file: "*.md"
+      - any-glob-to-any-file: docs/**
+
+# Dependencies
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file: package.json
+      - any-glob-to-any-file: package-lock.json
+      - any-glob-to-any-file: deno.json
+      - any-glob-to-any-file: deno.lock

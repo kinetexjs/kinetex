@@ -1,0 +1,100 @@
+name: Publish
+
+on:
+  workflow_run:
+    workflows: ["Build & Release"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish-jsr:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    name: Publish to JSR
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Type check
+        run: deno task check
+
+      - name: Lint
+        run: deno lint
+
+      - name: Run tests
+        run: deno task test
+        continue-on-error: true
+
+      # Fixes JSR: removes the freshly generated lockfile before publishing
+      - name: Clear generated lockfile
+        run: rm -f deno.lock
+
+      - name: Dry run publish
+        run: deno publish --dry-run --allow-dirty
+
+      - name: Publish to JSR
+        run: deno publish --allow-dirty
+
+  publish-npm:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      # Fixes NPM: checks package.json version to append --tag next if it is an RC/prerelease
+      - name: Determine NPM Dist Tag
+        id: npm_tag
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [[ "$VERSION" == *"-"* ]]; then
+            echo "tag_flag=--tag next" >> $GITHUB_OUTPUT
+          else
+            echo "tag_flag=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          
+      - name: Upgrade npm via Corepack
+        run: |
+          corepack enable
+          corepack prepare npm@latest --activate
+          
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build dist
+        run: npm run build
+
+      - name: Publish
+        run: npm publish --provenance --access public ${{ steps.npm_tag.outputs.tag_flag }}
+        env:
+          NODE_AUTH_TOKEN: ""
+          

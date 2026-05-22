@@ -1,0 +1,162 @@
+name: Bug Report
+description: File a bug report to help us improve kinetex
+title: "[Bug] "
+labels: ["bug", "needs-triage"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report! Please provide as much detail as possible.
+
+  - type: input
+    id: version
+    attributes:
+      label: kinetex Version
+      description: What version of kinetex are you running?
+      placeholder: "0.0.3"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Runtime
+      description: Which runtime(s) are you using?
+      multiple: true
+      options:
+        - Node.js 18
+        - Node.js 20
+        - Node.js 22+
+        - Deno
+        - Bun
+        - Browser (Chrome)
+        - Browser (Firefox)
+        - Browser (Safari)
+        - Browser (Edge)
+        - Cloudflare Workers
+        - Vercel Edge
+        - Other (please specify in "Additional Context")
+    validations:
+      required: true
+
+  - type: input
+    id: runtime-version
+    attributes:
+      label: Runtime Version
+      description: Exact runtime version (e.g. Node 22.14.0, Deno 2.3.0, Bun 1.2.0)
+      placeholder: "22.14.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: module
+    attributes:
+      label: Affected Module
+      description: Which part of kinetex is affected?
+      multiple: true
+      options:
+        - Client / FluentRequest
+        - Transport (HTTP/1.1 / HTTP/2)
+        - Interceptors
+        - Cache
+        - Cookie Jar
+        - SSE
+        - WebSocket
+        - GraphQL
+        - Pagination
+        - Progress
+        - Auth (Bearer / Basic / Digest / AWS SigV4)
+        - SOCKS5 Proxy
+        - Circuit Breaker
+        - Request Deduplication
+        - HAR / Logging
+        - OpenTelemetry
+        - URL Builder / Headers
+        - Response Parsing
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: "When I call client.get(...) with X, it throws Y instead of returning Z."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction Steps
+      description: Minimal, runnable code that reproduces the issue.
+      placeholder: |
+        ```typescript
+        import { kinetex } from "kinetex";
+
+        const client = kinetex({ baseURL: "https://httpbin.org" });
+        const res = await client.get("/get");
+        // ...
+        ```
+      render: typescript
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened? Include the full error message and stack trace.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: How severe is this bug?
+      options:
+        - Critical (production outage, data loss, security issue)
+        - High (feature broken, no workaround)
+        - Medium (feature broken, has workaround)
+        - Low (cosmetic, edge case, minor annoyance)
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Log Output / HAR
+      description: Please copy and paste any relevant log output or HAR recordings. This will be automatically formatted.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission Checklist
+      description: By submitting this issue, you confirm the following:
+      options:
+        - label: I have searched existing issues to avoid duplicates
+          required: true
+        - label: I can reproduce the bug with the latest kinetex version
+          required: true
+        - label: I have included a minimal reproduction (not just a description)
+          required: true
+        - label: I have checked that this is not a network/server issue on my end
+          required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: OS details, proxy configuration, custom fetch implementation, etc.

@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# Husky pre-commit hook — run lint-staged on staged files
+. "$(dirname -- "$0")/_/husky.sh"
+
+npx lint-staged

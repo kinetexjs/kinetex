@@ -1,0 +1,219 @@
+{
+  "name": "kinetex",
+  "version": "1.0.0-rc.1",
+  "description": "Feature-rich, universal TypeScript HTTP client.",
+  "author": "kinetexjs",
+  "license": "MIT",
+  "homepage": "https://github.com/kinetexjs/kinetex",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kinetexjs/kinetex.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kinetexjs/kinetex/issues"
+  },
+  "keywords": [
+    "http",
+    "http2",
+    "fetch",
+    "client",
+    "graphql",
+    "sse",
+    "pagination",
+    "retry",
+    "interceptors",
+    "aws",
+    "sigv4",
+    "socks5",
+    "proxy",
+    "cache",
+    "cookie",
+    "websocket",
+    "circuit-breaker",
+    "dedup",
+    "opentelemetry",
+    "otel"
+  ],
+  "type": "module",
+  "main": "./dist/cjs/mod.js",
+  "module": "./dist/esm/mod.js",
+  "browser": "./dist/browser/kinetex.esm.js",
+  "unpkg": "./dist/browser/kinetex.min.js",
+  "jsdelivr": "./dist/browser/kinetex.min.js",
+  "types": "./dist/types/mod.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/mod.d.ts",
+      "workerd": "./dist/esm/mod.js",
+      "worker": "./dist/esm/mod.js",
+      "browser": "./dist/browser/kinetex.esm.js",
+      "deno": "./src/mod.ts",
+      "bun": "./dist/esm/mod.js",
+      "import": "./dist/esm/mod.js",
+      "require": "./dist/cjs/mod.js"
+    },
+    "./worker": {
+      "types": "./dist/types/worker.d.ts",
+      "import": "./dist/esm/worker.js"
+    },
+    "./browser": {
+      "types": "./dist/types/mod.d.ts",
+      "import": "./dist/browser/kinetex.esm.js",
+      "script": "./dist/browser/kinetex.min.js"
+    },
+    "./cache": {
+      "types": "./dist/types/cache.d.ts",
+      "import": "./dist/esm/cache.js",
+      "require": "./dist/cjs/cache.js"
+    },
+    "./sse": {
+      "types": "./dist/types/sse.d.ts",
+      "import": "./dist/esm/sse.js",
+      "require": "./dist/cjs/sse.js"
+    },
+    "./graphql": {
+      "types": "./dist/types/graphql.d.ts",
+      "import": "./dist/esm/graphql.js",
+      "require": "./dist/cjs/graphql.js"
+    },
+    "./pagination": {
+      "types": "./dist/types/pagination.d.ts",
+      "import": "./dist/esm/pagination.js",
+      "require": "./dist/cjs/pagination.js"
+    },
+    "./progress": {
+      "types": "./dist/types/progress.d.ts",
+      "import": "./dist/esm/progress.js",
+      "require": "./dist/cjs/progress.js"
+    },
+    "./logging": {
+      "types": "./dist/types/logging.d.ts",
+      "import": "./dist/esm/logging.js",
+      "require": "./dist/cjs/logging.js"
+    },
+    "./response": {
+      "types": "./dist/types/response.d.ts",
+      "import": "./dist/esm/response.js",
+      "require": "./dist/cjs/response.js"
+    },
+    "./headers": {
+      "types": "./dist/types/headers.d.ts",
+      "import": "./dist/esm/headers.js",
+      "require": "./dist/cjs/headers.js"
+    },
+    "./url": {
+      "types": "./dist/types/url.d.ts",
+      "import": "./dist/esm/url.js",
+      "require": "./dist/cjs/url.js"
+    },
+    "./aws-sigv4": {
+      "types": "./dist/types/aws-sigv4.d.ts",
+      "import": "./dist/esm/aws-sigv4.js",
+      "require": "./dist/cjs/aws-sigv4.js"
+    },
+    "./socks5": {
+      "types": "./dist/types/socks5.d.ts",
+      "import": "./dist/esm/socks5.js",
+      "require": "./dist/cjs/socks5.js"
+    },
+    "./cookiejar": {
+      "types": "./dist/types/cookiejar.d.ts",
+      "import": "./dist/esm/cookiejar.js",
+      "require": "./dist/cjs/cookiejar.js"
+    },
+    "./circuit-breaker": {
+      "types": "./dist/types/circuit-breaker.d.ts",
+      "import": "./dist/esm/circuit-breaker.js",
+      "require": "./dist/cjs/circuit-breaker.js"
+    },
+    "./dedup": {
+      "types": "./dist/types/dedup.d.ts",
+      "import": "./dist/esm/dedup.js",
+      "require": "./dist/cjs/dedup.js"
+    },
+    "./digest": {
+      "types": "./dist/types/digest.d.ts",
+      "import": "./dist/esm/digest.js",
+      "require": "./dist/cjs/digest.js"
+    },
+    "./ws": {
+      "types": "./dist/types/ws.d.ts",
+      "import": "./dist/esm/ws.js",
+      "require": "./dist/cjs/ws.js"
+    },
+    "./lifecycle": {
+      "types": "./dist/types/lifecycle.d.ts",
+      "import": "./dist/esm/lifecycle.js",
+      "require": "./dist/cjs/lifecycle.js"
+    },
+    "./interceptors": {
+      "types": "./dist/types/interceptors.d.ts",
+      "import": "./dist/esm/interceptors.js",
+      "require": "./dist/cjs/interceptors.js"
+    },
+    "./core": {
+      "types": "./dist/types/core.d.ts",
+      "import": "./dist/esm/core.js",
+      "require": "./dist/cjs/core.js"
+    },
+    "./cookie-parser": {
+      "types": "./dist/types/cookie-parser.d.ts",
+      "import": "./dist/esm/cookie-parser.js",
+      "require": "./dist/cjs/cookie-parser.js"
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "lint-staged": {
+    "*.{ts,mts}": [
+      "prettier --check",
+      "tsc -p tsconfig.check.json --noEmit"
+    ],
+    "*.{json,md,yml,yaml}": [
+      "prettier --check"
+    ]
+  },
+  "scripts": {
+    "build": "tsx scripts/build.ts",
+    "rebuild": "npm run clean && npm run build",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "clean": "node -e \"import('node:fs').then(f=>f.default.rmSync('dist',{recursive:true,force:true}))\"",
+    "test": "tsx --test tests/mod.test.mts tests/client.test.mts tests/core.test.mts tests/utils.test.mts tests/headers.test.mts tests/url.test.mts tests/response.test.mts",
+    "test:all": "tsx --test tests/*.test.mts",
+    "node:battle": "tsx tests/Node.test.mts",
+    "deno:battle": "deno run --allow-net --allow-env --allow-read --allow-sys tests/runtime/deno/Deno.test.mts",
+    "bun:battle": "bun tests/runtime/bun/Bun.test.mts",
+    "lint": "tsc -p tsconfig.check.json --noEmit",
+    "prepublishOnly": "npm run clean && npm run build",
+    "release": "tsx scripts/release.ts",
+    "release:minor": "tsx scripts/release.ts minor",
+    "release:major": "tsx scripts/release.ts major",
+    "coverage": "c8 --exclude='dist/**' --report-dir=. --reporter=lcov --reporter=text node --import tsx --test --test-concurrency=1 --test-reporter=spec $(find tests -maxdepth 1 -name '*.test.mts' | tr '\\n' ' ')",
+    "coverage:summary": "c8 --exclude='dist/**' --report-dir=. --reporter=text-summary node --import tsx --test --test-concurrency=1 $(find tests -maxdepth 1 -name '*.test.mts' | tr '\\n' ' ')",
+    "type-coverage": "type-coverage --strict -p tsconfig.check.json",
+    "ts-prune": "ts-prune -p tsconfig.check.json",
+    "docs": "typedoc",
+    "prepare": "test -d .git && husky || true"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "c8": "^11.0.0",
+    "esbuild": "^0.28.0",
+    "husky": "^9.1.0",
+    "lint-staged": "^17.0.5",
+    "prettier": "3.8.3",
+    "ts-prune": "^0.10.3",
+    "tsx": "^4.22.3",
+    "type-coverage": "^2.29.7",
+    "typedoc": "^0.28.19",
+    "typedoc-plugin-markdown": "^4.11.0",
+    "typescript": "^6.0.3"
+  }
+}

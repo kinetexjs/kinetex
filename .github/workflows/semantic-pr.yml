@@ -1,0 +1,99 @@
+name: Semantic PR Title
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+
+permissions:
+  pull-requests: read
+  statuses: write
+
+jobs:
+  validate:
+    name: Validate PR title follows Conventional Commits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        id: lint
+        with:
+          types: |
+            fix
+            feat
+            chore
+            docs
+            refactor
+            perf
+            test
+            ci
+            build
+            revert
+            release
+          scopes: |
+            core
+            client
+            transport
+            cache
+            cookie
+            sse
+            ws
+            graphql
+            pagination
+            auth
+            proxy
+            headers
+            url
+            response
+            interceptors
+            lifecycle
+            logging
+            otel
+            dedup
+            circuit-breaker
+            docs
+            ci
+            build
+            deps
+          requireScope: false
+          subjectPattern: ^(?![A-Z]).+$
+          subjectPatternError: |
+            The subject "{subject}" found in the pull request title "{title}"
+            should not start with an uppercase character.
+          validateSingleCommit: false
+          ignoreLabels: |
+            automated
+            dependencies
+            ignore-semantic-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: marocchino/sticky-pull-request-comment@v2
+        if: always() && steps.lint.outputs.error_message != null
+        with:
+          header: semantic-pr-error
+          message: |
+            ## ⚠️ PR Title Does Not Follow Conventional Commits
+
+            Please update your PR title to match the format:
+
+            ```
+            <type>(<scope>): <description>
+            ```
+
+            **Examples:**
+            - `fix(core): handle timeout race condition`
+            - `feat(cache): add TwoTier storage adapter`
+            - `docs: update README with new API`
+            - `chore(deps): bump typescript to 5.8`
+
+            **Error Details:**
+            ${{ steps.lint.outputs.error_message }}
+
+      - uses: marocchino/sticky-pull-request-comment@v2
+        if: success()
+        with:
+          header: semantic-pr-error
+          delete: true

@@ -1,0 +1,46 @@
+node_modules/
+dist/
+tmp/
+docs/
+coverage/
+.c8_tmp/
+*.tsbuildinfo
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Environment files
+.env
+.env.*
+.env*.local
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test artifacts
+*.test-db
+*.test-tmp
+
+# Package artifacts
+*.tgz
+*.nupkg
+
+# AI assistant artifacts
+.aider*
+.claude*
+.opencode*
+
+# Misc
+*.orig

@@ -1,0 +1,254 @@
+name: CI / CD
+
+on:
+  push:
+    branches: [main, master, develop]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master, develop]
+  schedule:
+    # Run tests every night at 02:00 UTC to catch upstream API changes
+    - cron: "0 2 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  DENO_VERSION: "v2.x"
+  BUN_VERSION: "latest"
+
+defaults:
+  run:
+    shell: bash
+
+# ── JOB 1 — Type-Check (Node + Deno) ──────────────────────────
+
+jobs:
+  typecheck:
+    name: TypeScript strict check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Deno check
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      - run: deno task check
+
+      - name: TSC strict check
+        run: npm run typecheck
+
+      - name: Type coverage
+        run: npx type-coverage --strict -p tsconfig.check.json
+
+      - name: Dead code detection
+        run: npx ts-prune -p tsconfig.check.json || true
+        continue-on-error: true
+
+  # ── JOB 2 — Lint ──────────────────────────────────────────────
+
+  lint:
+    name: Lint (Deno)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      - run: deno lint
+
+      - name: Check formatting
+        run: deno fmt --check src/ || echo "Formatting issues found (non-blocking)"
+
+  # ── JOB 3 — Security Audit ────────────────────────────────────
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: npm audit
+        run: npm audit --audit-level=high || true
+        continue-on-error: true
+
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+
+  # ── JOB 4 — Tests (Node.js — Matrix: Node versions × OS) ─────
+
+  unit-node:
+    name: Tests / Node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: [typecheck, lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "23", "24"]
+        os: [ubuntu-latest]
+        include:
+          - node: "22"
+            os: windows-latest
+          - node: "22"
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run all tests
+        run: npm run test:all
+
+      - name: Coverage report
+        if: matrix.node == '22' && matrix.os == 'ubuntu-latest'
+        run: npm run coverage
+
+      - name: Upload coverage to Codecov
+        if: matrix.node == '22' && matrix.os == 'ubuntu-latest'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info
+          flags: unittests,integration
+          name: kinetex-coverage
+          fail_ci_if_error: false
+          verbose: true
+
+  # ── JOB 5 — Tests (Deno) ──────────────────────────────────────
+
+  unit-deno:
+    name: Tests / Deno
+    runs-on: ubuntu-latest
+    needs: [typecheck, lint]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      - name: Run Deno battle tests
+        run: deno run --allow-net --allow-env --allow-read --allow-sys tests/runtime/deno/Deno.test.mts
+
+      - name: Run Deno cross-runtime tests
+        run: deno run --allow-net --allow-env --allow-read --allow-sys tests/runtime/deno/cross-runtime-deno.test.mts
+
+  # ── JOB 6 — Tests (Bun) ───────────────────────────────────────
+
+  unit-bun:
+    name: Tests / Bun
+    runs-on: ubuntu-latest
+    needs: [typecheck, lint]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - run: bun install
+
+      - name: Run standard tests with Bun
+        run: bunx tsx --test tests/*.test.mts
+
+      - name: Run Bun battle tests
+        run: bun tests/runtime/bun/Bun.test.mts
+
+      - name: Run Bun cross-runtime tests
+        run: bun tests/runtime/bun/cross-runtime-bun.test.mts
+
+  # ── JOB 7 — Nightly Regression ────────────────────────────────
+
+  nightly-regression:
+    name: Nightly regression
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run Node standard tests
+        run: npm run test:all
+        timeout-minutes: 15
+
+      - name: Run Node battle tests
+        run: tsx tests/Node.test.mts
+        timeout-minutes: 5
+
+      - name: Run Node cross-runtime tests
+        run: tsx tests/cross-runtime-node.test.mts
+        timeout-minutes: 5
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      - name: Run Deno battle tests
+        run: deno run --allow-net --allow-env --allow-read --allow-sys tests/runtime/deno/Deno.test.mts
+        timeout-minutes: 15
+
+      - name: Run Deno cross-runtime tests
+        run: deno run --allow-net --allow-env --allow-read --allow-sys tests/runtime/deno/cross-runtime-deno.test.mts
+        timeout-minutes: 5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Run Bun standard tests
+        run: bunx tsx --test tests/*.test.mts
+        timeout-minutes: 15
+
+      - name: Run Bun battle tests
+        run: bun tests/runtime/bun/Bun.test.mts
+        timeout-minutes: 5
+
+      - name: Run Bun cross-runtime tests
+        run: bun tests/runtime/bun/cross-runtime-bun.test.mts
+        timeout-minutes: 5
+
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v9
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `Nightly regression failed — ${new Date().toISOString().slice(0, 10)}`,
+              body:  `Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['regression', 'ci'],
+            });

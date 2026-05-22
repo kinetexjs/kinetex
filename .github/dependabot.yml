@@ -1,0 +1,55 @@
+# Dependabot auto-dependency management — keeps dependencies fresh and secure
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    versioning-strategy: "increase"
+    open-pull-requests-limit: 15
+    labels:
+      - "dependencies"
+      - "npm"
+    reviewers:
+      - "kinetexjs/owners"
+    commit-message:
+      prefix: "fix"
+      prefix-development: "chore"
+      include: "scope"
+    groups:
+      typescript-ecosystem:
+        patterns:
+          - "typescript"
+          - "@types/*"
+          - "tsx"
+          - "ts-*"
+        update-types:
+          - "minor"
+          - "patch"
+      testing:
+        patterns:
+          - "c8"
+          - "type-coverage"
+          - "ts-prune"
+    ignore:
+      - dependency-name: "@types/node"
+        update-types:
+          - "version-update:semver-major"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
