@@ -1,5 +1,5 @@
 import assert from "assert/strict";
-import { Kinetex, KinetexError, TimeoutError, HTTPStatusError } from "../src/mod.ts";
+import { Kinetex, KinetexError, TimeoutError, HTTPStatusError } from "../../../src/mod.ts";
 import {
   detectRuntime,
   RUNTIME,
@@ -10,14 +10,14 @@ import {
   FetchTransport,
   NodeHTTP2Transport,
   createTransport,
-} from "../src/core.ts";
+} from "../../../src/core.ts";
 import {
   isAbortError,
   mergeSignals,
   uint8ArrayToBase64,
   concatUint8Arrays,
   sleep,
-} from "../src/utils.ts";
+} from "../../../src/utils.ts";
 
 let passed = 0,
   failed = 0;

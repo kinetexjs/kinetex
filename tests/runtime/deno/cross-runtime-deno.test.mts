@@ -1,5 +1,5 @@
 import { assertEquals, assert, assertStrictEquals } from "jsr:@std/assert";
-import { Kinetex, KinetexError, TimeoutError, HTTPStatusError } from "../src/mod.ts";
+import { Kinetex, KinetexError, TimeoutError, HTTPStatusError } from "../../../src/mod.ts";
 import {
   RUNTIME,
   IS_NODE,
@@ -9,8 +9,8 @@ import {
   getEffectiveRuntime,
   createTransport,
   FetchTransport,
-} from "../src/mod.ts";
-import { isAbortError, mergeSignals, uint8ArrayToBase64 } from "../src/mod.ts";
+} from "../../../src/mod.ts";
+import { isAbortError, mergeSignals, uint8ArrayToBase64 } from "../../../src/mod.ts";
 
 let passed = 0,
   failed = 0;

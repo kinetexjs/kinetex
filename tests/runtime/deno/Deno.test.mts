@@ -15,8 +15,8 @@ import {
   TimeoutError,
   HTTPStatusError,
   SizeLimitError,
-} from "../src/mod.ts";
-import type { WSMessage } from "../src/ws.ts";
+} from "../../../src/mod.ts";
+import type { WSMessage } from "../../../src/ws.ts";
 let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
@@ -1124,7 +1124,7 @@ import {
   isHTTP,
   isLocalhost,
   diffURLs,
-} from "../src/url.ts";
+} from "../../../src/url.ts";
 
 await test("percentEncode encodes spaces and special characters", async () => {
   assertEquals(percentEncode("hello world"), "hello%20world");
@@ -1384,7 +1384,7 @@ import {
   formatLinkHeader,
   parseRange,
   parseRetryAfter,
-} from "../src/headers.ts";
+} from "../../../src/headers.ts";
 
 await test("isValidHeaderName accepts valid header names", async () => {
   assertEquals(isValidHeaderName("content-type"), true);
@@ -1593,7 +1593,7 @@ import {
   HTTPResponseError,
   extractServerTiming,
   createLimitedReader,
-} from "../src/response.ts";
+} from "../../../src/response.ts";
 
 await test("normalizeHeaders lowercases all header keys", async () => {
   const norm = normRespHeaders(
@@ -1726,9 +1726,9 @@ import {
   getRegistrableDomain,
   isIPAddress,
   defaultPath,
-} from "../src/cookie-parser.ts";
+} from "../../../src/cookie-parser.ts";
 
-import { CookieJar, createCookieJar, loadCookieJar } from "../src/cookiejar.ts";
+import { CookieJar, createCookieJar, loadCookieJar } from "../../../src/cookiejar.ts";
 
 await test("parseCookieDate parses RFC 2616 date strings", async () => {
   const ts = parseCookieDate("Wed, 09 Jun 2021 10:18:14 GMT");
@@ -1851,7 +1851,7 @@ import {
   extractOperationName,
   GraphQLClientError,
   createGraphQLClient,
-} from "../src/graphql.ts";
+} from "../../../src/graphql.ts";
 
 await test("detectOperationType identifies query / mutation / subscription", async () => {
   assertEquals(detectOperationType("query GetUser { user { id } }"), "query");
@@ -1912,7 +1912,7 @@ import {
   formatProgress,
   ProgressTracker,
   throttleProgress,
-} from "../src/progress.ts";
+} from "../../../src/progress.ts";
 
 await test("formatBytes formats sizes with correct units", async () => {
   assertEquals(formatBytes(0), "0 B"); // NOTE: "0 B" not "0 Bytes"
@@ -2000,7 +2000,7 @@ await test("throttleProgress(fn, hz) — args: callback first, hz second", async
 
 suite("socks5.ts — pure functions");
 
-import { parseSocks5Url, Socks5Error } from "../src/socks5.ts";
+import { parseSocks5Url, Socks5Error } from "../../../src/socks5.ts";
 
 await test("parseSocks5Url parses socks5:// with auth", async () => {
   const config = parseSocks5Url("socks5://user:pass@proxy.example.com:1080");
@@ -2078,7 +2078,7 @@ await test("HTTPStatusError is created by kinetex internally (not directly)", as
 
 suite("core.ts — runtime and parsing");
 
-import { detectRuntime, RUNTIME, IS_NODE, HAS_NATIVE_FETCH, parseBody } from "../src/core.ts";
+import { detectRuntime, RUNTIME, IS_NODE, HAS_NATIVE_FETCH, parseBody } from "../../../src/core.ts";
 
 await test("detectRuntime returns a known runtime string", async () => {
   const runtime = detectRuntime();
@@ -2143,7 +2143,7 @@ import {
   staticCredentials,
   cachingCredentials,
   detectClockSkew,
-} from "../src/aws-sigv4.ts";
+} from "../../../src/aws-sigv4.ts";
 
 await test("formatAmzDate returns 16-char ISO8601 basic format ending in Z", async () => {
   const date = new Date("2024-01-15T12:30:45.000Z");
@@ -2213,7 +2213,7 @@ import {
   createLogger,
   toOTelSpan,
   Redactor,
-} from "../src/logging.ts";
+} from "../../../src/logging.ts";
 
 await test("LogLevel has ascending numeric values DEBUG < INFO < WARN < ERROR", async () => {
   assert(LogLevel.DEBUG < LogLevel.INFO);
@@ -2369,7 +2369,7 @@ import {
   serializePaginationState,
   deserializePaginationState,
   toPaginationIterator,
-} from "../src/pagination.ts";
+} from "../../../src/pagination.ts";
 
 await test("serializePaginationState round-trips through deserialize", async () => {
   const state = {
