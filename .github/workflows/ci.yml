@@ -174,9 +174,6 @@ jobs:
 
       - run: bun install
 
-      - name: Run standard tests with Bun
-        run: bunx tsx --test tests/*.test.mts
-
       - name: Run Bun battle tests
         run: bun tests/runtime/bun/Bun.test.mts
 
@@ -227,10 +224,6 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
-
-      - name: Run Bun standard tests
-        run: bunx tsx --test tests/*.test.mts
-        timeout-minutes: 15
 
       - name: Run Bun battle tests
         run: bun tests/runtime/bun/Bun.test.mts

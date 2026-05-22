@@ -174,7 +174,7 @@
   "lint-staged": {
     "*.{ts,mts}": [
       "prettier --check",
-      "tsc -p tsconfig.check.json --noEmit"
+      "bash -c 'tsc -p tsconfig.check.json --noEmit'"
     ],
     "*.{json,md,yml,yaml}": [
       "prettier --check"
@@ -200,7 +200,7 @@
     "type-coverage": "type-coverage --strict -p tsconfig.check.json",
     "ts-prune": "ts-prune -p tsconfig.check.json",
     "docs": "typedoc",
-    "prepare": "test -d .git && husky || true"
+    "prepare": "node -e \"require('fs').existsSync('.git')&&require('child_process').execSync('node node_modules/husky/bin.js',{cwd:__dirname,stdio:'inherit'},e=>e)\" || true"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",

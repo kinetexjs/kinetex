@@ -37,7 +37,6 @@ jobs:
         run: deno task test
         continue-on-error: true
 
-      # Fixes JSR: removes the freshly generated lockfile before publishing
       - name: Clear generated lockfile
         run: rm -f deno.lock
 
@@ -62,7 +61,6 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-      # Fixes NPM: checks package.json version to append --tag next if it is an RC/prerelease
       - name: Determine NPM Dist Tag
         id: npm_tag
         run: |
@@ -77,13 +75,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-          registry-url: "https://registry.npmjs.org"
-          cache: npm
 
-      - name: Upgrade npm via Corepack
-        run: |
-          corepack enable
-          corepack prepare npm@latest --activate
+      - name: Upgrade NPM
+        run: npm install -g npm@latest
 
       - name: Install dependencies
         run: npm ci
@@ -97,5 +91,4 @@ jobs:
       - name: Publish
         run: npm publish --provenance --access public ${{ steps.npm_tag.outputs.tag_flag }}
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          
+          NODE_AUTH_TOKEN: ""

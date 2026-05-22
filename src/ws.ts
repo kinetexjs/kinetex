@@ -540,8 +540,6 @@ export class WSClient {
       this._iterWaiter = null;
     }
 
-    this._msgListeners = [];
-    this._closeListeners = [];
     for (const w of this._openWaiters.splice(0)) w.reject(new Error("Client closed"));
     this._rooms = [];
 
@@ -556,7 +554,19 @@ export class WSClient {
       this._openedAt = null;
     }
 
+    this._mx.closedAt = Date.now();
     this._state = "CLOSED";
+
+    for (const fn of this._closeListeners) {
+      try {
+        fn({ code, reason });
+      } catch {
+        /* isolate */
+      }
+    }
+    this._closeListeners = [];
+    this._msgListeners = [];
+    this._cbClose?.(code, reason, false);
   }
 
   /**
@@ -595,7 +605,6 @@ export class WSClient {
     }
 
     this._msgListeners = [];
-    this._closeListeners = [];
     for (const w of this._openWaiters.splice(0)) w.reject(new Error("Client destroyed"));
     this._rooms = [];
 
@@ -612,6 +621,14 @@ export class WSClient {
     this._mx.closedAt = Date.now();
     this._state = "CLOSED";
 
+    for (const fn of this._closeListeners) {
+      try {
+        fn({ code: 1000, reason: "Destroyed" });
+      } catch {
+        /* isolate */
+      }
+    }
+    this._closeListeners = [];
     this._cbClose?.(1000, "Destroyed", false);
   }
 
@@ -1093,7 +1110,8 @@ export class WSClient {
           this._state = "CLOSED";
           this._cbClose?.(evt.code, evt.reason, false);
           this._terminateIter();
-          for (const w of this._openWaiters.splice(0)) w.reject(new WSError(`Socket closed (code ${evt.code})`));
+          for (const w of this._openWaiters.splice(0))
+            w.reject(new WSError(`Socket closed (code ${evt.code})`));
           this._rejectCorrelations(`Socket closed (code ${evt.code})`);
           return;
         }
@@ -1227,7 +1245,8 @@ export class WSClient {
       try {
         this._ws?.send(msg as string);
         this._mx.messagesSent++;
-        this._mx.bytesSent += typeof msg === "string" ? new TextEncoder().encode(msg).byteLength : msg.byteLength;
+        this._mx.bytesSent +=
+          typeof msg === "string" ? new TextEncoder().encode(msg).byteLength : msg.byteLength;
       } catch {
         /* ignore */
       }
