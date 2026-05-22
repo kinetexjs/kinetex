@@ -156,14 +156,16 @@ await t("custom methods set works", async () => {
   const [a, b] = await Promise.all([
     d.execute("POST", "https://httpbin.org/post", async () => {
       count++;
-      return (await httpbin.post("/post", { n: 1 })).status;
+      return 1;
     }),
     d.execute("POST", "https://httpbin.org/post", async () => {
       count++;
-      return (await httpbin.post("/post", { n: 2 })).status;
+      return 2;
     }),
   ]);
   assert.equal(count, 1);
+  assert.equal(a, 1);
+  assert.equal(b, 1);
 });
 
 // ============================================================================

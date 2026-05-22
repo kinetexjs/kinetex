@@ -162,9 +162,6 @@
       "require": "./dist/cjs/cookie-parser.js"
     }
   },
-  "engines": {
-    "node": ">=18"
-  },
   "sideEffects": false,
   "files": [
     "dist",
@@ -200,7 +197,7 @@
     "type-coverage": "type-coverage --strict -p tsconfig.check.json",
     "ts-prune": "ts-prune -p tsconfig.check.json",
     "docs": "typedoc",
-    "prepare": "node -e \"require('fs').existsSync('.git')&&require('child_process').execSync('node node_modules/husky/bin.js',{cwd:__dirname,stdio:'inherit'},e=>e)\" || true"
+    "prepare": "husky || true"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
