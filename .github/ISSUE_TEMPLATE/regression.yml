@@ -1,0 +1,66 @@
+name: Regression Report
+description: Report a feature that stopped working after an upgrade
+title: "[Regression] "
+labels: ["regression", "needs-triage"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a regression. This helps us catch breaking changes quickly.
+
+  - type: input
+    id: previous-version
+    attributes:
+      label: Working Version
+      description: The last version where this worked correctly
+      placeholder: "0.0.2"
+    validations:
+      required: true
+
+  - type: input
+    id: broken-version
+    attributes:
+      label: Broken Version
+      description: The first version where this stopped working
+      placeholder: "0.0.3"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Runtime
+      multiple: true
+      options:
+        - Node.js
+        - Deno
+        - Bun
+        - Browser
+        - Cloudflare Workers
+        - Vercel Edge
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What Changed?
+      description: Describe what behavior changed between the working and broken versions.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal code showing the regression.
+      render: typescript
+    validations:
+      required: true
+
+  - type: textarea
+    id: bisect
+    attributes:
+      label: Bisect Info (optional)
+      description: If you know which commit introduced the regression, please share.

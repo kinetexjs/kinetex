@@ -1,0 +1,12 @@
+# Gitleaks configuration for kinetex
+# See: https://github.com/gitleaks/gitleaks
+
+[allowlist]
+  description = "Known safe/test values — not real secrets"
+
+  # AWS official example credentials from AWS documentation
+  # https://docs.aws.amazon.com/IAM/latest/UserGuide/security-creds.html
+  regexes = [
+    '''AKIAIOSFODNN7EXAMPLE''',
+    '''wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY''',
+  ]

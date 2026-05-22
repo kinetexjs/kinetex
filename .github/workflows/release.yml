@@ -1,0 +1,119 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-and-release:
+    name: Build dist & create GitHub Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify required dist outputs
+        run: |
+          for f in \
+            dist/esm/mod.js \
+            dist/cjs/mod.js \
+            dist/types/mod.d.ts \
+            dist/browser/kinetex.min.js \
+            dist/browser/kinetex.esm.js; do
+            test -f "$f" && echo "✅ $f" || { echo "❌ MISSING: $f"; exit 1; }
+          done
+
+      - name: Generate source tarball
+        run: |
+          git archive --format=tar.gz -o kinetex-dist.tar.gz --prefix=kinetex-${{ github.ref_name }}/ HEAD
+          git archive --format=zip -o kinetex-dist.zip --prefix=kinetex-${{ github.ref_name }}/ HEAD
+
+      - name: Generate SBOM (CycloneDX)
+        uses: advanced-security/sbom-generator-action@v0.0.1
+        id: sbom
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ github.sha }}
+          path: |
+            dist/
+            kinetex-dist.tar.gz
+            kinetex-dist.zip
+          retention-days: 14
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          VERSION="${TAG#v}"
+          awk "/^## \\[${VERSION}\]/{found=1; next} found && /^## /{exit} found{print}" CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "See CHANGELOG.md for details." > release-notes.md
+          fi
+
+      - name: Generate provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            dist/esm/mod.js
+            dist/cjs/mod.js
+            dist/types/mod.d.ts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body_path: release-notes.md
+          files: |
+            kinetex-dist.tar.gz
+            kinetex-dist.zip
+          # Also attach the SBOM if generated
+          # SBOM is uploaded via the artifacts step above
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
+          generate_release_notes: false
+          discussion_category_name: announcements
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
