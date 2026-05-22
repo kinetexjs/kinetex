@@ -70,7 +70,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: marocchino/sticky-pull-request-comment@v2
+      - uses: marocchino/sticky-pull-request-comment@v3
         if: always() && steps.lint.outputs.error_message != null
         with:
           header: semantic-pr-error
@@ -92,7 +92,7 @@ jobs:
             **Error Details:**
             ${{ steps.lint.outputs.error_message }}
 
-      - uses: marocchino/sticky-pull-request-comment@v2
+      - uses: marocchino/sticky-pull-request-comment@v3
         if: success()
         with:
           header: semantic-pr-error
