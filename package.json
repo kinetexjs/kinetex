@@ -203,14 +203,14 @@
     "prepare": "husky || true"
   },
   "devDependencies": {
-    "@types/node": "^25.6.0",
+    "@types/node": "^25.9.1",
     "c8": "^11.0.0",
     "esbuild": "^0.28.0",
     "husky": "^9.1.0",
     "lint-staged": "^15.5.0",
     "prettier": "3.8.3",
     "ts-prune": "^0.10.3",
-    "tsx": "^4.21.0",
+    "tsx": "^4.22.3",
     "type-coverage": "^2.29.7",
     "typedoc": "^0.28.19",
     "typedoc-plugin-markdown": "^4.11.0",
