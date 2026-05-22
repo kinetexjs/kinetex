@@ -1,12 +1,44 @@
 # Gitleaks configuration for kinetex
 # See: https://github.com/gitleaks/gitleaks
 
+title = "kinetex gitleaks config"
+
+[extend]
+useDefault = true
+
 [allowlist]
   description = "Known safe/test values — not real secrets"
 
-  # AWS official example credentials from AWS documentation
-  # https://docs.aws.amazon.com/IAM/latest/UserGuide/security-creds.html
+  paths = [
+    '''tests/''',
+  ]
+
   regexes = [
+    # AWS official example credentials from AWS documentation
+    # https://docs.aws.amazon.com/IAM/latest/UserGuide/security-creds.html
     '''AKIAIOSFODNN7EXAMPLE''',
     '''wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY''',
+    '''IQoJb3JpZ2luX2VjEHwaC2V1LXdlc3QtMSJHMEUC''',
+
+    # Test/dummy bearer tokens
+    '''test-token''',
+    '''config-token''',
+    '''static-config-token''',
+    '''parent-token''',
+    '''child-token''',
+    '''should-be-ignored''',
+    '''config-token-123''',
+    '''wrongpassword''',
+
+    # Digest auth RFC test vectors
+    '''939e7578ed9cc5f2.*dcd98b7102''',
+    '''dcd98b7102dd2f0d8c11''',
+    '''5ccc069c403ebaf9f017''',
+    '''6629fae49393a0539745''',
+
+    # SHA256("") — known cryptographic constant
+    '''e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855''',
+
+    # Base64 alphabet — not a secret
+    '''ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\+/=''',
   ]

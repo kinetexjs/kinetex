@@ -44,7 +44,7 @@ deno lint
 Optionally, run real-world API tests (requires internet):
 
 ```bash
-npm run test:real
+npm run node:battle
 ```
 
 And check coverage:

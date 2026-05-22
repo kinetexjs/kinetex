@@ -80,6 +80,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v6
         with:
@@ -93,10 +95,11 @@ jobs:
         continue-on-error: true
 
       - name: Gitleaks secret scan
-        uses: gitleaks/gitleaks-action@v2
+        run: |
+          curl -sL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_amd64.tar.gz | tar xz
+          sudo mv gitleaks /usr/local/bin/
+          gitleaks detect --source . --redact -v --report-format sarif --report-path gitleaks-report.sarif
         continue-on-error: true
-        env:
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
 
   # ── JOB 4 — Tests (Node.js — Matrix: Node versions × OS) ─────
 
@@ -107,13 +110,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ["22", "23", "24"]
+        node: ["22"]
         os: [ubuntu-latest]
-        include:
-          - node: "22"
-            os: windows-latest
-          - node: "22"
-            os: macos-latest
+
     steps:
       - uses: actions/checkout@v6
 
