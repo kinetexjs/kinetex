@@ -57,7 +57,7 @@ jobs:
           git archive --format=zip -o kinetex-dist.zip --prefix=kinetex-${{ github.ref_name }}/ HEAD
 
       - name: Generate SBOM (CycloneDX)
-        uses: advanced-security/sbom-generator-action@v0.0.1
+        uses: advanced-security/sbom-generator-action@v0.0.2
         id: sbom
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
