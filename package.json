@@ -207,7 +207,7 @@
     "lint-staged": "^17.0.7",
     "prettier": "3.8.3",
     "ts-prune": "^0.10.3",
-    "tsx": "^4.22.3",
+    "tsx": "^4.22.4",
     "type-coverage": "^2.29.7",
     "typedoc": "^0.28.19",
     "typedoc-plugin-markdown": "^4.11.0",
