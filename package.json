@@ -210,7 +210,7 @@
     "tsx": "^4.22.4",
     "type-coverage": "^2.29.7",
     "typedoc": "^0.28.19",
-    "typedoc-plugin-markdown": "^4.11.0",
+    "typedoc-plugin-markdown": "^4.12.0",
     "typescript": "^6.0.3"
   }
 }
