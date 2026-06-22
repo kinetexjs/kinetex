@@ -200,7 +200,7 @@
     "prepare": "husky || true"
   },
   "devDependencies": {
-    "@types/node": "^25.9.3",
+    "@types/node": "^25.9.4",
     "c8": "^11.0.0",
     "esbuild": "^0.28.1",
     "husky": "^9.1.0",
