@@ -205,7 +205,7 @@
     "esbuild": "^0.28.1",
     "husky": "^9.1.0",
     "lint-staged": "^17.1.0",
-    "prettier": "3.9.5",
+    "prettier": "3.9.6",
     "ts-prune": "^0.10.3",
     "tsx": "^4.23.1",
     "type-coverage": "^2.30.1",
