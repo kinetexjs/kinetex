@@ -1,6 +1,6 @@
 {
   "name": "@kinetexjs/kinetex",
-  "version": "1.0.0-rc.2",
+  "version": "1.0.0-rc.1",
   "license": "MIT",
   "nodeModulesDir": "none",
   "description": "Feature-rich, universal TypeScript HTTP client.",
