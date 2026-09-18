@@ -67,6 +67,7 @@ async function main() {
   deno.version = newVersion;
   writeFileSync("deno.json", JSON.stringify(deno, null, 2) + "\n");
   console.log(`  ✓ deno.json: ${newVersion}`);
+  run("npx prettier --write package.json deno.json --log-level=warn");
 
   console.log("\n[4/7] Running build, typecheck, and lint...");
   run("npm run build");
