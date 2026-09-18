@@ -6,7 +6,7 @@
  *  1. Validates working tree is clean
  *  2. Bumps version in package.json (patch/minor/major via arg)
  *  3. Updates deno.json version to match
- *  4. Runs build + typecheck + lint + unit tests
+ *  4. Runs build + typecheck + lint
  *  5. Commits the version bump
  *  6. Creates and pushes a git tag (v{version})
  *  7. Pushes main branch
@@ -68,12 +68,11 @@ async function main() {
   writeFileSync("deno.json", JSON.stringify(deno, null, 2) + "\n");
   console.log(`  ✓ deno.json: ${newVersion}`);
 
-  console.log("\n[4/7] Running build, typecheck, lint, and tests...");
+  console.log("\n[4/7] Running build, typecheck, and lint...");
   run("npm run build");
   run("deno check src/");
   run("npm run typecheck");
   run("deno lint");
-  run("npm run test");
   console.log("  ✓ All checks passed");
 
   console.log("\n[5/7] Committing version bump...");

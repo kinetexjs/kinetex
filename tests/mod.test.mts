@@ -431,29 +431,15 @@ describe("mod - Fluent Request Builder", () => {
 
   it("Fluent subscribe() callback method", async () => {
     const client = kinetex({ baseURL: "https://httpbin.org" });
-    let callbackCalled = false;
-
-    client.GET("/get").subscribe(
-      (res) => {
-        callbackCalled = true;
-        console.log("Fluent subscribe() success - actual response:");
-        console.log(
-          JSON.stringify(
-            {
-              status: res.status,
-              data: res.data,
-            },
-            null,
-            2,
-          ),
+    const callbackCalled = await Promise.race([
+      new Promise<boolean>((resolve) => {
+        client.GET("/get").subscribe(
+          () => resolve(true),
+          () => resolve(false),
         );
-      },
-      (err) => {
-        console.log("Fluent subscribe() error:", err.message);
-      },
-    );
-
-    await new Promise((resolve) => setTimeout(resolve, 5000));
+      }),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 30_000)),
+    ]);
     assert.strictEqual(callbackCalled, true);
     client.destroy();
   });
