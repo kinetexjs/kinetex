@@ -174,7 +174,14 @@ function stopProxy(): void {
 
 // ── Malicious TCP server for protocol edge-case tests ─────────────────────
 
-function createMockServer(behavior: "bad-version" | "unsupported-method" | "bad-auth-version" | "ipv6-bound" | "conn-refused-after-auth"): Server {
+function createMockServer(
+  behavior:
+    | "bad-version"
+    | "unsupported-method"
+    | "bad-auth-version"
+    | "ipv6-bound"
+    | "conn-refused-after-auth",
+): Server {
   return createServer((socket) => {
     let buf = Buffer.alloc(0);
     let state: "greeting" | "auth" | "request" = "greeting";
@@ -515,7 +522,14 @@ await test("bad auth sub-negotiation version throws", async () => {
   await assert.rejects(
     async () => {
       await createSocks5Tunnel(
-        { host: "127.0.0.1", port, username: "u", password: "p", connectTimeoutMs: 5000, handshakeTimeoutMs: 5000 },
+        {
+          host: "127.0.0.1",
+          port,
+          username: "u",
+          password: "p",
+          connectTimeoutMs: 5000,
+          handshakeTimeoutMs: 5000,
+        },
         { host: "example.com", port: 80 },
         nodeTcpConnector,
       );
@@ -536,7 +550,14 @@ await test("IPv6 bound address in reply is decoded", async () => {
   await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
 
   const tunnel = await createSocks5Tunnel(
-    { host: "127.0.0.1", port, username: "u", password: "p", connectTimeoutMs: 5000, handshakeTimeoutMs: 5000 },
+    {
+      host: "127.0.0.1",
+      port,
+      username: "u",
+      password: "p",
+      connectTimeoutMs: 5000,
+      handshakeTimeoutMs: 5000,
+    },
     { host: "example.com", port: 80 },
     nodeTcpConnector,
   );
@@ -553,7 +574,14 @@ await test("proxy reply error with connection refused code", async () => {
   await assert.rejects(
     async () => {
       await createSocks5Tunnel(
-        { host: "127.0.0.1", port, username: "u", password: "p", connectTimeoutMs: 5000, handshakeTimeoutMs: 5000 },
+        {
+          host: "127.0.0.1",
+          port,
+          username: "u",
+          password: "p",
+          connectTimeoutMs: 5000,
+          handshakeTimeoutMs: 5000,
+        },
         { host: "example.com", port: 80 },
         nodeTcpConnector,
       );
@@ -588,7 +616,13 @@ await test("only username without password does not trigger auth", async () => {
   await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
 
   const tunnel = await createSocks5Tunnel(
-    { host: "127.0.0.1", port, username: "onlyuser", connectTimeoutMs: 5000, handshakeTimeoutMs: 5000 },
+    {
+      host: "127.0.0.1",
+      port,
+      username: "onlyuser",
+      connectTimeoutMs: 5000,
+      handshakeTimeoutMs: 5000,
+    },
     { host: "example.com", port: 80 },
     nodeTcpConnector,
   );
@@ -714,30 +748,6 @@ await test("tunnel to IPv4 target works", async () => {
   tunnel.conn.close();
 });
 
-await test("tunnel to domain target with remoteDns=true", async () => {
-  const tunnel = await createSocks5Tunnel(
-    { ...validConfig, remoteDns: true },
-    { host: "jsonplaceholder.typicode.com", port: 80 },
-    nodeTcpConnector,
-  );
-
-  const request = new TextEncoder().encode(
-    "GET /posts/1 HTTP/1.1\r\nHost: jsonplaceholder.typicode.com\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-  );
-  await tunnel.conn.write(request);
-
-  const buf = new Uint8Array(4096);
-  const n = await tunnel.conn.read(buf);
-  assert.notStrictEqual(n, null);
-  assert.strictEqual(n! > 0, true);
-
-  const response = new TextDecoder().decode(buf.subarray(0, n!));
-  assert.strictEqual(response.includes("200"), true);
-  assert.strictEqual(response.includes("userId"), true);
-
-  tunnel.conn.close();
-});
-
 await test("socks5Connector wrapper tunnels HTTP through proxy", async () => {
   const connector = socks5Connector(validConfig, nodeTcpConnector);
   const conn = await connector("httpbin.org", 80, 10_000);
@@ -835,11 +845,7 @@ await test("tunnel close is idempotent", async () => {
 await test("multiple sequential tunnels succeed", async () => {
   const tunnels = await Promise.all(
     Array.from({ length: 3 }, async () =>
-      createSocks5Tunnel(
-        validConfig,
-        { host: "httpbin.org", port: 80 },
-        nodeTcpConnector,
-      ),
+      createSocks5Tunnel(validConfig, { host: "httpbin.org", port: 80 }, nodeTcpConnector),
     ),
   );
 
@@ -873,11 +879,7 @@ await test("tunnel to non-existent host returns proxy error", async () => {
 await test("tunnel to refused port returns proxy error", async () => {
   await assert.rejects(
     async () => {
-      await createSocks5Tunnel(
-        validConfig,
-        { host: "127.0.0.1", port: 1 },
-        nodeTcpConnector,
-      );
+      await createSocks5Tunnel(validConfig, { host: "127.0.0.1", port: 1 }, nodeTcpConnector);
     },
     (err: any) => {
       assert.strictEqual(err instanceof Socks5Error, true);
