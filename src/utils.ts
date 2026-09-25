@@ -275,7 +275,11 @@ export function sanitizeParsedJSON<T>(value: T): T {
       delete obj[key];
       continue;
     }
-    obj[key] = sanitizeParsedJSON(obj[key]);
+    // Recurse without writing back: sanitizeParsedJSON mutates its argument
+    // in place and returns the same reference, so a `obj[key] = ...` write
+    // would be a redundant dynamic assignment with a remote-controlled key
+    // (CodeQL: remote property injection).
+    sanitizeParsedJSON(obj[key]);
   }
   return value;
 }
