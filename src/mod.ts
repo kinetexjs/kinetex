@@ -529,6 +529,7 @@ export {
   safeJSONParse,
   tryParseJSON,
   parseUntrustedJSON,
+  sanitizeParsedJSON,
   isUint8Array,
   isArrayBuffer,
   isReadableStream,

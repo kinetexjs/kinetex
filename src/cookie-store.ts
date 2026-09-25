@@ -493,6 +493,18 @@ export class CookieJar {
           // §5.4 step 2e: SameSite
           if (!sameSiteAllows(cookie.sameSite, context)) continue;
 
+          // FIX (H5): defense-in-depth — re-validate __Secure-/__Host- prefix
+          // rules at retrieval time. Set-time enforcement (enforcePrefixRules)
+          // is the RFC rule, but storage can be rehydrated via loadCookieJar
+          // from external JSON, so never emit a prefix cookie whose Secure/
+          // Path/hostOnly flags no longer satisfy the contract.
+          if (cookie.name.startsWith("__Secure-") && !(cookie.secure && isSecure)) continue;
+          if (
+            cookie.name.startsWith("__Host-") &&
+            !(cookie.secure && isSecure && cookie.path === "/" && cookie.hostOnly)
+          )
+            continue;
+
           result.push(cookie);
         }
       }

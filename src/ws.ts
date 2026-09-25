@@ -18,6 +18,10 @@
  *  - Cross-runtime: Node.js 22, Deno, Bun, Browser, Cloudflare Workers
  */
 
+// FIX (H6): remote WS payloads are untrusted — parsed JSON dispatched to
+// listeners is stripped of prototype-pollution keys (see sanitizeParsedJSON).
+import { sanitizeParsedJSON } from "./utils.ts";
+
 // ============================================================================
 // §1  TYPES
 // ============================================================================
@@ -1006,7 +1010,9 @@ export class WSClient {
           data = evt.data;
           bytes = new TextEncoder().encode(data).byteLength;
           try {
-            json = JSON.parse(data);
+            // FIX (H6): remote WS payloads are untrusted — strip
+            // prototype-pollution keys before dispatching to listeners.
+            json = sanitizeParsedJSON(JSON.parse(data));
           } catch {
             /* not JSON */
           }

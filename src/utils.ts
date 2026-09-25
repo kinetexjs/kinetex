@@ -248,6 +248,39 @@ export function tryParseJSON<T = unknown>(text: string): T | string {
 }
 
 /**
+ * FIX (H6): Strip prototype-pollution keys from a freshly parsed JSON value.
+ *
+ * Recursively removes own properties named `__proto__`, `constructor`, and
+ * `prototype` from plain objects. Use immediately after any raw `JSON.parse`
+ * that does not go through {@link safeJSONParse} (streaming parsers, legacy
+ * helpers) so that untrusted payloads can never smuggle pollution keys into
+ * downstream spread/merge operations.
+ *
+ * @param value - Parsed JSON value (mutated copy is returned for objects/arrays).
+ * @returns Sanitized value — same reference for primitives.
+ */
+export function sanitizeParsedJSON<T>(value: T): T {
+  if (value === null || typeof value !== "object") return value;
+
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      (value as unknown[])[i] = sanitizeParsedJSON(value[i]);
+    }
+    return value;
+  }
+
+  const obj = value as Record<string, unknown>;
+  for (const key of Object.keys(obj)) {
+    if (key === "__proto__" || key === "constructor" || key === "prototype") {
+      delete obj[key];
+      continue;
+    }
+    obj[key] = sanitizeParsedJSON(obj[key]);
+  }
+  return value;
+}
+
+/**
  * Parse JSON with reduced limits for untrusted input.
  *
  * @typeParam T - Expected parsed type
@@ -466,40 +499,171 @@ const FORBIDDEN_SCHEMES = new Set([
   "urn",
 ]);
 
+// FIX (H1): The regex-based PRIVATE_IP_RANGES list was bypassable via
+// IPv6 forms like `http://[::0:1]/`, `http://[::ffff:7f00:1]/` (hex), and
+// `http://[::ffff:a9fe:a9fe]/` (IMDS 169.254.169.254), plus numeric IPv4
+// hostnames like `http://2130706433/` (127.0.0.1) and `http://0x7f000001/`.
+// isSafeURL() now expands addresses to bytes and compares ranges numerically.
+
 /**
- * Private IP ranges that must be blocked to prevent SSRF attacks.
- *
- * IPv6 coverage:
- * - ::1 (loopback)
- * - fc00::/7 (ULA - includes fc00: and fd00:)
- * - fe80::/10 (link-local)
- * - 2001:db8::/32 (documentation)
- * - ::/96 (IPv4-compatible - deprecated but still seen)
- * - IPv4-mapped IPv6 (::ffff:x.x.x.x)
+ * Reserved IPv4 ranges blocked for SSRF prevention, as [lo, hi] 32-bit values.
  */
-const PRIVATE_IP_RANGES = [
-  /^127\./, // loopback
-  /^10\./, // RFC 1918
-  /^192\.168\./, // RFC 1918
-  /^172\.(1[6-9]|2\d|3[01])\./, // RFC 1918
-  /^169\.254\./, // link-local (AWS IMDS, etc.)
-  /^0\./, // this-network
-  /^::1$/i, // IPv6 loopback
-  /^fc00:/i, // IPv6 ULA (fc00::/7 - includes fc00: and fd00:)
-  /^fd00:/i, // IPv6 ULA (fd00::/8 - unique local)
-  /^fe80:/i, // IPv6 link-local (fe80::/10)
-  /^2001:db8:/i, // IPv6 documentation range
-  /^::0?ffff:/i, // IPv4-mapped IPv6 (::ffff:...)
-  /^0:0:0:0:0:ffff:/i, // IPv4-mapped compressed form
-  // FIX 4: IPv4-mapped IPv6 SSRF bypass — e.g. http://[::ffff:127.0.0.1]
-  /^::ffff:127\./i, // IPv4-mapped loopback
-  /^::ffff:10\./i, // IPv4-mapped RFC 1918
-  /^::ffff:192\.168\./i, // IPv4-mapped RFC 1918
-  /^::ffff:172\.(1[6-9]|2\d|3[01])\./i, // IPv4-mapped RFC 1918
-  /^::ffff:169\.254\./i, // IPv4-mapped link-local
-  /^0:0:0:0:0:ffff:7f/i, // compressed form of ::ffff:127.x
-  /^::$/i, // IPv4-compatible :: (any ::/96)
+const IPV4_BLOCKED_RANGES: Array<[number, number]> = [
+  [0x00000000, 0x00ffffff], // 0.0.0.0/8 — this-network
+  [0x0a000000, 0x0affffff], // 10.0.0.0/8 — RFC 1918 private
+  [0x64400000, 0x647fffff], // 100.64.0.0/10 — CGNAT (RFC 6598)
+  [0x7f000000, 0x7fffffff], // 127.0.0.0/8 — loopback
+  [0xa9fe0000, 0xa9feffff], // 169.254.0.0/16 — link-local (AWS IMDS etc.)
+  [0xac100000, 0xac1fffff], // 172.16.0.0/12 — RFC 1918 private
+  [0xc0000000, 0xc00000ff], // 192.0.0.0/24 — IETF protocol assignments
+  [0xc0000200, 0xc00002ff], // 192.0.2.0/24 — TEST-NET-1
+  [0xc0a80000, 0xc0a8ffff], // 192.168.0.0/16 — RFC 1918 private
+  [0xc6120000, 0xc613ffff], // 198.18.0.0/15 — benchmarking
+  [0xc6336400, 0xc63364ff], // 198.51.100.0/24 — TEST-NET-2
+  [0xcb007100, 0xcb0071ff], // 203.0.113.0/24 — TEST-NET-3
+  [0xe0000000, 0xefffffff], // 224.0.0.0/4 — multicast
+  [0xf0000000, 0xffffffff], // 240.0.0.0/4 — reserved (incl. 255.255.255.255)
 ];
+
+/** True when the 32-bit IPv4 value falls inside a reserved/blocked range. */
+function isBlockedIPv4(n: number): boolean {
+  return IPV4_BLOCKED_RANGES.some(([lo, hi]) => n >= lo && n <= hi);
+}
+
+/** Parse one dotted/numeric component: decimal, hex (0x…), or octal (0…). */
+function parseIPv4Component(p: string): number | null {
+  if (p === "") return null;
+  if (/^0[xX][0-9a-fA-F]+$/.test(p)) return parseInt(p, 16);
+  if (/^0[0-7]+$/.test(p)) return parseInt(p, 8);
+  if (/^\d+$/.test(p)) return parseInt(p, 10);
+  return null;
+}
+
+/**
+ * Best-effort parse of a dotted or numeric IPv4 literal, accepting decimal,
+ * hex (0x…), and octal (0…) component forms — the same shapes URL parsers
+ * and resolvers accept (e.g. "2130706433", "0x7f.1", "0177.0.0.1").
+ * Returns the 32-bit value, or null when the host cannot be an IPv4 literal.
+ */
+function parseIPv4Host(host: string): number | null {
+  if (host.includes(":") || !/^[0-9a-fA-FxX.]+$/.test(host)) return null;
+  const parts = host.split(".");
+  if (parts.length > 4) return null;
+  if (parts.length === 1) {
+    const v = parseIPv4Component(parts[0]!);
+    if (v === null || v > 0xffffffff) return null;
+    return v >>> 0;
+  }
+  const nums: number[] = [];
+  for (const p of parts) {
+    const v = parseIPv4Component(p);
+    // Last part may absorb the remainder per WHATWG; cap it at 24 bits.
+    const isLast = p === parts[parts.length - 1];
+    if (v === null || v > (isLast && nums.length === 3 ? 0xff : 0xff)) return null;
+    nums.push(v);
+  }
+  while (nums.length < 4) nums.push(0);
+  return ((nums[0]! << 24) | (nums[1]! << 16) | (nums[2]! << 8) | nums[3]!) >>> 0;
+}
+
+/**
+ * Expand an IPv6 address (bracket-stripped) into its 16 bytes.
+ * Handles :: compression, IPv4-mapped dotted tails, and zone indexes.
+ * Returns null when the address is not a valid IPv6 literal.
+ */
+function parseIPv6Host(host: string): Uint8Array | null {
+  if (!host.includes(":")) return null;
+  const bare = host.split("%")[0]!; // strip zone index (fe80::1%eth0)
+  const halves = bare.split("::");
+  if (halves.length > 2) return null;
+
+  const expandGroups = (part: string): number[] | null => {
+    if (part === "") return [];
+    const groups = part.split(":");
+    const out: number[] = [];
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i]!;
+      if (g === "") return null;
+      if (g.includes(".")) {
+        // IPv4 dotted tail (e.g. ::ffff:127.0.0.1) must be the last group
+        if (i !== groups.length - 1) return null;
+        const n = parseIPv4Host(g);
+        if (n === null) return null;
+        out.push((n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff);
+      } else {
+        if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+        const v = parseInt(g, 16);
+        out.push((v >>> 8) & 0xff, v & 0xff);
+      }
+    }
+    return out;
+  };
+
+  let bytes: number[];
+  if (halves.length === 2) {
+    const left = expandGroups(halves[0]!);
+    const right = expandGroups(halves[1]!);
+    if (!left || !right) return null;
+    const fill = 16 - left.length - right.length;
+    if (fill < 0) return null;
+    bytes = [...left, ...new Array<number>(fill).fill(0), ...right];
+  } else {
+    const all = expandGroups(bare);
+    if (!all || all.length !== 16) return null;
+    bytes = all;
+  }
+  return bytes.length === 16 ? new Uint8Array(bytes) : null;
+}
+
+/** True when the 16-byte IPv6 address is in a reserved/blocked range. */
+function isBlockedIPv6(b: Uint8Array): boolean {
+  const read32 = (i: number): number =>
+    ((b[i]! << 24) | (b[i + 1]! << 16) | (b[i + 2]! << 8) | b[i + 3]!) >>> 0;
+
+  // :: (unspecified) — always blocked
+  if (b.every((x) => x === 0)) return true;
+  // ::1/128 — loopback
+  if (b.slice(0, 15).every((x) => x === 0) && b[15] === 1) return true;
+
+  const first = b[0]!;
+  // fc00::/7 — unique local addresses (fc00::/8 + fd00::/8)
+  if ((first & 0xfe) === 0xfc) return true;
+  // fe80::/10 — link-local
+  if (first === 0xfe && (b[1]! & 0xc0) === 0x80) return true;
+  // ff00::/8 — multicast
+  if (first === 0xff) return true;
+  // 2001:db8::/32 — documentation
+  if (b[0] === 0x20 && b[1] === 0x01 && b[2] === 0x0d && b[3] === 0xb8) return true;
+
+  // ::ffff:0:0/96 — IPv4-mapped → apply the IPv4 checks to the tail
+  if (
+    b.slice(0, 10).every((x) => x === 0) &&
+    b[10] === 0xff &&
+    b[11] === 0xff
+  ) {
+    return isBlockedIPv4(read32(12));
+  }
+  // ::/96 — deprecated IPv4-compatible → apply the IPv4 checks to the tail
+  // (covers e.g. [::127.0.0.1] and [::169.254.169.254])
+  if (b.slice(0, 12).every((x) => x === 0)) {
+    return isBlockedIPv4(read32(12));
+  }
+  // 64:ff9b::/96 — NAT64 (RFC 6052): traffic is translated to the embedded IPv4
+  if (
+    b[0] === 0x00 &&
+    b[1] === 0x64 &&
+    b[2] === 0xff &&
+    b[3] === 0x9b &&
+    b.slice(4, 12).every((x) => x === 0)
+  ) {
+    return isBlockedIPv4(read32(12));
+  }
+  // 2002::/16 — 6to4: the embedded IPv4 sits in bits 16–47
+  if (b[0] === 0x20 && b[1] === 0x02) {
+    return isBlockedIPv4(read32(2));
+  }
+  return false;
+}
 
 /**
  * Validate a URL for safety.
@@ -526,16 +690,22 @@ export function isSafeURL(
     }
 
     let host = parsed.hostname.toLowerCase();
-    // Strip IPv6 brackets for consistent matching
-    if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
-    // Normalize expanded IPv6 loopback (::1 → 0:0:0:0:0:0:0:1)
-    if (host === "0:0:0:0:0:0:0:1") host = "::1";
+    const isV6Literal = host.startsWith("[") && host.endsWith("]");
+    if (isV6Literal) host = host.slice(1, -1);
 
-    // Block loopback and localhost
-    if (host === "localhost" || host === "0.0.0.0") return false;
+    // Block loopback hostnames (including *.localhost subdomains)
+    if (host === "localhost" || host.endsWith(".localhost") || host === "0.0.0.0") return false;
 
-    // Block private IP ranges (SSRF prevention)
-    if (PRIVATE_IP_RANGES.some((r) => r.test(host))) return false;
+    // Block private/reserved IPs (SSRF prevention) — numeric comparison over
+    // expanded bytes so every IPv6 spelling and numeric IPv4 form is covered.
+    if (isV6Literal || host.includes(":")) {
+      const v6 = parseIPv6Host(host);
+      // Unparseable IPv6 literal → reject defensively
+      if (v6 === null || isBlockedIPv6(v6)) return false;
+    } else {
+      const v4 = parseIPv4Host(host);
+      if (v4 !== null && isBlockedIPv4(v4)) return false;
+    }
 
     // Check for suspicious patterns (path traversal)
     if (parsed.hostname.includes("..") || parsed.pathname.includes("..")) {
@@ -611,6 +781,8 @@ export function deepClone<T>(value: T): T {
   }
   const cloned: Record<string, unknown> = {};
   for (const key in value) {
+    // Prototype-pollution guard: never copy __proto__ / constructor / prototype
+    if (key === "__proto__" || key === "constructor" || key === "prototype") continue;
     if (Object.prototype.hasOwnProperty.call(value, key)) {
       cloned[key] = deepClone((value as Record<string, unknown>)[key]);
     }
@@ -923,31 +1095,26 @@ export function isAbortError(error: unknown): boolean {
  * Uses `crypto.getRandomValues()` which is available in all target runtimes
  * (Node 18+, Deno, Bun, Browser, Cloudflare Workers, Vercel Edge).
  *
- * Falls back to `crypto.randomUUID()` as a secondary CSPRNG path for
- * hypothetical environments without `getRandomValues`.
+ * FIX (M8): removed the `Math.random()` fallback — non-CSPRNG output must
+ * never be used for nonces/cnonces (digest auth) or trace IDs. Environments
+ * without a CSPRNG now fail fast instead of silently producing predictable
+ * values.
  *
  * @param byteCount - Number of random bytes (output hex length = byteCount * 2)
  * @returns Hex-encoded random string
+ * @throws {Error} When no CSPRNG is available in the current runtime
  */
 export function randomBytes(byteCount: number): string {
+  if (!Number.isInteger(byteCount) || byteCount < 0 || byteCount > 65536) {
+    throw new Error(`randomBytes: invalid byteCount ${byteCount}`);
+  }
   const arr = new Uint8Array(byteCount);
   if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
     crypto.getRandomValues(arr);
   } else {
-    // Fallback: crypto.randomUUID() returns 36 hex chars (16 random bytes)
-    // in all WinterCG-compliant runtimes. Repeat to fill requested length.
-    const uuid =
-      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-        ? crypto.randomUUID().replace(/-/g, "")
-        : "";
-    if (uuid.length >= byteCount * 2) {
-      return uuid.slice(0, byteCount * 2);
-    }
-    // Last-resort fallback for environments with no crypto at all.
-    // This should never be reached in any runtime kinetex targets.
-    for (let i = 0; i < arr.length; i++) {
-      arr[i] = Math.floor(Math.random() * 256);
-    }
+    throw new Error(
+      "randomBytes: no CSPRNG available in this runtime — crypto.getRandomValues is required",
+    );
   }
   return Array.from(arr)
     .map((b) => b.toString(16).padStart(2, "0"))

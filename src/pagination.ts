@@ -23,6 +23,10 @@
  *  - Pagination state serialization (resume support)
  */
 
+// FIX (H6): serialized pagination state may come from untrusted URLs —
+// parsed JSON is stripped of prototype-pollution keys (see sanitizeParsedJSON).
+import { sanitizeParsedJSON } from "./utils.ts";
+
 // ============================================================================
 // §1  TYPES
 // ============================================================================
@@ -894,7 +898,9 @@ export function serializePaginationState(state: PaginationState): string {
  */
 export function deserializePaginationState(serialized: string): PaginationState {
   try {
-    return JSON.parse(atob(serialized)) as PaginationState;
+    // FIX (H6): serialized state can originate from untrusted URLs/clients —
+    // strip prototype-pollution keys before the state is spread into requests.
+    return sanitizeParsedJSON(JSON.parse(atob(serialized)) as PaginationState);
   } catch {
     throw new Error("Invalid pagination state string");
   }

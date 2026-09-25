@@ -525,10 +525,19 @@ await test("retry with already aborted signal throws", async () => {
   assert.ok(threw, `Expected AbortError or DOMException but got: ${caughtErr instanceof Error ? caughtErr.constructor.name : typeof caughtErr}`);
 });
 
-await test("client.GET().proxy() sets proxy config", async () => {
-  const res = await bin.GET("/get").proxy({ host: "proxy.example.com", port: 8080 }).send();
-  console.log(`    → proxy() executed: ${res.status}`);
-  assert.equal(res.status, 200);
+await test("client.GET().proxy() fails fast (proxy is not wired into transports)", async () => {
+  // FIX (M7): proxy config is a silent no-op — the client now throws with
+  // actionable guidance instead of sending traffic directly to the target.
+  await assert.rejects(
+    () => bin.GET("/get").proxy({ host: "proxy.example.com", port: 8080 }).send(),
+    (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.match(err.message, /proxy is configured but/);
+      assert.match(err.message, /undici ProxyAgent|createSocks5Tunnel/);
+      return true;
+    },
+  );
+  console.log(`    → proxy() correctly rejected with guidance`);
 });
 
 await test("client.GET().headers() merges multiple headers", async () => {

@@ -628,16 +628,24 @@ export class NodeHTTP2Transport implements Transport {
             }
           }
           if (hasForbidden) {
-            if (this._onDroppedHeader) {
-              this._onDroppedHeader(hName, hStr);
-              delete (h2ReqHeaders as Record<string, unknown>)[hName];
-            } else {
+            if (this._strict) {
               throw new KinetexError(
                 `Strict mode: header "${hName}" contains forbidden control characters`,
                 "EVALIDATION",
                 { request: currentReq },
               );
             }
+            // FIX (H3): non-strict mode must match FetchTransport behavior —
+            // notify the callback (if any) and warn, never drop silently.
+            if (this._onDroppedHeader) {
+              this._onDroppedHeader(hName, hStr);
+            } else if (typeof console !== "undefined") {
+              console.warn(
+                `[kinetex] Invalid header dropped (HTTP/2): "${hName}" — value contains illegal control characters. ` +
+                  `Pass strictHeaders: true to throw instead.`,
+              );
+            }
+            delete (h2ReqHeaders as Record<string, unknown>)[hName];
           }
         }
       }
@@ -936,9 +944,14 @@ export function createTransport(
   },
   transportOptions?: Pick<FetchTransportOptions, "strict" | "onDroppedHeader">,
 ): Transport {
-  // Use NodeHTTP2Transport for Node.js when HTTP/2 is preferred
-  // Falls back to FetchTransport for HTTP/1.1 or non-Node runtimes
-  if (IS_NODE && preferHTTP2) {
+  // FIX (M7-class silent no-op): a custom `fetch` config was silently ignored on
+  // Node.js when HTTP/2 was preferred (the default) — NodeHTTP2Transport has no
+  // fetchFn input, so the caller's fetch was never used. When a custom fetch is
+  // supplied, always route through FetchTransport so the documented
+  // "Custom fetch implementation" behavior holds on every runtime.
+  // Use NodeHTTP2Transport for Node.js when HTTP/2 is preferred and no custom
+  // fetch is given. Falls back to FetchTransport otherwise.
+  if (IS_NODE && preferHTTP2 && !fetchFn) {
     return new NodeHTTP2Transport({
       ...(sessionOptions?.sessionTTLMs !== undefined
         ? { sessionTTLMs: sessionOptions.sessionTTLMs }
@@ -998,8 +1011,19 @@ export async function sendWithTimeout(
   const signal = mergeSignals(request.signal, controller.signal) ?? null;
   const req = { ...request, signal };
 
+  const timeoutPromise = new Promise<RawResponse>((_, reject) => {
+    controller.signal.addEventListener(
+      "abort",
+      () => reject(new TimeoutError(timeoutMs, request)),
+      { once: true },
+    );
+  });
+
   try {
-    const result = await transport.send(req);
+    // Race the transport against the timer. The race is the actual deadline
+    // — a transport that never resolves (or ignores the abort signal) can no
+    // longer hang the caller past timeoutMs.
+    const result = await Promise.race([transport.send(req), timeoutPromise]);
     clearTimeout(timer);
     // Safety net: the transport may have resolved despite the abort signal
     // (e.g. Node.js HTTP/2 'close' fires before 'error' in some versions).
@@ -1010,7 +1034,7 @@ export async function sendWithTimeout(
     return result;
   } catch (err) {
     clearTimeout(timer);
-    if (controller.signal.aborted) {
+    if (controller.signal.aborted && !(err instanceof TimeoutError)) {
       throw new TimeoutError(timeoutMs, request);
     }
     throw err;

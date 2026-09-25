@@ -220,7 +220,12 @@ export class ResponseDecodeError extends Error {
  * Normalize a fetch Response headers to a plain object.
  */
 // FIX 12: normalizeHeaders centralised in utils.ts.
-import { normalizeHeaders as _normalizeHeadersUtil } from "./utils.ts";
+// FIX (H6): sanitizeParsedJSON strips __proto__/constructor/prototype keys
+// from freshly parsed JSON so untrusted payloads cannot pollute prototypes.
+import {
+  normalizeHeaders as _normalizeHeadersUtil,
+  sanitizeParsedJSON as _sanitizeParsedJSON,
+} from "./utils.ts";
 /** @deprecated use normalizeHeaders from utils.ts directly */
 export function normalizeHeaders(headers: Headers): Record<string, string> {
   return _normalizeHeadersUtil(headers);
@@ -654,7 +659,7 @@ export async function readJSON<T = unknown>(
   const text = decodeBody(bytes, charset, url);
 
   try {
-    return JSON.parse(text) as T;
+    return _sanitizeParsedJSON(JSON.parse(text) as T);
   } catch (err) {
     throw new ResponseDecodeError(`JSON parse failed: ${err}`, "json", url);
   }
@@ -786,7 +791,7 @@ export async function* readNDJSON<T = unknown>(
         const trimmed = buffer.trim();
         if (trimmed) {
           try {
-            yield JSON.parse(trimmed) as T;
+            yield _sanitizeParsedJSON(JSON.parse(trimmed) as T);
           } catch (err) {
             options.onParseError?.(err, trimmed);
           }
@@ -803,7 +808,7 @@ export async function* readNDJSON<T = unknown>(
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith("#")) continue;
         try {
-          yield JSON.parse(trimmed) as T;
+          yield _sanitizeParsedJSON(JSON.parse(trimmed) as T);
         } catch (err) {
           options.onParseError?.(err, trimmed);
         }
@@ -872,7 +877,7 @@ export async function* readJSONStream<T = unknown>(
         const remaining = flushBuffer();
         if (remaining) {
           try {
-            const obj = JSON.parse(remaining) as T;
+            const obj = _sanitizeParsedJSON(JSON.parse(remaining) as T);
             options.onObject?.(obj);
             yield obj;
           } catch (err) {
@@ -895,7 +900,7 @@ export async function* readJSONStream<T = unknown>(
           if (depth === 0 && startIdx !== -1) {
             const objStr = buffer.slice(startIdx, i + 1);
             try {
-              const obj = JSON.parse(objStr) as T;
+              const obj = _sanitizeParsedJSON(JSON.parse(objStr) as T);
               options.onObject?.(obj);
               yield obj;
             } catch (err) {
