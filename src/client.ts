@@ -252,6 +252,42 @@ function randomHex(len: number): string {
 // ============================================================================
 
 /**
+ * Headers redacted before being written to HAR entries (FIX M2).
+ * Mirrors logging.ts DEFAULT_REDACT_HEADERS — HAR logs are routinely exported
+ * and shared, so credentials must never appear verbatim.
+ */
+const HAR_REDACT_HEADERS = new Set([
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "set-cookie",
+  "x-api-key",
+  "x-auth-token",
+  "x-access-token",
+  "x-refresh-token",
+  "x-csrf-token",
+  "x-session-id",
+  "x-session-token",
+  "x-secret",
+  "x-secret-key",
+  "x-private-key",
+  "api-key",
+  "apikey",
+  "bearer",
+  "token",
+  "authentication",
+  "credentials",
+  "password",
+  "passwd",
+  "secret",
+]);
+
+/** Redact a single header value for HAR output. */
+function redactHARHeader(name: string, value: string): { name: string; value: string } {
+  return HAR_REDACT_HEADERS.has(name.toLowerCase()) ? { name, value: "***REDACTED***" } : { name, value };
+}
+
+/**
  * O(1) ring-buffer HAR entry recorder.
  * Stores up to `maxEntries` entries, evicting oldest first.
  */
@@ -320,7 +356,7 @@ class HARRecorder {
         method: req.method,
         url: req.url,
         httpVersion: res.httpVersion,
-        headers: Object.entries(req.headers).map(([name, value]) => ({ name, value })),
+        headers: Object.entries(req.headers).map(([name, value]) => redactHARHeader(name, value)),
         queryString: (() => {
           try {
             return Array.from(new URL(req.url).searchParams.entries()).map(([name, value]) => ({
@@ -343,7 +379,7 @@ class HARRecorder {
         status: res.status,
         statusText: res.statusText,
         httpVersion: res.httpVersion,
-        headers: Object.entries(res.headers).map(([name, value]) => ({ name, value })),
+        headers: Object.entries(res.headers).map(([name, value]) => redactHARHeader(name, value)),
         content: {
           size: res.rawBody?.byteLength ?? 0,
           mimeType: res.headers["content-type"] ?? "application/octet-stream",
@@ -408,7 +444,17 @@ async function applyAuth(req: KinetexRequest, auth: AuthConfig): Promise<Kinetex
   switch (auth.type) {
     case "bearer": {
       const token = typeof auth.token === "function" ? await auth.token() : auth.token;
-      headers["authorization"] = `Bearer ${token}`;
+      // FIX (H3): token values — especially from async providers — must be
+      // validated before injection. A token containing CRLF would split or
+      // forge headers on the wire (header injection).
+      const headerValue = `Bearer ${token}`;
+      if (!isValidHeaderValue(headerValue)) {
+        throw new KinetexError(
+          "Invalid bearer token — contains forbidden characters (CRLF/CTL)",
+          "EVALIDATION",
+        );
+      }
+      headers["authorization"] = headerValue;
       break;
     }
     case "basic": {
@@ -435,7 +481,23 @@ async function applyAuth(req: KinetexRequest, auth: AuthConfig): Promise<Kinetex
     }
     case "apikey": {
       const key = typeof auth.key === "function" ? await auth.key() : auth.key;
-      headers[auth.header.toLowerCase()] = key;
+      // FIX (LOW): validate the custom header name — an apikey header containing
+      // CRLF or spaces would be injected verbatim into the request.
+      if (!isValidHeaderName(auth.header)) {
+        throw new KinetexError(
+          `Invalid apikey auth header name: "${auth.header}"`,
+          "EVALIDATION",
+        );
+      }
+      // FIX (H3): the key value is equally attacker-influenced when provided
+      // via an async provider — validate before injection.
+      if (!isValidHeaderValue(String(key))) {
+        throw new KinetexError(
+          `Invalid apikey value for "${auth.header}" — contains forbidden characters`,
+          "EVALIDATION",
+        );
+      }
+      headers[auth.header.toLowerCase()] = String(key);
       break;
     }
     case "digest": {
@@ -461,6 +523,47 @@ async function applyAuth(req: KinetexRequest, auth: AuthConfig): Promise<Kinetex
 // ============================================================================
 // §5  URL BUILDING
 // ============================================================================
+
+/**
+ * Headers stripped when a redirect crosses origins (FIX H2).
+ * These carry credentials and must never be forwarded to a different origin.
+ */
+const CROSS_ORIGIN_STRIP_HEADERS = new Set([
+  "authorization",
+  "cookie",
+  "proxy-authorization",
+  "x-api-key",
+  "x-auth-token",
+  "x-access-token",
+  "x-refresh-token",
+  "x-csrf-token",
+  "x-session-id",
+  "x-session-token",
+  "x-secret",
+  "x-secret-key",
+  "x-private-key",
+  "api-key",
+  "apikey",
+  "www-authenticate",
+]);
+
+/**
+ * Strip userinfo (user:pass@) from a URL string for safe error messages (FIX M5).
+ * Falls back to a regex strip when the URL cannot be parsed.
+ */
+function redactUserInfo(url: string): string {
+  try {
+    const u = new URL(url);
+    if (u.username || u.password) {
+      u.username = "";
+      u.password = "";
+      return u.toString();
+    }
+    return url;
+  } catch {
+    return url.replace(/\/\/[^/@]*@/, "//");
+  }
+}
 
 /**
  * Resolve a URL against an optional base and append query parameters.
@@ -504,7 +607,7 @@ function buildURL(base: string | undefined, url: string, params: QueryParams | u
   if (!params || Object.keys(params).length === 0) {
     if (!isSafeURL(full)) {
       throw new KinetexError(
-        `URL "${full}" failed safety check — blocked private/loopback address or forbidden scheme`,
+        `URL "${redactUserInfo(full)}" failed safety check — blocked private/loopback address or forbidden scheme`,
         "EVALIDATION",
       );
     }
@@ -555,7 +658,7 @@ function buildURL(base: string | undefined, url: string, params: QueryParams | u
     // Validate the final URL with params
     if (!isSafeURL(result)) {
       throw new KinetexError(
-        `URL "${result}" failed safety check — blocked private/loopback address or forbidden scheme`,
+        `URL "${redactUserInfo(result)}" failed safety check — blocked private/loopback address or forbidden scheme`,
         "EVALIDATION",
       );
     }
@@ -604,6 +707,15 @@ function buildURL(base: string | undefined, url: string, params: QueryParams | u
     if (result.length > MAX_URL_LENGTH) {
       throw new KinetexError(
         `URL length ${result.length} bytes exceeds limit of ${MAX_URL_LENGTH} bytes`,
+        "EVALIDATION",
+      );
+    }
+
+    // FIX M4: the manual param-concat fallback previously returned WITHOUT a
+    // safety check — validate the assembled URL like every other path.
+    if (!isSafeURL(result)) {
+      throw new KinetexError(
+        `URL "${redactUserInfo(result)}" failed safety check — blocked private/loopback address or forbidden scheme`,
         "EVALIDATION",
       );
     }
@@ -1556,6 +1668,20 @@ export class Kinetex {
       mergeParams(this.cfg.params, options.params),
     );
 
+    // FIX (M7): proxy configuration was stored but never consumed — a silent
+    // no-op that sent traffic directly to the target, bypassing the user's
+    // proxy entirely. Fail fast with actionable guidance instead.
+    const proxy = options.proxy ?? this.cfg.proxy;
+    if (proxy) {
+      throw new KinetexError(
+        "proxy is configured but kinetex's built-in transports cannot route through it: " +
+          "HTTP(S) proxies require a custom fetch with a proxy agent (e.g. undici ProxyAgent " +
+          "passed via the `fetch` option), and SOCKS5 requires createSocks5Tunnel() from " +
+          "kinetex/socks5. Set up one of those instead of relying on `proxy` silently doing nothing.",
+        "EVALIDATION",
+      );
+    }
+
     // Enforce HTTPS-only if configured
     if (this.cfg.httpsOnly) {
       try {
@@ -1584,11 +1710,37 @@ export class Kinetex {
         bodySize = options.body.byteLength;
       } else if (options.body instanceof Blob) {
         bodySize = options.body.size;
+      } else if (ArrayBuffer.isView(options.body)) {
+        // FIX (H4): other typed-array/DataView views were uncounted.
+        // ArrayBuffer.isView() is used instead of `instanceof ArrayBufferView`
+        // because there is no runtime global to instanceof against.
+        bodySize = (options.body as ArrayBufferView).byteLength;
+      } else if (options.body instanceof URLSearchParams) {
+        // FIX (H4): previously silently skipped — count the serialized form.
+        bodySize = new TextEncoder().encode(options.body.toString()).byteLength;
       } else if (options.body instanceof FormData) {
-        // FormData size estimation is complex, skip for now
-        // In practice, browsers enforce their own limits
+        // FIX (H4): estimate multipart size instead of skipping entirely —
+        // the old skip allowed unbounded uploads past the configured limit.
+        const boundaryOverhead = 76; // per part: --boundary, headers, CRLF (conservative)
+        for (const [name, value] of options.body) {
+          bodySize += new TextEncoder().encode(name).byteLength + boundaryOverhead;
+          if (typeof value === "string") {
+            bodySize += new TextEncoder().encode(value).byteLength;
+          } else {
+            bodySize += value.size;
+          }
+        }
+        bodySize += boundaryOverhead; // final boundary
+      } else if (options.body instanceof ReadableStream) {
+        // FIX (H4): a stream's size cannot be known without consuming it —
+        // reject rather than silently bypassing the limit. Callers who need
+        // streaming uploads must pass maxRequestSize: 0 explicitly.
+        throw new KinetexError(
+          `maxRequestSize cannot be enforced for ReadableStream bodies — pass maxRequestSize: 0 to opt out, or buffer the body first`,
+          "EVALIDATION",
+        );
       } else if (options.body && typeof options.body === "object") {
-        bodySize = JSON.stringify(options.body).length;
+        bodySize = new TextEncoder().encode(JSON.stringify(options.body)).byteLength;
       }
 
       if (bodySize > maxRequestSize) {
@@ -1863,13 +2015,32 @@ export class Kinetex {
   ): Promise<RawResponse> {
     const MAX_REDIRECTS = 20;
     let currentReq: KinetexRequest = { ...req, redirect: "manual" as const };
+    const origin0 = (() => {
+      try {
+        return new URL(req.url).origin;
+      } catch {
+        return null;
+      }
+    })();
     // Track visited URLs to detect redirect loops
     const visited = new Set<string>();
 
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-      // Apply auth headers on every hop (they may have been lost during redirect)
+      // FIX H2 (part 2): re-apply auth on every hop ONLY while we remain on the
+      // original origin. Once a redirect has crossed origins, credential-bearing
+      // headers must not be re-injected — otherwise the cross-origin strip in
+      // the redirect branch below would be immediately undone.
       if (hop > 0 && appliedAuth) {
-        currentReq = await applyAuth(currentReq, appliedAuth);
+        const sameOrigin = (() => {
+          try {
+            return new URL(currentReq.url).origin === origin0;
+          } catch {
+            return false;
+          }
+        })();
+        if (sameOrigin) {
+          currentReq = await applyAuth(currentReq, appliedAuth);
+        }
       }
 
       // Fire request interceptors and onBeforeRequest hooks on every hop
@@ -1981,6 +2152,21 @@ export class Kinetex {
           nextHeaders["cookie"] = cookieHeader;
         } else {
           delete nextHeaders["cookie"];
+        }
+
+        // FIX H2: When the redirect crosses origins, strip credential-bearing
+        // headers (Authorization, Cookie, proxy auth, API keys) so secrets are
+        // never forwarded to a different origin (RFC 9110 7.1 semantics).
+        // Cookies for the new origin are re-established by the jar lookup above;
+        // jar scoping guarantees only same-site cookies apply.
+        try {
+          if (new URL(nextUrl).origin !== new URL(currentReq.url).origin) {
+            for (const h of CROSS_ORIGIN_STRIP_HEADERS) {
+              delete nextHeaders[h];
+            }
+          }
+        } catch {
+          /* nextUrl was already validated above */
         }
 
         currentReq = {

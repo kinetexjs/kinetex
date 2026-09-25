@@ -28,6 +28,9 @@
  */
 
 import { KinetexError as _KinetexError } from "./types.ts";
+// FIX (H6): JSON event payloads from the server are untrusted — strip
+// prototype-pollution keys before handing parsed data to user handlers.
+import { sanitizeParsedJSON } from "./utils.ts";
 
 // ============================================================================
 // §1  TYPES
@@ -689,7 +692,7 @@ export async function* jsonSSE<T = unknown>(
   for await (const evt of source) {
     if (!evt.data && evt.data !== "") continue;
     try {
-      const data = JSON.parse(evt.data, options.reviver) as T;
+      const data = sanitizeParsedJSON(JSON.parse(evt.data, options.reviver) as T);
       yield { event: evt.event, data, id: evt.id };
     } catch (err) {
       options.onError?.(err, evt);
@@ -739,7 +742,7 @@ export class SSERouter {
   onJSON<T>(eventType: string, handler: SSEEventHandler<T>): this {
     return this.on(eventType, async (data, evt) => {
       try {
-        const parsed = JSON.parse(data) as T;
+        const parsed = sanitizeParsedJSON(JSON.parse(data) as T);
         await handler(parsed, evt);
       } catch {
         /* ignore parse error */

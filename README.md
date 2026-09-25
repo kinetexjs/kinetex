@@ -155,7 +155,10 @@ const client = kinetex({
   rateLimit: { limit: 100, windowMs: 60_000, queue: true, maxQueue: 100 },
 
   // ── Proxy ──
-  proxy: { url: "socks5://127.0.0.1:1080" },
+  // NOTE: `proxy` fails fast — kinetex's built-in transports cannot route
+  // through it. Use the `fetch` option with a proxy-capable agent for
+  // HTTP(S) proxies, or createSocks5Tunnel() from "kinetex/socks5" for SOCKS5.
+  // proxy: { url: "socks5://127.0.0.1:1080" },  // → throws with guidance
 
   // ── Cache ──
   cache: { storage: "memory", ttlMs: 60_000, maxEntries: 1000, swr: true },
@@ -262,10 +265,8 @@ const data = await client
   .headers({ "X-A": "1", "X-B": "2" }) // multiple headers
   .param("page", "1") // single query param
   .params({ limit: "10", sort: "name" }) // multiple params
-  .query({ filter: "active" }) // alias for .params()
-  .body("raw text") // raw body
+  .withBody("raw text") // raw body (string, Uint8Array, ReadableStream, ...)
   .withJSON({ key: "value" }) // JSON body (sets Content-Type)
-  .withBody("text") // alias for .body()
   .withForm(formData) // FormData body
   .bearer("token") // Bearer auth
   .basic("user", "pass") // Basic auth
@@ -275,7 +276,7 @@ const data = await client
   .retry(3, { baseDelayMs: 1000 }) // Max retries + optional config
   .noRetry() // Skip retry
   .timeout(5000) // Timeout in ms
-  .proxy({ url: "socks5://..." }) // Proxy config
+  .proxy({ url: "socks5://..." }) // Throws — see "Proxy" note above; use fetch+agent or createSocks5Tunnel()
   .cache({ ttlMs: 5000 }) // Cache config
   .noCache() // Force fresh fetch
   .maxSize(1_000_000) // Max response size
@@ -428,10 +429,9 @@ The `ctx` parameter in `shouldRetry` and `onRetry` is of type `RetryContext`:
 interface RetryContext {
   attempt: number;
   maxRetries: number;
-  response?: KinetexResponse<unknown>;
-  error?: unknown;
+  response: KinetexResponse<unknown> | null; // null when the attempt failed before a response
+  error: unknown;
   request: KinetexRequest;
-  delayMs?: number;
 }
 ```
 
@@ -1319,6 +1319,23 @@ const sseClient = await client.sse("/events", {
 });
 ```
 
+### SSEClient Lifecycle & Health
+
+```ts
+// Collect a bounded number of events (resolves or aborts)
+const events = await sse.collect({ limit: 100, signal: controller.signal });
+
+// Health snapshot
+sse.url; // Current URL (updated after reconnect)
+sse.closed; // boolean
+sse.streamHealth;
+// { connected, totalEvents, totalReconnects, lastEventAt, lastEventId, reconnectAttempt }
+
+// Teardown
+sse.close(); // Graceful close — stops reconnecting
+destroy(); // Hard teardown
+```
+
 ---
 
 ## WebSocket
@@ -1386,11 +1403,34 @@ interface WSMetrics {
   bytesReceived: number;
   reconnectCount: number;
   totalConnectAttempts: number;
-  uptimeMs: number | null;
+  uptimeMs: number;
 }
 
 // Utility
 const ws = await connectWS("wss://api.example.com/ws", { onMessage: ... });
+
+// Connection state & health
+ws.state; // "CONNECTING" | "OPEN" | "CLOSING" | "CLOSED" | "RECONNECTING"
+ws.connected; // boolean
+ws.bufferedCount; // Messages queued while disconnected
+ws.metrics; // WSMetrics (see above)
+await ws.waitForOpen(5000); // Resolve when OPEN (throws on timeout)
+
+// Rooms (pub/sub groups — auto re-joined on reconnect when keepRooms: true)
+ws.join("prices");
+ws.join("orders", "v2"); // with optional namespace
+ws.leave("prices");
+ws.rooms; // readonly WSSubscribedRoom[]
+
+// Backpressure
+ws.backpressure; // { bufferedBytes, highWaterMark, lowWaterMark, isBackpressured, ... }
+await ws.drain(30_000); // Wait until outbound buffer is flushed
+await ws.drainAndClose(30_000); // Drain, then close gracefully
+ws.drainBuffer(); // Take queued offline messages as an array
+
+// Teardown
+ws.close(1000, "done"); // Close with code/reason (disconnects reconnect logic)
+ws.destroy(); // Hard teardown, no close frame
 ```
 
 ### Client-Level WebSocket
@@ -1761,8 +1801,33 @@ const customConnector: TcpConnector = socks5Connector({
 }); // Returns a TcpConnector function
 
 // Client-level proxy
-kinetex({
-  proxy: { url: "socks5://127.0.0.1:1080", username: "user", password: "pass" },
+// NOTE: like the per-request option, client-level `proxy` fails fast with
+// guidance instead of silently routing direct. For SOCKS5 use createSocks5Tunnel():
+try {
+  kinetex({
+    proxy: { url: "socks5://127.0.0.1:1080", username: "user", password: "pass" },
+  });
+} catch (e) {
+  // KinetexError: "proxy is configured but kinetex's built-in transports cannot
+  // route through it ..."
+}
+
+// Correct way to route through an HTTP(S) proxy — supply a proxy-aware fetch:
+import { ProxyAgent } from "undici"; // npm i undici (Node.js)
+const proxied = kinetex({
+  fetch: new ProxyAgent("http://127.0.0.1:8080").dispatch.bind(new ProxyAgent("http://127.0.0.1:8080")) as typeof fetch,
+});
+
+// Correct way to route through a SOCKS5 proxy — create a tunnel transport:
+import { createSocks5Tunnel } from "kinetex/socks5";
+const tunnel = createSocks5Tunnel({ proxyHost: "127.0.0.1", proxyPort: 1080 });
+const viaSocks = await tunnel.send({
+  url: "https://api.example.com/data",
+  method: "GET",
+  headers: {},
+  body: null,
+  signal: null,
+  meta: {},
 });
 ```
 
@@ -2493,6 +2558,17 @@ const result = parseUntrustedJSON(untrustedJson);
 // maxDepth: 16, maxStringLength: 1MB, maxArrayLength: 1000, maxObjectKeys: 100
 ```
 
+Also available: `sanitizeParsedJSON(value)` strips prototype-pollution keys
+(`__proto__`, `constructor`, `prototype`) from a value that was already parsed
+elsewhere (streaming parsers, legacy code paths).
+
+> **Built-in protection:** kinetex applies `sanitizeParsedJSON` automatically
+> to every untrusted JSON body it parses — `readJSON`, `readNDJSON`,
+> `readJSONStream`, GraphQL responses/batch/SSE events, SSE `jsonSSE()` and
+> `SSERouter.onJSON()`, and WebSocket `message.json`. Hostile
+> `"__proto__": {...}` keys in server payloads can never reach user code or
+> downstream merges.
+
 ---
 
 ## Type Guards & Utilities
@@ -2789,19 +2865,31 @@ import { kinetex } from "kinetex/browser";
 | Feature                     | Node 18+ | Node 22+ | Deno      | Bun | Browser      | CF Workers | Vercel Edge |
 | --------------------------- | -------- | -------- | --------- | --- | ------------ | ---------- | ----------- |
 | HTTP/1.1 fetch              | ✓        | ✓        | ✓         | ✓   | ✓            | ✓          | ✓           |
-| HTTP/2 (fetch)              | ✓        | ✓        | ✓         | ✓   | ✓            | ✓          | ✓           |
+| HTTP/2 (fetch, via Alt-Svc/runtime hints) | ✓* | ✓      | ✓         | ✓   | ✓            | ✓          | ✓           |
 | HTTP/2 (NodeHTTP2Transport) | ✗        | ✓        | ✗         | ✗   | ✗            | ✗          | ✗           |
-| HTTP/3 (detection)          | —        | —        | —         | —   | experimental | ✓          | —           |
-| WebSocket (WSClient)        | ✓        | ✓        | ✓         | ✓   | ✓            | partial    | ✗           |
+| HTTP/3 (detection via Alt-Svc) | ✓*   | ✓*       | ✓*        | ✓*  | experimental | ✓*         | ✓*          |
+| WebSocket (WSClient)        | ✗¹ (no native WebSocket) | ✓ | ✓ | ✓ | ✓ | partial² | ✗³          |
 | SOCKS5 proxy                | ✓        | ✓        | ✓         | ✓   | ✗            | ✗          | ✗           |
 | Blob                        | ✓        | ✓        | ✓         | ✓   | ✓            | guarded    | guarded     |
 | DOMException                | ✓        | ✓        | ✓         | ✓   | ✓            | guarded    | guarded     |
 | Buffer                      | ✓        | ✓        | ✓         | ✓   | ✗            | ✗          | ✗           |
 | crypto.subtle               | ✓        | ✓        | ✓         | ✓   | ✓            | ✓          | ✓           |
 | ReadableStream              | ✓        | ✓        | ✓         | ✓   | ✓            | ✓          | ✓           |
-| URLPattern                  | —        | —        | ✓         | —   | ✓            | ✓          | —           |
-| Brotli decompression        | ✓        | ✓        | ✓         | ✓   | ✓            | ✓          | ✓           |
+| URL pattern matching        | ✓        | ✓        | ✓         | ✓   | ✓            | ✓          | ✓           |
+| Brotli decompression        | ✓        | ✓        | ✗ passthrough | ✗ passthrough | ✗ passthrough | ✗ passthrough | ✗ passthrough |
 | Gzip/deflate decompression  | ✓        | ✓        | ✓         | ✓   | ✓            | ✓          | ✓           |
+
+\* HTTP/2+ detection is best-effort: `detectHTTPVersion()` reports HTTP/2 only when the runtime exposes protocol evidence (response `httpVersion`/`protocol` properties, or an `Alt-Svc` header); otherwise it reports `HTTP/1.1`. This is accurate for Node 18's undici fetch, which does not negotiate h2 by default — use `NodeHTTP2Transport` (Node 22+) for guaranteed HTTP/2.
+
+¹ WSClient requires a native `WebSocket` constructor. Node added one in v22 — on Node 18 use a polyfill (`globalThis.WebSocket = require('undici').WebSocket`).
+
+² Cloudflare Workers exposes a `WebSocket` constructor, but outbound client connections depend on runtime support.
+
+³ Vercel Edge has no stable outbound `WebSocket` client API.
+
+**URL pattern matching**: kinetex's `compilePattern` / `URLPattern` type (`kinetex/url`) is a built-in implementation — works identically in every runtime, does not use the native `URLPattern` API.
+
+**Brotli**: `decompressStream` uses `node:zlib.createBrotliDecompress()` on Node.js only. On all other runtimes, brotli-encoded bodies pass through compressed (WHATWG `DecompressionStream` does not support brotli), surfacing as a parse error downstream — servers should not negotiate `br` for non-Node clients.
 
 ---
 

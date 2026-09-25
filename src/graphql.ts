@@ -28,6 +28,9 @@
  */
 
 import { KinetexError as _KinetexError, ValidationError } from "./types.ts";
+// FIX (H6): untrusted GraphQL responses are parsed with raw JSON.parse below —
+// sanitize prototype-pollution keys before they reach user code or merges.
+import { sanitizeParsedJSON } from "./utils.ts";
 
 // ============================================================================
 // §1  TYPES
@@ -560,10 +563,19 @@ function setNestedValue(obj: Record<string, unknown>, path: string, value: unkno
   let current = obj;
   for (let i = 0; i < parts.length - 1; i++) {
     const key = parts[i]!;
+    // FIX (H6): reject prototype-pollution path segments — a GraphQL upload
+    // path like "__proto__.polluted" must never write through the prototype.
+    if (key === "__proto__" || key === "constructor" || key === "prototype") {
+      throw new ValidationError(`Invalid upload path: "${path}" — reserved key "${key}"`);
+    }
     if (!current[key] || typeof current[key] !== "object") current[key] = {};
     current = current[key] as Record<string, unknown>;
   }
-  current[parts[parts.length - 1]!] = value;
+  const leaf = parts[parts.length - 1]!;
+  if (leaf === "__proto__" || leaf === "constructor" || leaf === "prototype") {
+    throw new ValidationError(`Invalid upload path: "${path}" — reserved key "${leaf}"`);
+  }
+  current[leaf] = value;
 }
 
 // ============================================================================
@@ -590,7 +602,8 @@ async function parseGraphQLResponse<T>(
 
   let json: GraphQLResponse<T>;
   try {
-    json = (await response.json()) as GraphQLResponse<T>;
+    // FIX (H6): sanitize untrusted response JSON before it reaches user code.
+    json = sanitizeParsedJSON((await response.json()) as GraphQLResponse<T>);
   } catch (err) {
     throw new GraphQLClientError(
       "Failed to parse GraphQL response as JSON",
@@ -1065,7 +1078,8 @@ export class GraphQLClient {
       );
     }
 
-    const rawResults = await response.json();
+    // FIX (H6): sanitize untrusted batch response JSON before validation.
+    const rawResults = sanitizeParsedJSON(await response.json()) as unknown;
 
     // Validate response is array (B-5 fix)
     if (!Array.isArray(rawResults)) {
@@ -1074,7 +1088,7 @@ export class GraphQLClient {
         "EINVALIDRESPONSE",
         undefined,
         requests[0],
-        rawResults,
+        rawResults as GraphQLResponse<unknown>,
       );
     }
 
@@ -1184,7 +1198,7 @@ export class GraphQLClient {
 
       let gqlRes: GraphQLResponse<T>;
       try {
-        gqlRes = JSON.parse(event.data) as GraphQLResponse<T>;
+        gqlRes = sanitizeParsedJSON(JSON.parse(event.data) as GraphQLResponse<T>);
       } catch {
         continue;
       }

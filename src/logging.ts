@@ -26,6 +26,10 @@
  * to a remote service (RemoteTransport) rather than writing to files.
  */
 
+// FIX (H6): logged bodies are untrusted — parsed JSON is stripped of
+// prototype-pollution keys before redaction writes (see sanitizeParsedJSON).
+import { sanitizeParsedJSON } from "./utils.ts";
+
 // Cross-runtime: safely detect Node.js process.env
 const getNodeEnv = (): string | undefined => {
   try {
@@ -744,7 +748,9 @@ export class Redactor {
     // Redact body fields (JSON)
     if (ct.includes("application/json") && this.bodyFields.length > 0) {
       try {
-        const parsed = JSON.parse(str);
+        // FIX (H6): log bodies are untrusted — sanitize before mutation so a
+        // crafted payload cannot smuggle __proto__ paths into redaction writes.
+        const parsed = sanitizeParsedJSON(JSON.parse(str));
         for (const path of this.bodyFields) redactObjectPath(parsed, path.split("."));
         str = JSON.stringify(parsed);
       } catch {
@@ -771,9 +777,11 @@ function redactObjectPath(obj: unknown, path: string[]): void {
   if (!obj || typeof obj !== "object" || path.length === 0) return;
   const [head, ...rest] = path;
   if (head === undefined) return;
+  // FIX (H6): never traverse or write through prototype-pollution keys.
+  if (head === "__proto__" || head === "constructor" || head === "prototype") return;
   const o = obj as Record<string, unknown>;
   if (rest.length === 0) {
-    if (head in o) o[head] = "***";
+    if (Object.prototype.hasOwnProperty.call(o, head)) o[head] = "***";
     return;
   }
   if (typeof o[head] === "object") redactObjectPath(o[head] as Record<string, unknown>, rest);
