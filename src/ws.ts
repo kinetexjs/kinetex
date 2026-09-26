@@ -353,6 +353,10 @@ export class WSClient {
   private _openWaiters: OpenWaiter[] = [];
   private _correlations: Map<string, Correlation> = new Map();
   private _aborted = false;
+  /** Optional external abort signal from config (listener detached on close). */
+  private _externalSignal: AbortSignal | null = null;
+  /** Bound abort handler for the optional external `cfg.signal` (removed on close). */
+  private readonly _onExternalAbort = () => this.close(1000, "AbortSignal aborted");
 
   // ── Async iterator ──────────────────────────────────────────────────────
   private _iterQueue: WSMessage[] = [];
@@ -431,7 +435,8 @@ export class WSClient {
       }
     }
 
-    cfg.signal?.addEventListener("abort", () => this.close(1000, "AbortSignal aborted"), {
+    this._externalSignal = cfg.signal ?? null;
+    this._externalSignal?.addEventListener("abort", this._onExternalAbort, {
       once: true,
     });
   }
@@ -516,6 +521,10 @@ export class WSClient {
    */
   close(code = 1000, reason = "Client closed"): void {
     this._aborted = true;
+    // Detach the external abort listener so a long-lived caller signal does
+    // not retain every closed client (leak fix).
+    this._externalSignal?.removeEventListener("abort", this._onExternalAbort);
+    this._externalSignal = null;
     this._stopAll();
 
     for (const w of this._drainWaiters.splice(0)) w();

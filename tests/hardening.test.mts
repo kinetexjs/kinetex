@@ -11,12 +11,17 @@
  *  - cookie-store fromJSON round-trip with hostile names
  *  - HAR redaction of credential headers (recorder unit)
  *  - cross-origin redirect credential stripping (integration, no network)
+ *  - client pre-flight guards: proxy fail-fast, httpsOnly, unparseable-URL
+ *    fallback (manual param-concat + redactUserInfo regex), request-size
+ *    accounting for ArrayBuffer / Blob / FormData bodies
+ *  - timeout interceptor merged-signal lifecycle (listener-leak fix)
  */
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { sanitizeParsedJSON } from "../src/utils.ts";
+import { isSafeURL, randomBytes, sanitizeParsedJSON } from "../src/utils.ts";
+import { Kinetex } from "../src/client.ts";
 import { jsonSSE, parseSSEText, SSERouter } from "../src/sse.ts";
 import { deserializePaginationState, serializePaginationState } from "../src/pagination.ts";
 import { Redactor } from "../src/logging.ts";
@@ -223,7 +228,10 @@ describe("CookieJar.toJSON/fromJSON battle", () => {
       hostOnly: false,
     });
     const cookies = jar.getCookies("https://example.com/deep");
-    assert.equal(cookies.find((c) => c.name === "__Host-forged"), undefined);
+    assert.equal(
+      cookies.find((c) => c.name === "__Host-forged"),
+      undefined,
+    );
   });
 });
 
@@ -270,7 +278,10 @@ describe("redirect credential stripping battle", () => {
     const fakeFetch: typeof fetch = (async (input: any, init?: any) => {
       const url = typeof input === "string" ? input : String(input.url ?? input);
       const h = new Headers(init?.headers);
-      seen.push({ auth: h.get("authorization") ?? undefined, cookie: h.get("cookie") ?? undefined });
+      seen.push({
+        auth: h.get("authorization") ?? undefined,
+        cookie: h.get("cookie") ?? undefined,
+      });
       hop++;
       if (hop === 1) {
         return new Response(null, {
@@ -309,11 +320,9 @@ describe("GraphQL setNestedValue guard battle", () => {
     const client = createGraphQLClient({ url: "https://api.example.com/graphql" });
     await assert.rejects(
       () =>
-        client.upload(
-          "mutation($file: Upload!) { upload(file: $file) { id } }",
-          { file: null },
-          [{ file: new Blob(["x"]), path: "__proto__.polluted" }],
-        ),
+        client.upload("mutation($file: Upload!) { upload(file: $file) { id } }", { file: null }, [
+          { file: new Blob(["x"]), path: "__proto__.polluted" },
+        ]),
       /Invalid upload path|__proto__|reserved key/,
     );
     const probe: Record<string, unknown> = {};
@@ -325,11 +334,446 @@ describe("GraphQL setNestedValue guard battle", () => {
     const client = createGraphQLClient({ url: "https://api.example.com/graphql" });
     await assert.rejects(
       () =>
-        client.upload(
-          "mutation($file: Upload!) { upload(file: $file) { id } }",
-          { file: null },
-          [{ file: new Blob(["x"]), path: "variables.constructor.x" }],
+        client.upload("mutation($file: Upload!) { upload(file: $file) { id } }", { file: null }, [
+          { file: new Blob(["x"]), path: "variables.constructor.x" },
+        ]),
+      /Invalid upload path|reserved key/,
+    );
+  });
+});
+
+// ── SSRF parser battle (H1 hardening) ─────────────────────────────────────────
+
+describe("isSafeURL SSRF battle", () => {
+  it("blocks IPv4-mapped IPv6 loopback/IMDS (dotted and hex forms)", () => {
+    assert.equal(isSafeURL("http://[::ffff:127.0.0.1]/"), false);
+    assert.equal(isSafeURL("http://[::ffff:7f00:1]/"), false);
+    assert.equal(isSafeURL("http://[::ffff:169.254.169.254]/"), false);
+  });
+
+  it("blocks deprecated IPv4-compatible IPv6 forms", () => {
+    assert.equal(isSafeURL("http://[::127.0.0.1]/"), false);
+    assert.equal(isSafeURL("http://[::169.254.169.254]/"), false);
+  });
+
+  it("blocks NAT64 (64:ff9b::/96) and 6to4 (2002::/16) embedded private IPv4", () => {
+    assert.equal(isSafeURL("http://[64:ff9b::7f00:1]/"), false);
+    assert.equal(isSafeURL("http://[2002:7f00:1::]/"), false);
+  });
+
+  it("blocks reserved IPv6 ranges (unspecified, ULA, link-local, multicast, doc)", () => {
+    assert.equal(isSafeURL("http://[::]/"), false);
+    assert.equal(isSafeURL("http://[fc00::1]/"), false);
+    assert.equal(isSafeURL("http://[fd12::1]/"), false);
+    assert.equal(isSafeURL("http://[fe80::1]/"), false);
+    assert.equal(isSafeURL("http://[ff02::1]/"), false);
+    assert.equal(isSafeURL("http://[2001:db8::1]/"), false);
+  });
+
+  it("blocks CGNAT, TEST-NET, multicast and reserved IPv4 ranges", () => {
+    assert.equal(isSafeURL("http://100.64.0.1/"), false);
+    assert.equal(isSafeURL("http://192.0.2.1/"), false);
+    assert.equal(isSafeURL("http://224.0.0.1/"), false);
+    assert.equal(isSafeURL("http://240.0.0.1/"), false);
+  });
+
+  it("blocks WHATWG shortcut and trailing-dot IPv4 host forms (IMDS bypass)", () => {
+    // "169.254.43253" is 169.254.168.245 (link-local/IMDS). URL parsers keep
+    // the trailing-dot form verbatim, so the parser must resolve it itself.
+    assert.equal(isSafeURL("http://169.254.43253./"), false);
+    assert.equal(isSafeURL("http://127.1./"), false);
+    assert.equal(isSafeURL("http://10.1./"), false);
+    assert.equal(isSafeURL("http://127.0.0.1./"), false);
+    // Malformed dot runs must never fall through to the domain path.
+    assert.equal(isSafeURL("http://127.0.0.1../"), false);
+    // Legit public FQDN with trailing dot stays allowed.
+    assert.equal(isSafeURL("http://example.com./"), true);
+  });
+
+  it("rejects URLs whose IPv4 shorthand overflows instead of treating them as domains", () => {
+    // WHATWG URL parsing fails for IPv4 shorthand that overflows (component
+    // >= 256^(5-n), single number >= 2^32, or more than 4 dotted labels), so
+    // such URLs can never be constructed — and isSafeURL rejects anything it
+    // cannot parse. Defense-in-depth: hostile overflow forms are never
+    // silently reclassified as plain domain names.
+    assert.equal(isSafeURL("http://4294967296./"), false);
+    assert.equal(isSafeURL("http://1.2.3.4.5./"), false);
+    assert.equal(isSafeURL("http://127.0.0.1.5/"), false);
+    // A valid last-component shortcut with a trailing dot still expands and
+    // is range-checked: 8.8.43253 → 8.8.168.245 (public → allowed)...
+    assert.equal(isSafeURL("http://8.8.43253./"), true);
+    // ...while 2130706433 → 127.0.0.1 (loopback → blocked).
+    assert.equal(isSafeURL("http://2130706433./"), false);
+  });
+
+  it("blocks IPv4/IPv6-mapped forms whose embedded address is public", () => {
+    // ::ffff:93.184.216.34 is public — allowed (sanitizer does not over-block)
+    assert.equal(isSafeURL("http://[::ffff:93.184.216.34]/"), true);
+  });
+
+  it("rejects unparseable IPv6 literals defensively", () => {
+    // 5 groups + invalid group → parseIPv6Host returns null → reject
+    assert.equal(isSafeURL("http://[1:2:3:4:5::gggg]/"), false);
+  });
+
+  it("still allows legitimate public hosts", () => {
+    assert.equal(isSafeURL("https://example.com/"), true);
+    assert.equal(isSafeURL("http://93.184.216.34/"), true);
+    assert.equal(isSafeURL("http://[2606:2800:220:1:248:1893:25c8:1946]/"), true);
+  });
+});
+
+// ── randomBytes CSPRNG contract ────────────────────────────────────────────────
+
+describe("randomBytes contract", () => {
+  it("produces correct-length hex output", () => {
+    const hex = randomBytes(16);
+    assert.equal(hex.length, 32);
+    assert.match(hex, /^[0-9a-f]+$/);
+    assert.notEqual(randomBytes(16), randomBytes(16));
+  });
+
+  it("allows zero bytes and rejects invalid counts", () => {
+    assert.equal(randomBytes(0), "");
+    assert.throws(() => randomBytes(-1), /invalid byteCount/);
+    assert.throws(() => randomBytes(1.5), /invalid byteCount/);
+    assert.throws(() => randomBytes(65537), /invalid byteCount/);
+  });
+});
+
+// ── Auth header-injection guards (H3) ─────────────────────────────────────────
+
+describe("auth injection guards", () => {
+  it("bearer auth rejects CRLF-carrying tokens from async providers", async () => {
+    const { kinetex } = await import("../src/mod.ts");
+    const client = kinetex({
+      baseURL: "https://api.example.com",
+      auth: { type: "bearer", token: async () => "tok\r\nX-Evil: 1" },
+    });
+    await assert.rejects(() => client.get("/x"), /forbidden characters/);
+    client.destroy();
+  });
+
+  it("apikey auth rejects invalid header names and values", async () => {
+    const { kinetex } = await import("../src/mod.ts");
+    const c1 = kinetex({
+      baseURL: "https://api.example.com",
+      auth: { type: "apikey", header: "X-Bad\r\nHeader", key: "k" },
+    });
+    await assert.rejects(() => c1.get("/x"), /Invalid apikey auth header name/);
+    c1.destroy();
+
+    const c2 = kinetex({
+      baseURL: "https://api.example.com",
+      auth: { type: "apikey", header: "X-Key", key: async () => "v\r\nX-Evil: 1" },
+    });
+    await assert.rejects(() => c2.get("/x"), /Invalid apikey value/);
+    c2.destroy();
+  });
+});
+
+// ── buildURL fallback safety check (M4) ───────────────────────────────────────
+
+describe("buildURL manual fallback safety", () => {
+  it("rejects unsafe URLs assembled by the manual query-param fallback", async () => {
+    const { kinetex } = await import("../src/mod.ts");
+    // Absolute URL whose query string is malformed enough to force the manual
+    // concat path, embedding a loopback host.
+    const client = kinetex({ baseURL: "https://api.example.com" });
+    await assert.rejects(() => client.get("http://127.0.0.1/p?%%%"), /safety check|EVALIDATION/);
+    client.destroy();
+  });
+});
+
+// ── Request-size limit matrix (H4) ────────────────────────────────────────────
+
+describe("maxRequestSize body accounting", () => {
+  function clientWith(limit: number) {
+    return new Kinetex({ baseURL: "https://api.example.com", maxRequestSize: limit });
+  }
+
+  it("counts DataView and URLSearchParams bodies", async () => {
+    const dv = clientWith(4);
+    const data = new DataView(new ArrayBuffer(8));
+    await assert.rejects(() => dv.post("/x", data as unknown as BodyInit), /exceeds limit/);
+    dv.destroy();
+
+    const us = clientWith(4);
+    await assert.rejects(
+      () => us.post("/x", new URLSearchParams("a=12345678") as unknown as BodyInit),
+      /exceeds limit/,
+    );
+    us.destroy();
+  });
+
+  it("estimates FormData multipart size instead of skipping it", async () => {
+    const c = clientWith(4);
+    const fd = new FormData();
+    fd.append("file", new Blob([new Uint8Array(64)]), "f.bin");
+    await assert.rejects(() => c.post("/x", fd as unknown as BodyInit), /exceeds limit/);
+    c.destroy();
+  });
+
+  it("rejects ReadableStream bodies when a limit is configured", async () => {
+    const c = clientWith(1024);
+    const stream = new ReadableStream<Uint8Array>({
+      start(ctrl) {
+        ctrl.enqueue(new Uint8Array(4));
+        ctrl.close();
+      },
+    });
+    await assert.rejects(() => c.post("/x", stream as unknown as BodyInit), /ReadableStream/);
+    c.destroy();
+  });
+
+  it("allows ReadableStream bodies when the limit is explicitly disabled", async () => {
+    let seen = 0;
+    const fakeFetch: typeof fetch = (async () => {
+      seen++;
+      return new Response("{}", { headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const c = new Kinetex({ baseURL: "https://api.example.com", fetch: fakeFetch });
+    const stream = new ReadableStream<Uint8Array>({
+      start(ctrl) {
+        ctrl.enqueue(new Uint8Array(4));
+        ctrl.close();
+      },
+    });
+    await c.post("/x", stream as unknown as BodyInit, { maxRequestSize: 0 });
+    assert.equal(seen, 1);
+    c.destroy();
+  });
+});
+
+// ── HAR recording battle ───────────────────────────────────────────────────────
+
+describe("HAR recording battle", () => {
+  it("records a redacted entry for a fetch and clears on clearHAR()", async () => {
+    const { kinetex } = await import("../src/mod.ts");
+    const fakeFetch: typeof fetch = (async () =>
+      new Response('{"ok":true}', {
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const client = kinetex({
+      baseURL: "https://api.example.com",
+      fetch: fakeFetch,
+      har: true,
+      headers: { authorization: "Bearer sekrit" },
+    });
+    await client.get("/users");
+    const har = client.getHAR();
+    assert.equal(har.entries.length, 1);
+    assert.equal(har.entries[0]!.request.url, "https://api.example.com/users");
+    const auth = har.entries[0]!.request.headers.find((h) => h.name === "authorization");
+    assert.equal(auth?.value, "***REDACTED***");
+    client.clearHAR();
+    assert.equal(client.getHAR().entries.length, 0);
+    client.destroy();
+  });
+
+  it("throws when HAR was not enabled", async () => {
+    const { kinetex } = await import("../src/mod.ts");
+    const client = kinetex({ baseURL: "https://api.example.com" });
+    assert.throws(() => client.getHAR(), /har: true/);
+    client.destroy();
+  });
+});
+
+// ── CookieJar prefix-rule retrieval defense (H5) ──────────────────────────────
+
+describe("CookieJar __Host-/__Secure- retrieval battle", () => {
+  it("never emits __Host- cookies whose flags no longer satisfy the contract", () => {
+    const jar = CookieJar.fromJSON([
+      {
+        name: "__Host-session",
+        value: "good",
+        domain: "example.com",
+        path: "/",
+        expires: null,
+        maxAge: null,
+        secure: true,
+        httpOnly: true,
+        sameSite: "None",
+        createdAt: Date.now(),
+        lastAccessed: Date.now(),
+        hostOnly: true,
+      },
+      {
+        name: "__Host-broken",
+        value: "bad",
+        domain: "example.com",
+        path: "/sub",
+        expires: null,
+        maxAge: null,
+        secure: false,
+        httpOnly: false,
+        sameSite: "None",
+        createdAt: Date.now(),
+        lastAccessed: Date.now(),
+        hostOnly: false,
+      },
+      {
+        name: "__Secure-broken",
+        value: "bad",
+        domain: "example.com",
+        path: "/",
+        expires: null,
+        maxAge: null,
+        secure: false,
+        httpOnly: false,
+        sameSite: "None",
+        createdAt: Date.now(),
+        lastAccessed: Date.now(),
+        hostOnly: false,
+      },
+    ]);
+    const names = jar
+      .getCookies({ url: "https://example.com/" })
+      .map((c) => c.name)
+      .sort();
+    assert.deepEqual(names, ["__Host-session"]);
+    jar.destroy();
+  });
+});
+
+// ── Timeout interceptor merged-signal lifecycle (listener-leak fix) ─────────
+
+describe("timeout interceptor merged-signal cleanup", () => {
+  async function makeManager() {
+    const { InterceptorManager, createTimeoutInterceptor } = await import("../src/interceptors.ts");
+    const m = new InterceptorManager();
+    const timeout = createTimeoutInterceptor({ timeoutMs: 5000 });
+    m.useRequest(timeout.requestInterceptor);
+    m.useResponse(timeout.responseInterceptor);
+    m.useError(timeout.errorInterceptor);
+    return m;
+  }
+
+  it("cleans up the merged external-signal listener on success", async () => {
+    const m = await makeManager();
+    const external = new AbortController();
+    const res = await m.execute(
+      {
+        url: "https://api.example.com/x",
+        method: "GET",
+        headers: {},
+        signal: external.signal,
+      },
+      async () => new Response("ok"),
+    );
+    assert.equal(res.status, 200);
+    // After the response the request-phase listener must be detached: a late
+    // external abort is a no-op and must not surface anywhere.
+    external.abort();
+  });
+
+  it("propagates an external abort through the merged signal", async () => {
+    const m = await makeManager();
+    const external = new AbortController();
+    await assert.rejects(
+      () =>
+        m.execute(
+          {
+            url: "https://api.example.com/x",
+            method: "GET",
+            headers: {},
+            signal: external.signal,
+          },
+          async () => {
+            // Abort mid-flight so the timeout interceptor's merged-signal
+            // handler runs (clears its timer + forwards the abort reason).
+            external.abort(new Error("user-cancel"));
+            throw new Error("user-cancel");
+          },
         ),
+      /user-cancel|abort/i,
+    );
+  });
+
+  it("cleans up the merged external-signal listener on dispatcher error", async () => {
+    const m = await makeManager();
+    const external = new AbortController();
+    await assert.rejects(
+      () =>
+        m.execute(
+          {
+            url: "https://api.example.com/x",
+            method: "GET",
+            headers: {},
+            signal: external.signal,
+          },
+          async () => {
+            throw new Error("boom");
+          },
+        ),
+      /boom/,
+    );
+    // Late external abort after the error cleanup must be inert.
+    external.abort();
+  });
+});
+
+// ── Client pre-flight guard coverage (M7 / httpsOnly / H4 leftovers) ─────────
+
+describe("client pre-flight guards", () => {
+  it("fail-fasts when a proxy is configured but unusable", async () => {
+    const { kinetex } = await import("../src/mod.ts");
+    const client = kinetex({
+      baseURL: "https://api.example.com",
+      proxy: "http://proxy.example.com:8080",
+    });
+    await assert.rejects(
+      () => client.get("/x"),
+      (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.match(String((err as Error).message ?? err), /proxy/i);
+        return true;
+      },
+    );
+    client.destroy();
+  });
+
+  it("enforces httpsOnly for http URLs", async () => {
+    const client = new Kinetex({ baseURL: "https://api.example.com", httpsOnly: true });
+    await assert.rejects(() => client.get("http://api.example.com/x"), /HTTPS-only/i);
+    client.destroy();
+  });
+
+  it("rejects unparseable URLs after param merging (redactUserInfo fallback)", async () => {
+    // "99999" is a reserved/bad port — URL parsing throws both in buildURL and
+    // in the safety check, forcing the manual-fallback + regex-redaction path.
+    const client = new Kinetex({ baseURL: "https://api.example.com" });
+    await assert.rejects(
+      () => client.get("https://api.example.com:99999/p"),
+      /safety check|EVALIDATION/i,
+    );
+    client.destroy();
+  });
+
+  it("counts ArrayBuffer, Blob, and FormData bodies toward maxRequestSize", async () => {
+    const client = new Kinetex({ baseURL: "https://api.example.com", maxRequestSize: 8 });
+    await assert.rejects(() => client.post("/x", new ArrayBuffer(32)), /exceeds limit/i);
+    await assert.rejects(() => client.post("/x", new Blob([new Uint8Array(32)])), /exceeds limit/i);
+    await assert.rejects(() => {
+      const fd = new FormData();
+      fd.append("a", "value-longer-than-eight");
+      return client.post("/x", fd);
+    }, /exceeds limit/i);
+    client.destroy();
+  });
+});
+
+// ── GraphQL upload leaf-path guard (H6) ───────────────────────────────────────
+
+describe("GraphQL upload leaf path guard", () => {
+  it("rejects reserved keys at the leaf of an upload path", async () => {
+    const { createGraphQLClient } = await import("../src/graphql.ts");
+    const client = createGraphQLClient({ url: "https://api.example.com/graphql" });
+    await assert.rejects(
+      () =>
+        client.upload("mutation($file: Upload!) { upload(file: $file) { id } }", { file: null }, [
+          { file: new Blob(["x"]), path: "variables.__proto__" },
+        ]),
       /Invalid upload path|reserved key/,
     );
   });

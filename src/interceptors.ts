@@ -871,17 +871,17 @@ export function createTimeoutInterceptor(config: Partial<TimeoutConfig> = {}): {
       controller.abort(new TimeoutError(cfg.message, ms));
     }, ms);
 
-    // Merge with any existing signal
+    // Merge with any existing signal. The listener is removed in the
+    // response/error cleanup below so a shared external signal does not
+    // accumulate one closure per request (leak fix).
     const existing = ctx.request.signal;
     if (existing) {
-      existing.addEventListener(
-        "abort",
-        () => {
-          clearTimeout(timer);
-          controller.abort(existing.reason);
-        },
-        { once: true },
-      );
+      const onExistingAbort = () => {
+        clearTimeout(timer);
+        controller.abort(existing.reason);
+      };
+      existing.addEventListener("abort", onExistingAbort, { once: true });
+      ctx.store.set(TIMEOUT_SIGNAL_KEY, { existing, onExistingAbort });
     }
 
     ctx.request = { ...ctx.request, signal: controller.signal };
@@ -890,22 +890,33 @@ export function createTimeoutInterceptor(config: Partial<TimeoutConfig> = {}): {
     ctx.store.set(TIMEOUT_TIMER_KEY, timer);
   };
 
-  // Response interceptor cleans up the timer after request completes
-  const responseInterceptor: ResponseInterceptorFn = (ctx) => {
+  /** Shared cleanup for the response and error phases. */
+  const cleanupTimeout = (ctx: {
+    store: Map<symbol, unknown>;
+  }): void => {
     const timer = ctx.store.get(TIMEOUT_TIMER_KEY) as ReturnType<typeof setTimeout> | undefined;
     if (timer) {
       clearTimeout(timer);
       ctx.store.delete(TIMEOUT_TIMER_KEY);
+    }
+    const merged = ctx.store.get(TIMEOUT_SIGNAL_KEY) as
+      | { existing: AbortSignal; onExistingAbort: () => void }
+      | undefined;
+    if (merged) {
+      merged.existing.removeEventListener("abort", merged.onExistingAbort);
+      ctx.store.delete(TIMEOUT_SIGNAL_KEY);
     }
   };
 
-  // Error interceptor also cleans up the timer
+  // Response interceptor cleans up the timer and merged-signal listener after
+  // the request completes
+  const responseInterceptor: ResponseInterceptorFn = (ctx) => {
+    cleanupTimeout(ctx);
+  };
+
+  // Error interceptor also cleans up the timer and merged-signal listener
   const errorInterceptor: ErrorInterceptorFn = (ctx) => {
-    const timer = ctx.store.get(TIMEOUT_TIMER_KEY) as ReturnType<typeof setTimeout> | undefined;
-    if (timer) {
-      clearTimeout(timer);
-      ctx.store.delete(TIMEOUT_TIMER_KEY);
-    }
+    cleanupTimeout(ctx);
   };
 
   return {
@@ -917,6 +928,7 @@ export function createTimeoutInterceptor(config: Partial<TimeoutConfig> = {}): {
 }
 
 const TIMEOUT_TIMER_KEY = Symbol("timeoutTimer");
+const TIMEOUT_SIGNAL_KEY = Symbol("timeoutSignal");
 
 /** Error thrown when a request exceeds the configured timeout. */
 export class TimeoutError extends Error {

@@ -368,6 +368,8 @@ export class NodeHTTP2Transport implements Transport {
 
   private readonly _strict: boolean;
   private readonly _onDroppedHeader: ((name: string, value: string) => void) | undefined;
+  /** Optional CA bundle for origins with self-signed / private-PKI certificates. */
+  private readonly _ca: string | string[] | undefined;
   /** FIX 11: Configurable connect timeout (replaces hardcoded 30 000 ms) */
   private readonly _connectTimeoutMs: number;
   /** FIX 11: Configurable per-request stream timeout (replaces hardcoded 30 000 ms) */
@@ -385,6 +387,8 @@ export class NodeHTTP2Transport implements Transport {
       maxSessions?: number;
       strict?: boolean;
       onDroppedHeader?: (name: string, value: string) => void;
+      /** CA certificate(s) to trust in addition to the system store (private PKIs, self-signed test servers). */
+      ca?: string | string[];
       /** HTTP/2 connection (CONNECT) timeout in ms. Default: 30 000 */
       connectTimeoutMs?: number;
       /** HTTP/2 per-stream request timeout in ms. Default: 30 000 */
@@ -396,6 +400,7 @@ export class NodeHTTP2Transport implements Transport {
     this.maxSessions = options.maxSessions ?? 100;
     this._strict = options.strict ?? false;
     this._onDroppedHeader = options.onDroppedHeader;
+    this._ca = options.ca;
     this._connectTimeoutMs = options.connectTimeoutMs ?? 30_000;
     this._requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
   }
@@ -470,7 +475,10 @@ export class NodeHTTP2Transport implements Transport {
 
     const session = await new Promise<import("node:http2").ClientHttp2Session>(
       (resolve, reject) => {
-        const s = http2.connect(origin, { rejectUnauthorized: true });
+        const s = http2.connect(origin, {
+          rejectUnauthorized: true,
+          ...(this._ca !== undefined ? { ca: this._ca } : {}),
+        });
         // FIX 11: use configurable connect timeout instead of hardcoded 30 000 ms
         // FIX 9: unref() the timer so it does not prevent process exit
         const connectTimeout = setTimeout(() => {
@@ -614,39 +622,42 @@ export class NodeHTTP2Transport implements Transport {
         ...currentReq.headers,
       };
 
-      // Strict-mode header validation (HTTP/2 control-character check)
-      if (this._strict) {
-        for (const [hName, hValue] of Object.entries(h2ReqHeaders)) {
-          if (hName.startsWith(":")) continue;
-          const hStr = Array.isArray(hValue) ? hValue.join(", ") : String(hValue);
-          let hasForbidden = false;
-          for (let ci = 0; ci < hStr.length; ci++) {
-            const code = hStr.charCodeAt(ci);
-            if ((code >= 0x00 && code <= 0x08) || (code >= 0x0a && code <= 0x1f) || code === 0x7f) {
-              hasForbidden = true;
-              break;
-            }
+      // Header validation (HTTP/2 control-character check). Runs in BOTH modes:
+      // strict throws, non-strict drops with callback/warn — matching the
+      // FetchTransport contract. (Previously the whole loop was gated on
+      // strict mode, so non-strict requests never validated and a header with
+      // forbidden control characters crashed session.request() with a raw
+      // ERR_INVALID_HEADER_VALUE instead of being dropped.)
+      for (const [hName, hValue] of Object.entries(h2ReqHeaders)) {
+        if (hName.startsWith(":")) continue;
+        const hStr = Array.isArray(hValue) ? hValue.join(", ") : String(hValue);
+        let hasForbidden = false;
+        for (let ci = 0; ci < hStr.length; ci++) {
+          const code = hStr.charCodeAt(ci);
+          if ((code >= 0x00 && code <= 0x08) || (code >= 0x0a && code <= 0x1f) || code === 0x7f) {
+            hasForbidden = true;
+            break;
           }
-          if (hasForbidden) {
-            if (this._strict) {
-              throw new KinetexError(
-                `Strict mode: header "${hName}" contains forbidden control characters`,
-                "EVALIDATION",
-                { request: currentReq },
-              );
-            }
-            // FIX (H3): non-strict mode must match FetchTransport behavior —
-            // notify the callback (if any) and warn, never drop silently.
-            if (this._onDroppedHeader) {
-              this._onDroppedHeader(hName, hStr);
-            } else if (typeof console !== "undefined") {
-              console.warn(
-                `[kinetex] Invalid header dropped (HTTP/2): "${hName}" — value contains illegal control characters. ` +
-                  `Pass strictHeaders: true to throw instead.`,
-              );
-            }
-            delete (h2ReqHeaders as Record<string, unknown>)[hName];
+        }
+        if (hasForbidden) {
+          if (this._strict) {
+            throw new KinetexError(
+              `Strict mode: header "${hName}" contains forbidden control characters`,
+              "EVALIDATION",
+              { request: currentReq },
+            );
           }
+          // FIX (H3): non-strict mode must match FetchTransport behavior —
+          // notify the callback (if any) and warn, never drop silently.
+          if (this._onDroppedHeader) {
+            this._onDroppedHeader(hName, hStr);
+          } else if (typeof console !== "undefined") {
+            console.warn(
+              `[kinetex] Invalid header dropped (HTTP/2): "${hName}" — value contains illegal control characters. ` +
+                `Pass strictHeaders: true to throw instead.`,
+            );
+          }
+          delete (h2ReqHeaders as Record<string, unknown>)[hName];
         }
       }
 

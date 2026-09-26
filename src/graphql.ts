@@ -668,8 +668,10 @@ async function executeHTTP<T>(
   const timer =
     config.timeoutMs > 0 ? setTimeout(() => controller.abort(), config.timeoutMs) : null;
 
-  // Merge external signal
-  signal?.addEventListener("abort", () => controller.abort(), { once: true });
+  // Merge external signal. The listener is removed once the fetch settles so
+  // it does not accumulate on long-lived caller-provided signals (leak fix).
+  const onExternalAbort = () => controller.abort();
+  signal?.addEventListener("abort", onExternalAbort, { once: true });
 
   let response: Response;
   try {
@@ -694,6 +696,7 @@ async function executeHTTP<T>(
     );
   } finally {
     if (timer) clearTimeout(timer);
+    signal?.removeEventListener("abort", onExternalAbort);
   }
 
   return parseGraphQLResponse<T>(response, req);
@@ -995,7 +998,10 @@ export class GraphQLClient {
 
     const form = buildMultipartBody(req, uploads);
     const controller = new AbortController();
-    options.signal?.addEventListener("abort", () => controller.abort(), { once: true });
+    // Listener removed when the fetch settles — avoids accumulating on the
+    // caller's signal across many uploads (leak fix).
+    const onExternalAbort = () => controller.abort();
+    options.signal?.addEventListener("abort", onExternalAbort, { once: true });
 
     this.config.onRequest(req);
 
@@ -1018,6 +1024,8 @@ export class GraphQLClient {
       );
       this.config.onError(clientErr, req);
       throw clientErr;
+    } finally {
+      options.signal?.removeEventListener("abort", onExternalAbort);
     }
 
     const gqlRes = await parseGraphQLResponse<T>(response, req);
@@ -1057,7 +1065,10 @@ export class GraphQLClient {
   ): Promise<T[]> {
     const headers = await buildHeaders(this.config);
     const controller = new AbortController();
-    options.signal?.addEventListener("abort", () => controller.abort(), { once: true });
+    // Listener removed when the fetch settles — avoids accumulating on the
+    // caller's signal across many batches (leak fix).
+    const onExternalAbort = () => controller.abort();
+    options.signal?.addEventListener("abort", onExternalAbort, { once: true });
 
     let response: Response;
     try {
@@ -1076,6 +1087,8 @@ export class GraphQLClient {
         undefined,
         err,
       );
+    } finally {
+      options.signal?.removeEventListener("abort", onExternalAbort);
     }
 
     // FIX (H6): sanitize untrusted batch response JSON before validation.
