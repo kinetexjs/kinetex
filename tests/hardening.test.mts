@@ -893,8 +893,10 @@ describe("GraphQL external-signal lifecycle", () => {
     });
     // Abort shortly after the request starts so the merged-signal listener
     // (onExternalAbort) must forward the abort into the client's controller.
-    const abortTimer = setTimeout(() => external.abort(), 15);
-    if (typeof abortTimer.unref === "function") abortTimer.unref();
+    // The timer is deliberately NOT unref'd: it must keep the event loop alive
+    // until it fires, otherwise the loop can drain while the fake fetch's
+    // promise is still pending and node:test reports a stalled resolution.
+    setTimeout(() => external.abort(), 15);
     await assert.rejects(
       () => client.query("{ ok }", undefined, { signal: external.signal }),
       /timed out|aborted|Network error/i,
