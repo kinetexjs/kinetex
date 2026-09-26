@@ -551,23 +551,34 @@ function parseIPv4Component(p: string): number | null {
  */
 function parseIPv4Host(host: string): number | null {
   if (host.includes(":") || !/^[0-9a-fA-FxX.]+$/.test(host)) return null;
-  const parts = host.split(".");
-  if (parts.length > 4) return null;
+  // WHATWG host parser: a single trailing dot (FQDN form) is stripped before
+  // parsing, so "127.0.0.1." must be treated exactly like "127.0.0.1".
+  const bare = host.endsWith(".") ? host.slice(0, -1) : host;
+  if (bare === "") return null;
+  const parts = bare.split(".");
+  if (parts.length > 4 || parts.length < 1) return null;
   if (parts.length === 1) {
     const v = parseIPv4Component(parts[0]!);
     if (v === null || v > 0xffffffff) return null;
     return v >>> 0;
   }
-  const nums: number[] = [];
-  for (const p of parts) {
-    const v = parseIPv4Component(p);
-    // Last part may absorb the remainder per WHATWG; cap it at 24 bits.
-    const isLast = p === parts[parts.length - 1];
-    if (v === null || v > (isLast && nums.length === 3 ? 0xff : 0xff)) return null;
-    nums.push(v);
+  // WHATWG: all but the last part are single octets; the last part may absorb
+  // the remainder of the address (value < 256^(5 - numberOfParts)) and is
+  // expanded big-endian across the remaining octets. E.g. "127.1" → 127.0.0.1
+  // and "169.254.43253" → 169.254.168.245 (still link-local → blocked).
+  const octets: number[] = [];
+  for (let i = 0; i < parts.length - 1; i++) {
+    const v = parseIPv4Component(parts[i]!);
+    if (v === null || v > 0xff) return null;
+    octets.push(v);
   }
-  while (nums.length < 4) nums.push(0);
-  return ((nums[0]! << 24) | (nums[1]! << 16) | (nums[2]! << 8) | nums[3]!) >>> 0;
+  const last = parseIPv4Component(parts[parts.length - 1]!);
+  const lastCap = 2 ** (8 * (5 - parts.length)); // 256^(5-n)
+  if (last === null || last >= lastCap) return null;
+  for (let shift = 8 * (4 - parts.length); shift >= 0; shift -= 8) {
+    octets.push((last >>> shift) & 0xff);
+  }
+  return ((octets[0]! << 24) | (octets[1]! << 16) | (octets[2]! << 8) | octets[3]!) >>> 0;
 }
 
 /**

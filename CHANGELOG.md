@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-26
+
+### Fixed
+
+- **Security (SSRF):** `isSafeURL`'s IPv4 literal parser now implements full WHATWG shortcut-host semantics — the last dotted component absorbs the remainder of the address (`127.1` → `127.0.0.1`, `169.254.43253` → link-local/IMDS), and a single trailing dot (FQDN form, which URL parsers keep verbatim and fetch resolvers treat as the same host) is stripped before parsing. Together these close a bypass where trailing-dot shortcut hosts were previously treated as domain names and allowed through the private-range check. The dead conditional in the last-octet bounds check was removed.
+- **Memory (listener leaks):** abort-signal listeners registered with `once: true` are now also removed when the operation settles — GraphQL execute/upload/batch, upload & download progress streams, XHR progress, the WebSocket external-signal close hook, and the timeout interceptor's merged-signal listener. Long-lived caller-provided signals no longer accumulate one closure per request (Node emits `MaxListenersExceededWarning` past 11).
+- **HTTP/2 header validation:** the forbidden-control-character check in `NodeHTTP2Transport` is no longer gated behind strict mode — in non-strict mode (the default) an invalid header is now dropped with the `onDroppedHeader` callback / warning, matching `FetchTransport`, instead of the whole validation loop being skipped and the raw header crashing `session.request()` with `ERR_INVALID_HEADER_VALUE`. Strict mode still throws `EVALIDATION`.
+- `NodeHTTP2Transport` (and `createTransport` session options) now accept a `ca` option so origins with self-signed or private-PKI certificates can be trusted without disabling TLS verification.
+
+### Added
+
+- Hardening test coverage: SSRF address-expansion matrix (IPv4-mapped/IPv4-compatible/NAT64/6to4 IPv6 forms, shortcut + trailing-dot IPv4 hosts), `randomBytes` CSPRNG contract, bearer/apikey header-injection guards (H3), `buildURL` manual-fallback safety check (M4), `maxRequestSize` body accounting for DataView/URLSearchParams/FormData/ReadableStream (H4), HAR recording + credential redaction, `CookieJar` `__Host-`/`__Secure-` retrieval-time defense (H5), and the GraphQL upload leaf-path pollution guard (H6).
+- Additional hardening test coverage: client pre-flight guards (proxy fail-fast (M7), `httpsOnly` enforcement, unparseable-URL path exercising the manual-fallback safety check + `redactUserInfo` regex redaction, `maxRequestSize` accounting for ArrayBuffer/Blob/FormData bodies) and the timeout interceptor's merged external-signal lifecycle (abort propagation + listener cleanup on success/error).
+- New local HTTP/2 test harness (`tests/h2-header-drop.test.mts`, Node-only): spins up a throwaway self-signed `http2.createSecureServer` (cert generated at test time into gitignored `tmp/`, skipped cleanly when openssl is unavailable) and covers the forbidden-header drop/callback/warn/strict paths plus per-request validation over the real HTTP/2 wire.
+- Offline tests for the GraphQL external-signal lifecycle (query/upload/batch): assert the abort listener is added and removed on the caller's signal, that an external abort propagates and rejects, and that the no-CSPRNG `randomBytes` fallback throws — the httpbin-dependent graphql suite is skipped in CI, so these paths were previously unmeasured there.
+
+### Changed
+
+- Coverage scripts (`coverage`, `coverage:summary`) now write reports to `coverage/` instead of the repo root, so `lcov.info` lands where the CI codecov upload step looks for it (`./coverage/lcov.info`) — previously the upload silently found nothing.
+
 ## [1.1.0] - 2026-09-25
 
 ### Fixed
@@ -58,6 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Worker entry point for edge runtimes (`kinetex/worker`)
 - Zero external dependencies
 
-[Unreleased]: https://github.com/kinetexjs/kinetex/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/kinetexjs/kinetex/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/kinetexjs/kinetex/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/kinetexjs/kinetex/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/kinetexjs/kinetex/compare/v0.0.3...v1.0.0

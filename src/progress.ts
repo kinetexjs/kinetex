@@ -287,14 +287,13 @@ export function withUploadProgress(
         return;
       }
 
-      options.signal?.addEventListener(
-        "abort",
-        () => {
-          reader.cancel("aborted").catch(() => {});
-          controller.error(new DOMException("Upload aborted", "AbortError"));
-        },
-        { once: true },
-      );
+      const onUploadAbort = () => {
+        reader.cancel("aborted").catch(() => {});
+        controller.error(new DOMException("Upload aborted", "AbortError"));
+      };
+      // Removed in the stream's finally block so repeated uploads sharing one
+      // signal do not accumulate listeners (leak fix).
+      options.signal?.addEventListener("abort", onUploadAbort, { once: true });
 
       try {
         while (true) {
@@ -310,6 +309,8 @@ export function withUploadProgress(
       } catch (err) {
         tracker.complete();
         controller.error(err);
+      } finally {
+        options.signal?.removeEventListener("abort", onUploadAbort);
       }
     },
   });
@@ -476,11 +477,11 @@ export async function collectStream(
     throw new DOMException("Stream aborted", "AbortError");
   }
 
-  // Register abort handler
+  // Register abort handler (removed in the finally below — leak fix)
+  const abortHandler = () => {
+    reader.cancel("aborted").catch(() => {});
+  };
   if (options.signal) {
-    const abortHandler = () => {
-      reader.cancel("aborted").catch(() => {});
-    };
     options.signal.addEventListener("abort", abortHandler, { once: true });
   }
 
@@ -493,6 +494,7 @@ export async function collectStream(
     }
   } finally {
     reader.releaseLock();
+    options.signal?.removeEventListener("abort", abortHandler);
   }
 
   tracker.complete();
