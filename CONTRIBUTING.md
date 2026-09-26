@@ -70,12 +70,36 @@ npm run test:coverage
 
 ## Release Process
 
-Releases are automated via CI. To trigger a release:
+`main` is protected — releases go through a pull request. The release script automates the whole flow:
 
 ```bash
-# Bump version in package.json and deno.json, then:
-git commit -m "release: v1.2.0"
-git push origin main
+npm run release              # patch bump (1.2.0 → 1.2.1)
+npm run release minor        # minor bump (1.2.0 → 1.3.0)
+npm run release major        # major bump (1.2.0 → 2.0.0)
+npm run release 1.3.0        # explicit version
 ```
+
+The script will:
+
+1. Verify the working tree is clean and level with latest `main`
+2. Bump the version in `package.json` and `deno.json`
+3. Run build + typecheck + lint (Deno steps run locally when `deno` is installed; CI runs them regardless)
+4. Commit on a `release/vX.Y.Z` branch and open a PR titled `chore: release vX.Y.Z`
+
+Then a maintainer approves and merges the PR. Publishing is triggered by tagging the squash commit that landed on `main`:
+
+```bash
+git fetch origin main --tags
+git tag -a v1.3.0 -m "Release v1.3.0" origin/main
+git push origin v1.3.0
+```
+
+The tag push triggers the automated pipelines: `release.yml` (GitHub Release), `publish.yml` (npm + JSR), and `docs.yml` (TypeDoc).
+
+Useful flags:
+
+- `--merge` — after opening the PR (or re-run on an existing `release/vX.Y.Z` branch), wait for required checks, squash-merge, tag and push the tag automatically
+- `--no-pr` — stop after the local commit
+- `--draft` — open the release PR as a draft
 
 CI will automatically publish to npm and JSR when it sees a commit starting with `release:`.
