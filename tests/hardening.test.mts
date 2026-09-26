@@ -433,6 +433,25 @@ describe("randomBytes contract", () => {
     assert.notEqual(randomBytes(16), randomBytes(16));
   });
 
+  it("throws a descriptive error when no CSPRNG is available", async () => {
+    const { randomBytes } = await import("../src/utils.ts");
+    const orig = globalThis.crypto;
+    Object.defineProperty(globalThis, "crypto", {
+      value: {},
+      configurable: true,
+      writable: true,
+    });
+    try {
+      assert.throws(() => randomBytes(8), /CSPRNG/);
+    } finally {
+      Object.defineProperty(globalThis, "crypto", {
+        value: orig,
+        configurable: true,
+        writable: true,
+      });
+    }
+  });
+
   it("allows zero bytes and rejects invalid counts", () => {
     assert.equal(randomBytes(0), "");
     assert.throws(() => randomBytes(-1), /invalid byteCount/);
@@ -776,5 +795,110 @@ describe("GraphQL upload leaf path guard", () => {
         ]),
       /Invalid upload path|reserved key/,
     );
+  });
+});
+
+// ── GraphQL external-signal lifecycle (listener-leak fix, offline) ──────────
+
+describe("GraphQL external-signal lifecycle", () => {
+  /**
+   * The httpbin-dependent graphql suite is skipped in CI, so the leak-fix
+   * listener lines (execute/upload/batch) must be exercised offline via the
+   * injectable `fetch`. Each test also verifies the abort listener is actually
+   * REMOVED from the caller's signal once the operation settles — the leak
+   * itself is what the fix is about.
+   */
+  function makeClient() {
+    return import("../src/graphql.ts").then(({ createGraphQLClient }) =>
+      createGraphQLClient({
+        url: "https://api.example.com/graphql",
+        fetch: (async () =>
+          new Response(JSON.stringify({ data: { ok: 1 } }), {
+            headers: { "content-type": "application/json" },
+          })) as unknown as typeof fetch,
+      }),
+    );
+  }
+
+  function instrument(signal: AbortSignal) {
+    const calls = { added: 0, removed: 0 };
+    const origAdd = signal.addEventListener.bind(signal);
+    const origRemove = signal.removeEventListener.bind(signal);
+    signal.addEventListener = ((...args: Parameters<AbortSignal["addEventListener"]>) => {
+      calls.added++;
+      return origAdd(...args);
+    }) as AbortSignal["addEventListener"];
+    signal.removeEventListener = ((...args: Parameters<AbortSignal["removeEventListener"]>) => {
+      calls.removed++;
+      return origRemove(...args);
+    }) as AbortSignal["removeEventListener"];
+    return calls;
+  }
+
+  it("query: listener added and removed on the caller's signal", async () => {
+    const client = await makeClient();
+    const external = new AbortController();
+    const calls = instrument(external.signal);
+    await client.query("{ ok }", undefined, { signal: external.signal });
+    assert.equal(calls.added, 1);
+    assert.equal(calls.removed, 1, "listener must be removed once the fetch settles");
+  });
+
+  it("upload: listener added and removed on the caller's signal", async () => {
+    const client = await makeClient();
+    const external = new AbortController();
+    const calls = instrument(external.signal);
+    await client.upload(
+      "mutation($file: Upload!) { upload(file: $file) { id } }",
+      { file: null },
+      [{ file: new Blob(["x"]), path: "variables.file" }],
+      { signal: external.signal },
+    );
+    assert.equal(calls.added, 1);
+    assert.equal(calls.removed, 1, "listener must be removed once the fetch settles");
+  });
+
+  it("batch: listener added and removed on the caller's signal", async () => {
+    const { createGraphQLClient } = await import("../src/graphql.ts");
+    const external = new AbortController();
+    const calls = instrument(external.signal);
+    const client = createGraphQLClient({
+      url: "https://api.example.com/graphql",
+      // Batch responses are JSON arrays, one entry per request.
+      fetch: (async () =>
+        new Response(JSON.stringify([{ data: { a: 1 } }, { data: { b: 2 } }]), {
+          headers: { "content-type": "application/json" },
+        })) as unknown as typeof fetch,
+    });
+    await client.batch([{ query: "{ a }" }, { query: "{ b }" }], {
+      signal: external.signal,
+    });
+    assert.equal(calls.added, 1);
+    assert.equal(calls.removed, 1, "listener must be removed once the fetch settles");
+  });
+
+  it("query: external abort mid-flight rejects and the listener is removed", async () => {
+    const { createGraphQLClient } = await import("../src/graphql.ts");
+    const external = new AbortController();
+    const calls = instrument(external.signal);
+    const client = createGraphQLClient({
+      url: "https://api.example.com/graphql",
+      timeoutMs: 0, // isolate propagation: abort comes from the external signal only
+      fetch: (_url: unknown, init?: { signal?: AbortSignal }) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new Error("The operation was aborted")),
+          );
+        }) as unknown as typeof fetch,
+    });
+    // Abort shortly after the request starts so the merged-signal listener
+    // (onExternalAbort) must forward the abort into the client's controller.
+    const abortTimer = setTimeout(() => external.abort(), 15);
+    if (typeof abortTimer.unref === "function") abortTimer.unref();
+    await assert.rejects(
+      () => client.query("{ ok }", undefined, { signal: external.signal }),
+      /timed out|aborted|Network error/i,
+    );
+    assert.equal(calls.removed, 1, "error path must also detach the listener");
   });
 });
