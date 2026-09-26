@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `scripts/release.ts` rewritten for the protected-`main` workflow: it now bumps versions, verifies, opens a `chore: release vX.Y.Z` pull request, and (with `--merge`) can wait for checks, squash-merge, tag the merge commit and push the tag that triggers npm/JSR/GitHub Release publishing. See CONTRIBUTING.md → Release Process.
+
 ## [1.2.0] - 2026-09-26
 
 ### Fixed
