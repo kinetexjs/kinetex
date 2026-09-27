@@ -352,7 +352,11 @@ export class CookieJar {
     let hostOnly: boolean;
 
     if (parsed.domain !== null && parsed.domain !== "") {
-      const cd = parsed.domain;
+      // Normalize the case: the Domain attribute is case-insensitive, but the
+      // value was stored verbatim while every lookup compares against a
+      // lower-cased request host. `Domain=Example.COM` therefore stored a cookie
+      // that could never be matched again — silently lost for the jar's lifetime.
+      const cd = parsed.domain.toLowerCase();
 
       // Must domain-match the request host (use custom matcher if provided)
       const matcher = this.domainMatcherFn ?? domainMatch;
@@ -447,10 +451,9 @@ export class CookieJar {
    * @returns Array of matching Cookie objects (direct references into storage)
    */
   getCookies(options: GetCookiesOptions): Cookie[] {
-    // Lazy cleanup: 1% chance to clear expired cookies on each access
-    if (Math.random() < 0.01) {
-      this.clearExpired();
-    }
+    // Expired cookies are removed by the periodic cleanup timer (and by
+    // clearExpired()); the old 1%-per-access coin flip walked the whole store
+    // at random and made eviction timing non-deterministic.
 
     const url = safeParseUrl(options.url);
     if (!url) return [];
@@ -952,9 +955,14 @@ export class CookieJar {
     // For domain cookies: domain-match (subdomains allowed).
     // We can't know per-domain whether it's host-only without checking cookies,
     // so we do the broader domain-match here and filter host-only per cookie.
-    if (reqHost === cookieDomain) return true;
-    if (isIPAddress(reqHost)) return false;
-    return reqHost.endsWith("." + cookieDomain);
+    // Lower-case both sides: cookie domains are stored from the (already
+    // normalized) Domain attribute, but a caller can also insert cookies
+    // directly via putCookie() with mixed-case input.
+    const host = reqHost.toLowerCase();
+    const domain = cookieDomain.toLowerCase();
+    if (host === domain) return true;
+    if (isIPAddress(host)) return false;
+    return host.endsWith("." + domain);
   }
 }
 

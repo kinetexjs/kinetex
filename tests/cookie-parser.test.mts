@@ -215,8 +215,8 @@ await test("canonicalizeDomainFull - punycode segment decoded", () => {
 });
 await test("canonicalizeDomainFull - multiple punycode segments decoded", () => {
   const result = canonicalizeDomainFull("xn--n3h.xn--4ek.example.com");
-  // xn--n3h decodes to ☃, xn--4ek may not decode via domainToUnicode
-  assert.ok(result === "☃.xn--4ek.example.com" || result === "☃.㄄.example.com");
+  // Both punycode labels decode: xn--n3h → ☃ and xn--4ek → ㄄
+  assert.equal(result, "☃.㄄.example.com");
 });
 
 await test("isIPAddress - IPv4", () => assert.equal(isIPAddress("192.168.1.1"), true));
@@ -303,7 +303,8 @@ await test("SameSite=invalid defaults to Unset", () => {
 });
 await test("expires without Max-Age", () => {
   const r = parseSetCookieHeader("session=abc; Expires=Wed, 21 Oct 2025 07:28:00 GMT");
-  assert.ok(r?.expires !== null);
+  assert.equal(r?.expires, Date.parse("Wed, 21 Oct 2025 07:28:00 GMT"));
+  assert.equal(r?.maxAge, null, "Max-Age must win when present, but it is absent here");
 });
 await test("control char in value returns null", () => {
   assert.equal(parseSetCookieHeader("session=\x07test"), null);
@@ -535,8 +536,8 @@ await test("httpbin /cookies/set with redirect manual", async () => {
 await test("httpbin /response-headers echoes Set-Cookie from params", async () => {
   const res = await client.get("https://httpbin.org/response-headers?Set-Cookie=fake=cookie");
   const setCookies = extractSetCookieHeaders(res.headers);
-  assert.ok(setCookies.length > 0);
-  assert.ok(setCookies.some((c) => c.includes("fake=cookie")));
+  assert.equal(setCookies.length, 1);
+  assert.equal(setCookies[0], "fake=cookie");
 });
 
 await test("kinetex cookie jar captures real Set-Cookie and re-sends on next request", async () => {
@@ -604,12 +605,8 @@ await test("kinetex cookie jar with multiple Set-Cookie headers", async () => {
     "https://httpbin.org/response-headers?Set-Cookie=a=1&Set-Cookie=b=2",
   );
   const raw = extractSetCookieHeaders(res.headers);
-  // httpbin may echo these as individual Set-Cookie headers or combine them
-  assert.ok(raw.length > 0, "Should extract at least one Set-Cookie");
-  // Verify extracted values contain our cookies
-  const all = raw.join(" ");
-  assert.ok(all.includes("a=1") || raw.some((c) => c.startsWith("a=1")));
-  assert.ok(all.includes("b=2") || raw.some((c) => c.startsWith("b=2")));
+  assert.equal(raw.length, 2);
+  assert.deepEqual(raw, ["a=1", "b=2"]);
 });
 
 // ============================================================================

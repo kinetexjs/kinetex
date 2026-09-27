@@ -124,7 +124,7 @@ export interface CacheConfig {
   honorCacheControl?: boolean;
   /** Only cache these methods. Default: ["GET", "HEAD"] */
   cacheMethods?: string[];
-  /** Only cache these status codes. Default: [200,203,204,206,300,301,304,404,405,410,414,501] */
+  /** Only cache these status codes. Default: [200,203,204,206,300,301,404,405,410,414,501] */
   cacheStatuses?: number[];
   /** Custom cache key function (may be async) */
   cacheKey?: (req: CacheableRequest) => string | Promise<string>;
@@ -536,14 +536,18 @@ function buildVaryKey(varyHeader: string, requestHeaders: Record<string, string>
 /**
  * Normalize a string for use in a cache key to prevent injection attacks.
  * Removes control characters and normalizes whitespace.
+ *
+ * The control characters are the entire point of the match: they are what has
+ * to be stripped out of a URL before it is used as a cache-key component, so
+ * `no-control-regex` is suppressed here deliberately.
  */
+// deno-lint-ignore no-control-regex
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
+
 function normalizeCacheKeyPart(part: string): string {
-  const controlRanges = [
-    String.fromCharCode(0x00) + "-" + String.fromCharCode(0x1f),
-    String.fromCharCode(0x7f) + "-" + String.fromCharCode(0x9f),
-  ].join("");
-  const controlRegex = new RegExp(`[${controlRanges}]`, "g");
-  return part.replaceAll(controlRegex, "").replaceAll(/\s+/g, " ").trim();
+  // The regex is module-level: rebuilding it from String.fromCharCode on every
+  // call (for every URL component, for every cache key) was pure overhead.
+  return part.replaceAll(CONTROL_CHARS, "").replaceAll(/\s+/g, " ").trim();
 }
 
 /**
@@ -552,11 +556,18 @@ function normalizeCacheKeyPart(part: string): string {
  * Returns "" when no auth headers are present (shared/anonymous cache).
  */
 export async function getAuthFingerprint(headers: Record<string, string>): Promise<string> {
-  const authHeaders = ["authorization", "cookie", "x-api-key", "x-auth-token"];
-  const parts: string[] = [];
+  // HTTP header names are case-insensitive, so a caller passing
+  // `Authorization` must fingerprint identically to `authorization` —
+  // otherwise a cache key or dedup key silently changes meaning with the
+  // casing of the caller's object literal.
+  const lowered = new Map<string, string>();
+  for (const [name, value] of Object.entries(headers)) {
+    lowered.set(name.toLowerCase(), value);
+  }
 
-  for (const header of authHeaders) {
-    const value = headers[header.toLowerCase()];
+  const parts: string[] = [];
+  for (const header of CREDENTIAL_HEADERS) {
+    const value = lowered.get(header);
     if (value) parts.push(`${header}=${value}`);
   }
 
@@ -570,6 +581,30 @@ export async function getAuthFingerprint(headers: Record<string, string>): Promi
     .slice(0, 32); // 128-bit prefix — ample for auth isolation
   return `auth:${hex}`;
 }
+
+/**
+ * Every header kinetex treats as credential-bearing. Shared by the cache-key
+ * fingerprint, the dedup key and the cross-origin redirect strip list so the
+ * three can never drift apart again: a header missing from the fingerprint list
+ * lets two different users share one cache entry or one coalesced response.
+ */
+export const CREDENTIAL_HEADERS = [
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "x-api-key",
+  "apikey",
+  "api-key",
+  "x-auth-token",
+  "x-access-token",
+  "x-refresh-token",
+  "x-session-id",
+  "x-session-token",
+  "x-secret",
+  "x-secret-key",
+  "x-private-key",
+  "x-csrf-token",
+] as const;
 
 /**
  * Default cache key function.
@@ -815,8 +850,10 @@ export class HTTPCache {
       maxAbsoluteAgeMs: config.maxAbsoluteAgeMs ?? 7 * 24 * 60 * 60 * 1000, // 7 days
       honorCacheControl: config.honorCacheControl ?? true,
       cacheMethods: config.cacheMethods ?? ["GET", "HEAD"],
+      // 304 is intentionally absent: the client revalidates rather than
+      // storing a 304, so listing it only implied a guarantee that never held.
       cacheStatuses: config.cacheStatuses ?? [
-        200, 203, 204, 206, 300, 301, 304, 404, 405, 410, 414, 501,
+        200, 203, 204, 206, 300, 301, 404, 405, 410, 414, 501,
       ],
       cacheKey: config.cacheKey ?? defaultCacheKey,
       storage: config.storage ?? new MemoryStorageAdapter(),
@@ -1318,11 +1355,12 @@ export class HTTPCache {
       for (const tag of entry.tags) {
         this.tagIndex.get(tag)?.delete(key);
       }
+    } else {
+      // Storage miss (already evicted / gone): the tag sets still referenced
+      // this key and those references used to be left behind forever, growing
+      // tagIndex on every eviction until invalidateByTag() walked stale keys.
+      for (const set of this.tagIndex.values()) set.delete(key);
     }
-    /* NOTE: If entry is undefined (e.g., not found during LRU eviction),
-       the tag index entry for that key will not be cleaned up.
-       This is a minor leak on disk-based storage miss, acceptable trade-off
-       since the key is gone from LRU and storage anyway. */
   }
 
   private async _ensureCapacity(newEntrySize: number): Promise<void> {

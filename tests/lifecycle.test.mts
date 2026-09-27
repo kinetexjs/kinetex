@@ -103,7 +103,8 @@ await test("502 triggers onError hook with attempt", async () => {
     await bin.get("/status/502");
   } catch (e) {}
 
-  assert.ok(attempt > 0);
+  // 502 is retried, so onError finally reports the last attempt
+  assert.equal(attempt, 4);
 });
 
 await test("503 triggers onError with request data", async () => {
@@ -119,7 +120,7 @@ await test("503 triggers onError with request data", async () => {
     await bin.get("/status/503");
   } catch (e) {}
 
-  assert.ok(url.includes("/status/503"));
+  assert.equal(url, "https://httpbin.org/status/503");
 });
 
 // ============================================================================
@@ -153,16 +154,28 @@ await test("loggingHooks afterResponse with GET", async () => {
 });
 
 await test("loggingHooks onError with 400", async () => {
-  const logging = createLoggingHooks();
+  const logged: Array<{ msg: string; data: { status?: number | null; url?: string } }> = [];
+  const logging = createLoggingHooks({
+    logger: (msg: string, data: unknown) => {
+      logged.push({ msg, data: data as { status?: number | null; url?: string } });
+    },
+  });
 
   const reg = new HookRegistry();
   reg.addOnError(logging.onError);
 
   bin.attachHookRegistry(reg);
 
+  let status = 0;
   try {
     await bin.get("/status/400");
-  } catch (e) {}
+  } catch (err: any) {
+    status = err?.status ?? 0;
+  }
+  // A 4xx must both surface to the caller and reach the logging hook.
+  assert.equal(status, 400, "expected an HTTPStatusError carrying status 400");
+  assert.equal(logged.length, 1, `onError logging hook must fire once, got ${logged.length}`);
+  assert.equal(logged[0]!.data.status, 400);
 });
 
 await test("loggingHooks with custom logger", async () => {
@@ -211,7 +224,9 @@ await test("timingHook tracks GET request time", async () => {
   bin.attachHookRegistry(reg);
 
   const res = await bin.get("/get");
-  assert.ok(res.durationMs >= 0);
+  assert.equal(res.status, 200);
+  assert.equal(typeof res.durationMs, "number");
+  assert.equal(res.durationMs > 0, true, `durationMs must be positive, got ${res.durationMs}`);
 });
 
 await test("timingHook tracks POST request time", async () => {
@@ -974,7 +989,11 @@ await test("ProgressTracker calculates rate", () => {
   tracker.update(100);
   const event = tracker.update(100);
 
-  assert.ok(event.rate! >= 0);
+  assert.equal(event.loaded, 200);
+  assert.equal(event.total, 1000);
+  assert.equal(event.percent, 20);
+  assert.equal(typeof event.rate, "number");
+  assert.equal(event.rate! >= 0, true);
 });
 
 await test("ProgressTracker.complete returns final", () => {

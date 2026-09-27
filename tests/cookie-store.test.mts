@@ -190,20 +190,47 @@ await test("Expires in past deletes cookie immediately", () => {
   assert.equal(jar.count, 0);
 });
 
+// The 400-day cap is expressed on the stored expiry, but that expiry is an
+// absolute timestamp captured inside setCookie(). Comparing it to a later
+// Date.now() therefore loses whatever elapsed in between, so an exact equality
+// against 400 days fails whenever a millisecond ticks over. Assert a bounded
+// window around the cap instead, measured from the timestamp taken *before* the
+// write.
+const CAP_400D = 400 * 86400000;
+
+function assertCappedAt400Days(label: string, expires: number, before: number): void {
+  // The cap is stamped from the "now" inside setCookie(), which is at or just
+  // after `before`, and Expires only has whole-second resolution, so the delta
+  // can sit a few milliseconds either side of exactly 400 days. 5s of slack is
+  // still six orders of magnitude below the 1-day granularity that would
+  // distinguish "capped" from "not capped".
+  const SLACK = 5000;
+  const delta = expires - before;
+  assert.equal(
+    delta <= CAP_400D + SLACK && delta > CAP_400D - SLACK,
+    true,
+    `${label}: expected expiry capped at 400 days from ${before}, got ${delta}ms`,
+  );
+}
+
 await test("Max-Age capped at 400 days", () => {
   const jar = createCookieJar();
+  const before = Date.now();
   jar.setCookie("x=1; Max-Age=99999999", { url: "https://example.com/" });
   const cookies = jar.getCookies({ url: "https://example.com/" });
-  const remaining = cookies[0].expires - Date.now();
-  assert.ok(remaining <= 400 * 86400000 + 2000);
+  assertCappedAt400Days("Max-Age", cookies[0].expires as number, before);
 });
 
 await test("Expires capped at 400 days from now", () => {
-  const farFuture = new Date(Date.now() + 999 * 86400000).toUTCString();
+  const before = Date.now();
+  const farFuture = new Date(before + 999 * 86400000).toUTCString();
   const jar = createCookieJar();
   jar.setCookie(`x=1; Expires=${farFuture}`, { url: "https://example.com/" });
-  const age = jar.getCookies({ url: "https://example.com/" })[0].expires - Date.now();
-  assert.ok(age <= 400 * 86400000 + 2000);
+  assertCappedAt400Days(
+    "Expires",
+    jar.getCookies({ url: "https://example.com/" })[0].expires as number,
+    before,
+  );
 });
 
 await test("cookie over 4096 bytes rejected", () => {
@@ -455,9 +482,26 @@ await test("toString returns pretty JSON", () => {
   const jar = createCookieJar();
   jar.setCookie("x=1", { url: "https://example.com/" });
   const str = jar.toString();
-  assert.ok(str.includes('"name"'));
-  assert.ok(str.includes('"value"'));
-  assert.ok(str.includes('"x"'));
+  assert.equal(str.startsWith('[\n  {\n    "name": "x"'), true, `not pretty-printed: ${str}`);
+  const parsed = JSON.parse(str) as Record<string, unknown>[];
+  assert.equal(parsed.length, 1);
+  assert.deepEqual(
+    { ...parsed[0], createdAt: 0, lastAccessed: 0 },
+    {
+      name: "x",
+      value: "1",
+      domain: "example.com",
+      path: "/",
+      expires: null,
+      maxAge: null,
+      secure: false,
+      httpOnly: false,
+      sameSite: "Unset",
+      createdAt: 0,
+      lastAccessed: 0,
+      hostOnly: true,
+    },
+  );
 });
 
 await test("serialize + deserialize full round-trip", () => {
@@ -564,7 +608,7 @@ await test("custom max limits work", () => {
   for (let i = 0; i < 10; i++) {
     jar.setCookie(`x${i}=1; Domain=example.com; Path=/p${i}`, { url: `https://example.com/p${i}` });
   }
-  assert.ok(jar.count <= 5);
+  assert.equal(jar.count, 5);
 });
 
 await test("destroy cleans up interval timer", () => {
@@ -714,13 +758,22 @@ await test("getCookiesForDomain does not return expired cookies", () => {
 
 await test("cookie with Max-Age and Expires both set uses Max-Age", () => {
   const jar = createCookieJar();
-  const future = new Date(Date.now() + 86400000).toUTCString();
-  jar.setCookie("x=1; Max-Age=3600; Expires=" + future, { url: "https://example.com/" });
-  const expires = jar.getCookies({ url: "https://example.com/" })[0].expires;
-  const expectedMaxAge = Date.now() + 3600000;
-  assert.ok(
-    Math.abs(expires - expectedMaxAge) < 5000,
-    `expected ~1h, got ${expires - Date.now()}ms`,
+  // Expires lands a full day out, so "used Expires" and "used Max-Age"
+  // are unambiguously distinct outcomes rather than near-identical numbers.
+  const expiresAttr = new Date(Date.now() + 86400000).toUTCString();
+  jar.setCookie("x=1; Max-Age=3600; Expires=" + expiresAttr, { url: "https://example.com/" });
+  const cookie = jar.getCookies({ url: "https://example.com/" })[0];
+  assert.notEqual(cookie.expires, null);
+
+  // Max-Age is relative to "now" and Expires is absolute, so the two differ by a
+  // whole day. Asserting an exact millisecond count races against the clock
+  // ticking between setCookie() and the read; precedence is what is under test,
+  // and that is decidable exactly: the expiry must be ~1h away, never ~24h.
+  const remaining = (cookie.expires as number) - Date.now();
+  assert.equal(
+    remaining > 3500000 && remaining <= 3600000,
+    true,
+    `Max-Age=3600 should win over Expires, expected ~1h remaining, got ${remaining}ms`,
   );
 });
 
@@ -759,7 +812,7 @@ await test("custom max limits work", () => {
   for (let i = 0; i < 10; i++) {
     jar.setCookie(`x${i}=1; Domain=example.com; Path=/p${i}`, { url: `https://example.com/p${i}` });
   }
-  assert.ok(jar.count <= 5);
+  assert.equal(jar.count, 5);
 });
 
 await test("destroy cleans up interval timer", () => {
@@ -878,10 +931,8 @@ await test("cookie jar with multiple Set-Cookie from response-headers", async ()
   const res = await httpbin.get("/response-headers?Set-Cookie=m1=v1&Set-Cookie=m2=v2");
   const { extractSetCookieHeaders } = await import("../src/cookie-parser.ts");
   const raw = extractSetCookieHeaders(res.headers);
-  assert.ok(raw.length > 0, "Should extract Set-Cookie from response");
-  // Verify at least one of our values is present
-  const all = raw.join(" ");
-  assert.ok(all.includes("m1=v1") || all.includes("m2=v2"));
+  assert.equal(raw.length, 2, `Should extract both Set-Cookie headers, got ${JSON.stringify(raw)}`);
+  assert.deepEqual(raw.map((c) => c.split(";")[0]).sort(), ["m1=v1", "m2=v2"]);
 });
 
 await test("direct CookieJar with real httpbin Set-Cookie", async () => {

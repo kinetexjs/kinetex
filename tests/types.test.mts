@@ -164,8 +164,8 @@ await test("HTTPStatusError server error (5xx)", () => {
 
 await test("HTTPStatusError message includes status and URL", () => {
   const e = new HTTPStatusError(fakeRes, fakeReq);
-  assert.ok(e.message.includes("500"));
-  assert.ok(e.message.includes("https://example.com/api"));
+  assert.equal(e.code, "EHTTPSTATUS");
+  assert.equal(e.message, `HTTP 500 ${fakeRes.statusText} — https://example.com/api`);
 });
 
 suite("AbortError");
@@ -313,22 +313,35 @@ await test("returns undefined for non-string types", () => {
 suite("Error hierarchy");
 
 await test("all error classes inherit from KinetexError", () => {
-  assert.ok(new SizeLimitError(1, 1) instanceof KinetexError);
-  assert.ok(new HTTPStatusError(fakeRes, fakeReq) instanceof KinetexError);
-  assert.ok(new AbortError() instanceof KinetexError);
-  assert.ok(new NetworkError("") instanceof KinetexError);
-  assert.ok(new ValidationError("") instanceof KinetexError);
-  assert.ok(new AuthError("") instanceof KinetexError);
-  assert.ok(new ProxyError("") instanceof KinetexError);
-  assert.ok(new RedirectError("") instanceof KinetexError);
-  assert.ok(new TimeoutError(1) instanceof KinetexError);
+  const errors = [
+    new SizeLimitError(1, 1),
+    new HTTPStatusError(fakeRes, fakeReq),
+    new AbortError(),
+    new NetworkError(""),
+    new ValidationError(""),
+    new AuthError(""),
+    new ProxyError(""),
+    new RedirectError(""),
+    new TimeoutError(1),
+  ];
+  assert.equal(errors.length, 9);
+  assert.deepEqual(
+    errors.map((e) => e instanceof KinetexError),
+    errors.map(() => true),
+  );
 });
 
 await test("all error classes inherit from Error", () => {
-  assert.ok(new SizeLimitError(1, 1) instanceof Error);
-  assert.ok(new HTTPStatusError(fakeRes, fakeReq) instanceof Error);
-  assert.ok(new AbortError() instanceof Error);
-  assert.ok(new NetworkError("") instanceof Error);
+  const errors = [
+    new SizeLimitError(1, 1),
+    new HTTPStatusError(fakeRes, fakeReq),
+    new AbortError(),
+    new NetworkError(""),
+  ];
+  assert.deepEqual(
+    errors.map((e) => e instanceof Error),
+    errors.map(() => true),
+  );
 });
 
 suite("KinetexError status getter");

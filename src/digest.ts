@@ -658,3 +658,45 @@ export async function createDigestAuthorization(
   );
   return formatDigestAuth(challenge, username, response, uri, cnonce, nc);
 }
+
+/**
+ * Stateful Digest-auth authorizer.
+ *
+ * Keeps a per-nonce request counter and increments it on every call, as
+ * RFC 7616 §3.4.1 requires: `nc` is the hex request count for the current
+ * nonce and MUST increase for each request. The stateless
+ * {@link createDigestAuthorization} always sends 00000001, which replay-
+ * protecting servers (nginx, Apache with `AuthDigestNonceLifetime`) reject on
+ * the second request. A new nonce (challenge change) resets the counter to 1.
+ *
+ * Not safe to share across clients that authenticate as different users —
+ * create one per client.
+ */
+export function createDigestAuthorizer(): (
+  wwwAuth: string,
+  username: string,
+  password: string,
+  method: string,
+  uri: string,
+) => Promise<string> {
+  const counters = new Map<string, number>();
+
+  return async (wwwAuth, username, password, method, uri) => {
+    const challenge = parseDigestChallenge(wwwAuth);
+    const cnonce = randomBytes(5);
+    const scope = `${challenge.realm}\u0000${challenge.nonce}`;
+    const next = (counters.get(scope) ?? 0) + 1;
+    counters.set(scope, next);
+    const nc = next.toString(16).padStart(8, "0");
+    const response = await computeDigestResponse(
+      challenge,
+      username,
+      password,
+      method,
+      uri,
+      cnonce,
+      nc,
+    );
+    return formatDigestAuth(challenge, username, response, uri, cnonce, nc);
+  };
+}

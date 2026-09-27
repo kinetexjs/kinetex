@@ -200,7 +200,8 @@ await test("Redactor handles Uint8Array with invalid UTF-8", async () => {
   const r = new Redactor({ logRequestBody: true });
   const res = r.redactBody(new Uint8Array([0xfe, 0xff]), "application/json", false);
   // TextDecoder with default (fatal=false) replaces invalid bytes with U+FFFD
-  assertOk(typeof res.body === "string");
+  assert.equal(res.body, "\uFFFD\uFFFD");
+  assert.equal(res.size, 2);
 });
 
 await test("Redactor truncates body exceeding maxBodyLength", async () => {
@@ -265,24 +266,21 @@ await test("ConsoleTransport pretty-prints request", async () => {
   let out = "";
   const t = new ConsoleTransport({ pretty: true, onWrite: (s) => (out = s) });
   t.write(makeReq());
-  assertOk(out.includes("GET"));
-  assertOk(out.includes("←"));
+  assert.equal(out, "[00:00:00.000] INFO  ← GET / [test-123]");
 });
 
 await test("ConsoleTransport pretty-prints response", async () => {
   let out = "";
   const t = new ConsoleTransport({ pretty: true, onWrite: (s) => (out = s) });
   t.write(makeRes());
-  assertOk(out.includes("200"));
-  assertOk(out.includes("→"));
+  assert.equal(out, "[00:00:00.000] INFO  → 200 GET / 150ms [test-123]");
 });
 
 await test("ConsoleTransport pretty-prints error", async () => {
   let out = "";
   const t = new ConsoleTransport({ pretty: true, onWrite: (s) => (out = s) });
   t.write(makeErr());
-  assertOk(out.includes("✗"));
-  assertOk(out.includes("test"));
+  assert.equal(out, "[00:00:00.000] ERROR ✗ GET / test [test-123]");
 });
 
 await test("ConsoleTransport JSON output when not pretty", async () => {
@@ -298,7 +296,7 @@ await test("ConsoleTransport marks cached responses", async () => {
   let out = "";
   const t = new ConsoleTransport({ pretty: true, onWrite: (s) => (out = s) });
   t.write(makeRes({ cached: true }));
-  assertOk(out.includes("cached"));
+  assert.equal(out, "[00:00:00.000] INFO  → 200 GET / 150ms (cached) [test-123]");
 });
 
 // ── JSONTransport ─────────────────────────────────────────────────────────
@@ -363,7 +361,7 @@ await test("BatchingTransport flush on empty buffer no-ops", async () => {
   };
   const b = new BatchingTransport(inner);
   await b.flush();
-  assertOk(flushed);
+  assert.equal(flushed, true);
 });
 
 // ── RemoteTransport ───────────────────────────────────────────────────────
@@ -429,8 +427,8 @@ await test("MultiTransport flush calls inner flushes", async () => {
     },
   };
   await new MultiTransport([t1, t2]).flush();
-  assertOk(f1);
-  assertOk(f2);
+  assert.equal(f1, true);
+  assert.equal(f2, true);
 });
 
 await test("MultiTransport isolates transport errors", async () => {
@@ -488,7 +486,8 @@ await test("createProductionLogger with endpoint uses MultiTransport", async () 
 
 await test("createProductionLogger without endpoint", async () => {
   const logger = createProductionLogger({});
-  assertOk((logger as any).cfg.transports[0] instanceof MultiTransport);
+  assert.equal((logger as any).cfg.transports.length, 1);
+  assert.equal((logger as any).cfg.transports[0] instanceof MultiTransport, true);
 });
 
 // ── HTTPLogger request ID ──────────────────────────────────────────────────
@@ -496,7 +495,10 @@ await test("createProductionLogger without endpoint", async () => {
 suite("HTTPLogger request ID");
 
 await test("generateRequestId returns non-empty string", async () => {
-  assertOk(createLogger().generateRequestId().length >= 10);
+  const id = createLogger().generateRequestId();
+  assert.equal(typeof id, "string");
+  assert.match(id, /^[a-z0-9]+-\d{4}-[a-z0-9]+$/i);
+  assert.equal(createLogger().generateRequestId() !== id, true, "ids must be unique");
 });
 
 await test("generateRequestId with custom generator", async () => {
@@ -542,7 +544,7 @@ await test("logRequest redacts sensitive headers", async () => {
 await test("logRequest redacts URL params", async () => {
   const { written, logger } = await captureWrite();
   logger.logRequest("r1", "GET", "https://example.com?token=abc", {}, null, 1);
-  assertOk((written[0] as any).url.includes("token=***"));
+  assert.equal((written[0] as any).url, "https://example.com/?token=***");
 });
 
 // ── HTTPLogger logResponse ────────────────────────────────────────────────
@@ -656,7 +658,7 @@ await test("flush delegates to transport flush", async () => {
     ],
   });
   await logger.flush();
-  assertOk(flushed);
+  assert.equal(flushed, true);
 });
 
 // ── HTTPLogger child ──────────────────────────────────────────────────────
@@ -789,11 +791,12 @@ suite("Active ID cleanup");
 await test("logRequest >500 triggers cleanup", async () => {
   const logger = createLogger({ transports: [{ write: () => {}, flush: async () => {} }] });
   const ids = (logger as any).activeIds as Map<string, unknown>;
-  // Add entries - cleanup runs when size > 500 but the eviction only triggers at MAX_ACTIVE_IDS (10000)
-  // So this verifies the cleanup is called without error
-  for (let i = 0; i < 501; i++) ids.set(`stale-${i}`, { startMs: 0, method: "GET", url: "/s" });
+  // startMs far in the past so every seeded entry is unambiguously idle
+  for (let i = 0; i < 501; i++) ids.set(`stale-${i}`, { startMs: -1e9, method: "GET", url: "/s" });
+  assert.equal(ids.size, 501);
   logger.logRequest("fresh", "GET", "/f", {}, null, 1);
-  assertOk(ids.size > 0);
+  // Crossing the 500 threshold runs the stale sweep, leaving only the fresh id
+  assert.deepEqual([...ids.keys()], ["fresh"]);
 });
 
 await test("activeIds deleted after logResponse", async () => {

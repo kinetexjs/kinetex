@@ -147,6 +147,8 @@ export type ErrorInterceptorResult = void | undefined | InterceptorResponse;
 /** Generic interceptor function type (internal use). */
 export type InterceptorFn<T = unknown> = (ctx: InterceptorContext) => Promise<T> | T;
 
+import { getAuthFingerprint } from "./cache.ts";
+
 /** A request-phase interceptor function. */
 export type RequestInterceptorFn = (
   ctx: InterceptorContext,
@@ -239,8 +241,16 @@ function nextId(): string {
   return `interceptor_${++_idSeq}`;
 }
 
-function sortByPriority<T extends { priority: number }>(arr: T[]): T[] {
-  return [...arr].sort((a, b) => a.priority - b.priority);
+/**
+ * Insert keeping ascending priority order. Sorting at registration (once)
+ * instead of on every request avoids copying the whole array three times per
+ * request, and Array#sort is stable so equal priorities keep registration
+ * order — the same result the old per-request sort produced.
+ */
+function insertByPriority<T extends { priority: number }>(arr: T[], entry: T): void {
+  const at = arr.findIndex((x) => x.priority > entry.priority);
+  if (at === -1) arr.push(entry);
+  else arr.splice(at, 0, entry);
 }
 
 /**
@@ -265,7 +275,7 @@ export class InterceptorManager {
    */
   useRequest(fn: RequestInterceptorFn, opts: InterceptorOptions = {}): string {
     const id = opts.id ?? nextId();
-    this.requestInterceptors.push({
+    insertByPriority(this.requestInterceptors, {
       id,
       priority: opts.priority ?? 0,
       once: opts.once ?? false,
@@ -284,7 +294,7 @@ export class InterceptorManager {
    */
   useResponse(fn: ResponseInterceptorFn, opts: InterceptorOptions = {}): string {
     const id = opts.id ?? nextId();
-    this.responseInterceptors.push({
+    insertByPriority(this.responseInterceptors, {
       id,
       priority: opts.priority ?? 0,
       once: opts.once ?? false,
@@ -303,7 +313,7 @@ export class InterceptorManager {
    */
   useError(fn: ErrorInterceptorFn, opts: InterceptorOptions = {}): string {
     const id = opts.id ?? nextId();
-    this.errorInterceptors.push({
+    insertByPriority(this.errorInterceptors, {
       id,
       priority: opts.priority ?? 0,
       once: opts.once ?? false,
@@ -416,7 +426,7 @@ export class InterceptorManager {
     const toEject = new Set<string>();
 
     // ── Request phase ──────────────────────────────────────────────────────
-    for (const interceptor of sortByPriority(this.requestInterceptors)) {
+    for (const interceptor of this.requestInterceptors) {
       if (ctx.aborted) break;
       if (interceptor.condition && !interceptor.condition(ctx)) continue;
 
@@ -467,7 +477,7 @@ export class InterceptorManager {
     // Collect IDs to eject after iteration
     const toEject = new Set<string>();
 
-    for (const interceptor of sortByPriority(this.responseInterceptors)) {
+    for (const interceptor of this.responseInterceptors) {
       if (ctx.aborted) break;
       if (interceptor.condition && !interceptor.condition(ctx)) continue;
 
@@ -513,7 +523,7 @@ export class InterceptorManager {
     // Collect IDs to eject after iteration
     const toEject = new Set<string>();
 
-    for (const interceptor of sortByPriority(this.errorInterceptors)) {
+    for (const interceptor of this.errorInterceptors) {
       if (interceptor.condition && !interceptor.condition(ctx)) continue;
 
       let result: ErrorInterceptorResult;
@@ -891,17 +901,14 @@ export function createTimeoutInterceptor(config: Partial<TimeoutConfig> = {}): {
   };
 
   /** Shared cleanup for the response and error phases. */
-  const cleanupTimeout = (ctx: {
-    store: Map<symbol, unknown>;
-  }): void => {
+  const cleanupTimeout = (ctx: { store: Map<symbol, unknown> }): void => {
     const timer = ctx.store.get(TIMEOUT_TIMER_KEY) as ReturnType<typeof setTimeout> | undefined;
     if (timer) {
       clearTimeout(timer);
       ctx.store.delete(TIMEOUT_TIMER_KEY);
     }
     const merged = ctx.store.get(TIMEOUT_SIGNAL_KEY) as
-      | { existing: AbortSignal; onExistingAbort: () => void }
-      | undefined;
+      { existing: AbortSignal; onExistingAbort: () => void } | undefined;
     if (merged) {
       merged.existing.removeEventListener("abort", merged.onExistingAbort);
       ctx.store.delete(TIMEOUT_SIGNAL_KEY);
@@ -1242,18 +1249,28 @@ export function createDedupeInterceptor(): {
   type Waiter = {
     resolve: (r: InterceptorResponse) => void;
     reject: (e: unknown) => void;
+    cleanup: () => void;
   };
   const inflight = new Map<string, { promise: Promise<InterceptorResponse>; waiters: Waiter[] }>();
 
-  function key(req: InterceptorRequest): string {
-    return `${req.method.toUpperCase()}:${req.url}`;
+  /**
+   * Dedupe key. SECURITY: the auth fingerprint is part of the key. Without it,
+   * two callers with different Authorization / Cookie / API-key headers for the
+   * same URL were coalesced and one user received the other user's response.
+   */
+  async function key(req: InterceptorRequest): Promise<string> {
+    const authFp = await getAuthFingerprint((req.headers ?? {}) as Record<string, string>);
+    return `${req.method.toUpperCase()}:${req.url}${authFp ? ":" + authFp : ""}`;
   }
 
-  const requestInterceptor: RequestInterceptorFn = (ctx) => {
+  const requestInterceptor: RequestInterceptorFn = async (ctx) => {
     if (ctx.request.method.toUpperCase() !== "GET" && ctx.request.method.toUpperCase() !== "HEAD")
       return;
 
-    const k = key(ctx.request);
+    const k = await key(ctx.request);
+    // Stash the key on the context so the response/error phases can find this
+    // request' slot without re-deriving it.
+    ctx.store.set(DEDUPE_KEY, k);
     const slot = inflight.get(k);
     if (!slot) {
       // First request for this key — create in-flight entry
@@ -1264,38 +1281,59 @@ export function createDedupeInterceptor(): {
       return;
     }
 
-    // A request is already in flight — queue up
-    ctx.store.set(DEDUPE_QUEUED_KEY, k);
-    // Return a Promise that resolves to InterceptorResponse (which is a valid RequestInterceptorResult)
+    // A request is already in flight — queue up. A queued caller must never be
+    // left hanging if its own signal aborts while it waits for the leader.
     return new Promise<RequestInterceptorResult>((resolve, reject) => {
-      slot.waiters.push({
+      const signal = ctx.request.signal;
+      const waiter: Waiter = {
         resolve: (res: InterceptorResponse) => resolve(res),
         reject: (err: unknown) => reject(err), // Properly reject instead of throwing
-      });
+        cleanup: () => signal?.removeEventListener("abort", onQueuedAbort),
+      };
+      const onQueuedAbort = () => {
+        const at = slot.waiters.indexOf(waiter);
+        if (at !== -1) slot.waiters.splice(at, 1);
+        reject(new Error("Request aborted while queued for deduplication"));
+      };
+      if (signal?.aborted) {
+        onQueuedAbort();
+        return;
+      }
+      signal?.addEventListener("abort", onQueuedAbort, { once: true });
+      slot.waiters.push(waiter);
     });
   };
 
   const responseInterceptor: ResponseInterceptorFn = (ctx) => {
     if (!ctx.response) return;
-    const k = key(ctx.request);
+    const k = ctx.store.get(DEDUPE_KEY) as string | undefined;
+    if (!k) return;
     const slot = inflight.get(k);
     if (!slot) return;
     inflight.delete(k);
-    for (const w of slot.waiters) w.resolve(ctx.response);
+    for (const w of slot.waiters.splice(0)) {
+      w.cleanup();
+      w.resolve(ctx.response);
+    }
   };
 
   const errorInterceptor: ErrorInterceptorFn = (ctx) => {
-    const k = key(ctx.request);
+    const k = ctx.store.get(DEDUPE_KEY) as string | undefined;
+    if (!k) return;
     const slot = inflight.get(k);
     if (!slot) return;
     inflight.delete(k);
-    for (const w of slot.waiters) w.reject(ctx.error);
+    for (const w of slot.waiters.splice(0)) {
+      w.cleanup();
+      w.reject(ctx.error);
+    }
   };
 
   return { requestInterceptor, responseInterceptor, errorInterceptor };
 }
 
-const DEDUPE_QUEUED_KEY = Symbol("dedupeQueued");
+/** ctx.store key holding this request's dedupe key. */
+const DEDUPE_KEY = Symbol("dedupeKey");
 
 // ============================================================================
 // §11  BUILT-IN: RATE-LIMIT INTERCEPTOR (token bucket)

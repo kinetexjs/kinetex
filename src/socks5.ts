@@ -725,40 +725,38 @@ export const denoTcpConnector: TcpConnector = async (host, port, timeoutMs): Pro
     };
   };
 
-  let conn: Awaited<ReturnType<typeof denoGlobal.Deno.connect>>;
-
-  if (timeoutMs && timeoutMs > 0) {
-    // Wrap connect in a timeout race
-    conn = await Promise.race([
-      denoGlobal.Deno.connect({ hostname: host, port, transport: "tcp" }),
-      new Promise<never>((_, rej) =>
-        setTimeout(
-          () => rej(new Socks5Error("TCP connect to proxy timed out", "SOCKS5_TIMEOUT", true)),
-          timeoutMs,
-        ),
-      ),
-    ]);
-  } else {
-    conn = await denoGlobal.Deno.connect({ hostname: host, port, transport: "tcp" });
-  }
-
-  const wrappedRead = async (buf: Uint8Array): Promise<number | null> => {
-    if (timeoutMs && timeoutMs > 0) {
-      return Promise.race([
-        conn.read(buf).catch(() => null),
-        new Promise<never>((_, rej) =>
-          setTimeout(
-            () => rej(new Socks5Error("TCP read timed out", "SOCKS5_TIMEOUT", true)),
-            timeoutMs,
-          ),
-        ),
-      ]);
-    }
+  // NOTE: every timeout below is created and cleared explicitly. The previous
+  // Promise.race timers were never cleared, so each read left a pending timer
+  // (holding a closure, and keeping the Deno event loop alive) for the full
+  // timeout window — one per chunk on a streaming tunnel.
+  const withTimeout = async <T>(work: Promise<T>, message: string): Promise<T> => {
+    if (!timeoutMs || timeoutMs <= 0) return work;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await conn.read(buf);
-    } catch {
-      return null;
+      return await Promise.race([
+        work,
+        new Promise<never>((_, rej) => {
+          timer = setTimeout(
+            () => rej(new Socks5Error(message, "SOCKS5_TIMEOUT", true)),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
+  };
+
+  const conn: Awaited<ReturnType<typeof denoGlobal.Deno.connect>> = await withTimeout(
+    denoGlobal.Deno.connect({ hostname: host, port, transport: "tcp" }),
+    "TCP connect to proxy timed out",
+  );
+
+  // Not `async`: it returns withTimeout()'s promise directly, so there is no
+  // await to make the function async.
+  const wrappedRead = (buf: Uint8Array): Promise<number | null> => {
+    const read = conn.read(buf).catch(() => null);
+    return withTimeout(read, "TCP read timed out");
   };
 
   return {
@@ -829,13 +827,21 @@ export const nodeTcpConnector: TcpConnector = (host, port, timeoutMs): Promise<T
           flushBuffer();
         });
 
+        // Latch EOF. Without this, a read issued AFTER `end` parked forever:
+        // the socket will never emit data again, nothing rejects, and the caller
+        // hangs with no error. Callers now get an immediate null (clean EOF).
+        let ended = false;
         socket.on("end", () => {
+          ended = true;
           if (pendingRead) {
             pendingRead(null);
             pendingRead = null;
             pendingReject = null;
             pendingBuf = null;
           }
+        });
+        socket.on("close", () => {
+          ended = true;
         });
 
         socket.once("error", (err) => {
@@ -856,6 +862,10 @@ export const nodeTcpConnector: TcpConnector = (host, port, timeoutMs): Promise<T
               new Promise<number | null>((res, rej) => {
                 if (lastError) {
                   rej(lastError);
+                  return;
+                }
+                if (ended && buffer.length === 0) {
+                  res(null);
                   return;
                 }
                 if (buffer.length > 0) {

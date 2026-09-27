@@ -9,7 +9,9 @@
  *  - FetchTransport (globalThis.fetch) is used automatically when IS_NODE is false.
  *
  * ⚠️ Features unavailable from this entry point (use main `mod.ts` instead):
- *  - HTTP/2 (node:http2) — available in Node.js but not edge runtimes
+ *  - HTTP/2 (node:http2) — this entry point always uses FetchTransport, so
+ *    `httpVersion: "HTTP/2"` has no effect here even on a runtime where the
+ *    main entry point would use it
  *  - HTTPS agent options (node:tls) — Node.js only
  *  - Custom Node.js-only transports (e.g., Undici, Node.js http/https agents)
  *  - Some advanced interceptors that depend on Node.js APIs
@@ -73,13 +75,11 @@ import type { KinetexConfig } from "./types.ts";
  *   baseURL: "https://api.example.com",
  *   auth: { type: "bearer", token: "my-token" },
  * });
- *
- * // HTTP/2 is supported for outgoing requests (when target server supports it)
- * const http2Client = kinetex({ httpVersion: "HTTP/2" });
  * ```
  *
- * Note: Default transport is `globalThis.fetch` which is available in all
- * edge runtimes. This entry point does not include Node.js-specific transports.
+ * Note: Default transport is `globalThis.fetch`, available in all edge
+ * runtimes. `httpVersion` defaults to HTTP/1.1 here; HTTP/2 requires the Node
+ * `node:http2` transport, which this entry point does not include.
  */
 export function kinetex(config: KinetexConfig = {}): _Kinetex {
   return new _Kinetex({ httpVersion: config.httpVersion ?? "HTTP/1.1", ...config });

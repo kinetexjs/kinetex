@@ -94,7 +94,7 @@ await test("percentEncode 1000 common URLs", () => {
   const start = performance.now();
   for (const u of urls) percentEncode(u);
   const e = logTiming("percentEncode", start, 1000);
-  assert.ok(e < 200, `percentEncode took ${e}ms, expected <200ms`);
+  assert.equal(e < 200, true, `percentEncode took ${e}ms, expected <200ms`);
 });
 
 await test("percentDecode 1000 encoded URLs", () => {
@@ -107,7 +107,7 @@ await test("percentDecode 1000 encoded URLs", () => {
   const start = performance.now();
   for (const u of encoded) percentDecode(u);
   const e = logTiming("percentDecode", start, 1000);
-  assert.ok(e < 100, `percentDecode took ${e}ms, expected <100ms`);
+  assert.equal(e < 100, true, `percentDecode took ${e}ms, expected <100ms`);
 });
 
 await test("stringifyQuery with 100 params", () => {
@@ -117,7 +117,7 @@ await test("stringifyQuery with 100 params", () => {
   for (let i = 0; i < 100; i++) stringifyQuery(params);
   const e = elapsedMs(start);
   logTiming("stringifyQuery ×100", start, 100);
-  assert.ok(e < 100, `stringifyQuery took ${e}ms (100 reps), expected <100ms`);
+  assert.equal(e < 100, true, `stringifyQuery took ${e}ms (100 reps), expected <100ms`);
 });
 
 await test("URLBuilder build 1000 URLs", () => {
@@ -129,7 +129,7 @@ await test("URLBuilder build 1000 URLs", () => {
       .toString();
   }
   const e = logTiming("URLBuilder", start, 1000);
-  assert.ok(e < 500, `URLBuilder took ${e}ms, expected <500ms`);
+  assert.equal(e < 500, true, `URLBuilder took ${e}ms, expected <500ms`);
 });
 
 await test("parseQuery round-trip stability", () => {
@@ -362,9 +362,9 @@ await test("MemoryStorage eviction under maxSize", async () => {
   const stats = cache.getStats();
   const e = elapsedMs(start);
   logTiming("MemoryStorage eviction", start, 1_000);
-  assert.ok(stats.evictions >= 900, `expected >=900 evictions, got ${stats.evictions}`);
-  assert.ok(stats.totalEntries <= 100, `expected <=100 entries, got ${stats.totalEntries}`);
-  assert.ok(e < 500, `eviction took ${e}ms, expected <500ms`);
+  assert.equal(stats.evictions, 900);
+  assert.equal(stats.totalEntries, 100);
+  assert.equal(e < 500, true, `eviction took ${e}ms, expected <500ms`);
 });
 
 // ============================================================================
@@ -379,10 +379,10 @@ await test("base64Encode 1KB buffer — 10,000 iterations", () => {
   const start = performance.now();
   for (let i = 0; i < 10_000; i++) {
     const enc = base64Encode(buf);
-    assert.ok(enc.length > 0);
+    assert.equal(enc.length, 1368);
   }
   const e = logTiming("base64Encode 1KB", start, 10_000);
-  assert.ok(e < 500, `base64Encode took ${e}ms, expected <500ms`);
+  assert.equal(e < 500, true, `base64Encode took ${e}ms, expected <500ms`);
 });
 
 await test("base64Decode encoded string — 10,000 iterations", () => {

@@ -603,9 +603,16 @@ export class SSEClient {
 
         if (!cfg.reconnect) throw err;
 
-        // Max reconnects reached
-        if (cfg.maxReconnects > 0 && reconnectAttempt >= cfg.maxReconnects) {
-          throw new SSEMaxReconnectsError(reconnectAttempt, cfg.url);
+        // Max reconnects reached.
+        //
+        // Checked against the number of reconnects actually performed, NOT
+        // `reconnectAttempt`. That counter is reset on every successful connect
+        // (so back-off restarts), which meant a server that accepted the
+        // connection and then dropped the stream reset the counter each time —
+        // the cap could never be reached and the client reconnected forever,
+        // regardless of maxReconnects. `attempts` is the real attempt count.
+        if (cfg.maxReconnects > 0 && this.health.totalReconnects >= cfg.maxReconnects) {
+          throw new SSEMaxReconnectsError(this.health.totalReconnects, cfg.url);
         }
 
         reconnectAttempt++;
@@ -625,7 +632,10 @@ export class SSEClient {
           heartbeatTimer = null;
         }
 
-        await sleep(delay);
+        // Abortable: without the signal an abort() during back-off had to wait
+        // out the full delay (up to maxReconnectDelayMs) before being noticed.
+        await sleep(delay, cfg.signal);
+        if (cfg.signal?.aborted) break;
         parser.reset();
         continue;
       }
@@ -634,16 +644,26 @@ export class SSEClient {
       this.health.connected = false;
       if (!cfg.reconnect) break;
 
-      // Max reconnects reached (also checked in catch for error path)
-      if (cfg.maxReconnects > 0 && reconnectAttempt >= cfg.maxReconnects) {
-        throw new SSEMaxReconnectsError(reconnectAttempt, cfg.url);
+      // Max reconnects reached. Same reasoning as the error path above: the
+      // cap bounds reconnects performed, and a successful connect zeroes
+      // `reconnectAttempt`, so that counter cannot be used here.
+      if (cfg.maxReconnects > 0 && this.health.totalReconnects >= cfg.maxReconnects) {
+        throw new SSEMaxReconnectsError(this.health.totalReconnects, cfg.url);
       }
 
       // Reconnect after stream closed by server
       reconnectAttempt++;
       this.health.totalReconnects++;
+      this.health.reconnectAttempt = reconnectAttempt;
 
-      const delay = Math.min(reconnectDelay, cfg.maxReconnectDelayMs);
+      // Same jitter formula as the error path — a clean server close used to
+      // reconnect with zero jitter, so every client in a fleet reconnected in
+      // lockstep after a server restart.
+      const delay = Math.min(
+        reconnectDelay + reconnectDelay * cfg.reconnectJitter * Math.random(),
+        cfg.maxReconnectDelayMs,
+      );
+      reconnectDelay = Math.min(reconnectDelay * 2, cfg.maxReconnectDelayMs);
       cfg.onReconnect(reconnectAttempt, delay);
 
       // Clear orphaned heartbeat timer before sleep to avoid firing during back-off
@@ -652,7 +672,10 @@ export class SSEClient {
         heartbeatTimer = null;
       }
 
-      await sleep(delay);
+      await sleep(delay, cfg.signal);
+      // Same as the error path: without this, a close()/abort() during a
+      // clean-close back-off was not noticed until the full delay elapsed.
+      if (cfg.signal?.aborted) break;
     }
 
     this.health.connected = false;
@@ -1031,6 +1054,21 @@ export function parseSSEText(text: string): SSEEvent[] {
 // §10  UTILITIES
 // ============================================================================
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((r) => {
+    if (signal?.aborted) {
+      r();
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      r();
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      r();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }

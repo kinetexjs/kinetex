@@ -369,11 +369,22 @@ async function main() {
   });
   await test("blob", async () => {
     const b = await createLimitedReader(1000).blob(new Response("test"));
+    // Assert the real type and size, not just that it is a Blob.
     ok(b instanceof Blob);
+    // new Response("test") carries an implicit text/plain;charset=utf-8.
+    eq(b.type, "text/plain;charset=utf-8");
+    eq(b.size, 4);
     eq(await b.text(), "test");
   });
   await test("stream", async () => {
-    ok(createLimitedReader(1000).stream(new Response("d")) instanceof ReadableStream);
+    const s = createLimitedReader(1000).stream(new Response("d"));
+    ok(s instanceof ReadableStream);
+    // The stream must actually yield the body, not just exist.
+    const reader = s.getReader();
+    const first = await reader.read();
+    ok(first.done === false, "expected a chunk");
+    eq(new TextDecoder().decode(first.value as Uint8Array), "d");
+    eq((await reader.read()).done, true);
   });
   await test("throws when exceeded", async () => {
     const r = createLimitedReader(5, "throw");
@@ -416,10 +427,37 @@ async function main() {
   });
   await test("sizeLimit abort", async () => {
     const res = await ktx.get("https://jsonplaceholder.typicode.com/posts");
-    const t = await readText(new Response(res.rawBody as any), {
+    const body = res.rawBody as any;
+
+    // The three onExceed modes are genuinely different. A bare `length <= 5`
+    // check cannot tell them apart: both "truncate" (returns exactly maxBytes)
+    // and "abort" (returns nothing) satisfy it. Pin each behaviour:
+
+    // "throw" rejects with ResponseSizeLimitError.
+    let caught: unknown = null;
+    try {
+      await readText(new Response(body), { sizeLimit: { maxBytes: 5, onExceed: "throw" } });
+    } catch (err) {
+      caught = err;
+    }
+    ok(
+      caught instanceof ResponseSizeLimitError,
+      `expected ResponseSizeLimitError, got ${String(caught)}`,
+    );
+    eq((caught as ResponseSizeLimitError).limit, 5);
+    ok((caught as ResponseSizeLimitError).bytesRead > 5);
+
+    // "truncate" returns exactly maxBytes characters.
+    const truncated = await readText(new Response(body), {
+      sizeLimit: { maxBytes: 5, onExceed: "truncate" },
+    });
+    eq(truncated.length, 5);
+
+    // "abort" yields no content at all — not a truncated prefix.
+    const aborted = await readText(new Response(body), {
       sizeLimit: { maxBytes: 5, onExceed: "abort" },
     });
-    assert.ok(t.length <= 5, `Expected length <= 5, got ${t.length}`);
+    eq(aborted, "");
   });
   await test("signal.aborted before read", async () => {
     const ac = new AbortController();

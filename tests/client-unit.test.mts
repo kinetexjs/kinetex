@@ -507,7 +507,15 @@ await test("send with plain object body auto-serializes as JSON", async () => {
 await test("send with URLSearchParams body", async () => {
   const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
   const res = await client.post("/post", new URLSearchParams({ a: "1" }), { throwOnError: false });
-  assert.ok(res.status === 200 || res.status === 201);
+  assert.equal(res.status, 200);
+  const echoed = res.data as {
+    form?: Record<string, string>;
+    headers?: Record<string, string>;
+    data?: string;
+    files?: Record<string, string>;
+  };
+  assert.equal(JSON.stringify(echoed.form), JSON.stringify({ a: "1" }));
+  assert.equal(echoed.headers?.["Content-Type"], "application/x-www-form-urlencoded");
   client.destroy();
 });
 

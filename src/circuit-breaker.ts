@@ -212,10 +212,16 @@ export class CircuitBreaker {
 
   /** Snapshot of all counters — suitable for logging or dashboards. */
   get snapshot(): CircuitBreakerState {
+    // Counted with a loop: filter() allocated a new array on every snapshot,
+    // and snapshot is taken on every rejection and state transition.
+    let failureCount = this._consecutiveFails;
+    if (this.windowSize > 0) {
+      failureCount = 0;
+      for (const ok of this._window) if (!ok) failureCount++;
+    }
     return {
       state: this._state,
-      failureCount:
-        this.windowSize > 0 ? this._window.filter((v) => !v).length : this._consecutiveFails,
+      failureCount,
       successCount: this._consecutiveSucc,
       lastFailureAt: this._lastFailureAt,
       lastSuccessAt: this._lastSuccessAt,
@@ -244,6 +250,11 @@ export class CircuitBreaker {
       return Promise.reject(new CircuitOpenError(this.key, snap));
     }
 
+    // Remember whether THIS call holds a half-open probe. Decrementing based
+    // on the state at settle time was wrong: if a sibling probe failed first
+    // the state was already OPEN, the decrement was skipped, and the probe slot
+    // stayed occupied for the rest of the half-open window.
+    let heldProbe = false;
     if (this._state === "HALF_OPEN") {
       if (this._inFlightProbes >= this.halfOpenConcurrency) {
         this._totalRejected++;
@@ -252,28 +263,32 @@ export class CircuitBreaker {
         return Promise.reject(new CircuitOpenError(this.key, snap));
       }
       this._inFlightProbes++;
+      heldProbe = true;
     }
 
     this._totalRequests++;
 
-    return fn().then(
-      (result) => {
-        if (this._state === "HALF_OPEN")
-          this._inFlightProbes = Math.max(0, this._inFlightProbes - 1);
-        this._recordSuccess();
-        return result;
-      },
-      (err: unknown) => {
-        if (this._state === "HALF_OPEN")
-          this._inFlightProbes = Math.max(0, this._inFlightProbes - 1);
-        if (this._isCountableFailure(err)) {
-          this._recordFailure();
-        }
-        // Never decrement _totalRequests — keep a faithful count of all attempts,
-        // including non-countable failures (e.g. app-level errors we don't treat as outages).
-        throw err;
-      },
-    );
+    // Promise.resolve().then(fn) so a synchronous throw inside `fn` becomes a
+    // rejection. execute() is an async API — callers destructure .catch() off
+    // the return value, and a sync throw would escape before they could.
+    return Promise.resolve()
+      .then(fn)
+      .then(
+        (result) => {
+          if (heldProbe) this._inFlightProbes = Math.max(0, this._inFlightProbes - 1);
+          this._recordSuccess();
+          return result;
+        },
+        (err: unknown) => {
+          if (heldProbe) this._inFlightProbes = Math.max(0, this._inFlightProbes - 1);
+          if (this._isCountableFailure(err)) {
+            this._recordFailure();
+          }
+          // Never decrement _totalRequests — keep a faithful count of all attempts,
+          // including non-countable failures (e.g. app-level errors we don't treat as outages).
+          throw err;
+        },
+      );
   }
 
   /**

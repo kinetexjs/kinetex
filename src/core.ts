@@ -198,6 +198,13 @@ export interface FetchTransportOptions {
 }
 
 /**
+ * The accept-encoding value client.ts injects when the caller did not set
+ * one. FetchTransport removes exactly this string so fetch() negotiates its
+ * own encodings; any other value is treated as caller intent.
+ */
+export const DEFAULT_ACCEPT_ENCODING = "gzip, deflate, br";
+
+/**
  * Universal fetch-based transport.
  * Suitable for all runtimes where `fetch` is available.
  */
@@ -262,10 +269,12 @@ export class FetchTransport implements Transport {
       sanitizedHeaders[name] = value;
     }
 
-    // Strip default accept-encoding injected by client.ts so fetch()
-    // can add its own. Preserve caller-explicit values (e.g. "identity").
+    // Strip the accept-encoding value INJECTED by client.ts so fetch() can add
+    // its own. The old check removed ANY value containing gzip+deflate+br,
+    // including one the caller set deliberately; matching the exact injected
+    // default keeps caller intent intact.
     const ae = sanitizedHeaders["accept-encoding"];
-    if (ae && ae.toLowerCase().includes("gzip") && ae.toLowerCase().includes("deflate") && ae.toLowerCase().includes("br")) {
+    if (ae && ae.toLowerCase().replace(/\s+/g, " ") === DEFAULT_ACCEPT_ENCODING) {
       delete sanitizedHeaders["accept-encoding"];
     }
 
@@ -962,6 +971,15 @@ export function createTransport(
   // "Custom fetch implementation" behavior holds on every runtime.
   // Use NodeHTTP2Transport for Node.js when HTTP/2 is preferred and no custom
   // fetch is given. Falls back to FetchTransport otherwise.
+  if (IS_NODE && preferHTTP2 && fetchFn) {
+    if (!isProductionEnvironment()) {
+      console.warn(
+        '[kinetex] httpVersion: "HTTP/2" is ignored when a custom `fetch` is configured — ' +
+          "NodeHTTP2Transport cannot use a custom fetch, so the request goes through " +
+          "FetchTransport (HTTP/1.1 semantics). Drop the `fetch` option to use HTTP/2.",
+      );
+    }
+  }
   if (IS_NODE && preferHTTP2 && !fetchFn) {
     return new NodeHTTP2Transport({
       ...(sessionOptions?.sessionTTLMs !== undefined
@@ -1389,7 +1407,7 @@ async function writeChunkWithBackpressure(
 
 /**
  * Write a request body to an HTTP/2 stream, respecting backpressure.
- * Handles ReadableStream, Uint8Array, ArrayBuffer, and string body types.
+ * Handles ReadableStream, Uint8Array, ArrayBuffer, string, URLSearchParams and Blob bodies.
  *
  * @param stream - HTTP/2 stream to write to
  * @param body   - Request body
@@ -1414,13 +1432,17 @@ async function attachBodyToH2Stream(
   } else if (typeof body === "string") {
     stream.end(body);
   } else {
-    stream.end();
+    // The raw Node transports bypass fetch, so bodies fetch would normally
+    // serialize (URLSearchParams, Blob) must be encoded here. Skipping them
+    // silently sent an empty body to the server.
+    const bytes = await serializeRawBody(body);
+    stream.end(bytes);
   }
 }
 
 /**
  * Write a request body to a Node.js http.ClientRequest, respecting backpressure.
- * Handles ReadableStream, Uint8Array, ArrayBuffer, and string body types.
+ * Handles ReadableStream, Uint8Array, ArrayBuffer, string, URLSearchParams and Blob bodies.
  *
  * @param req  - Node.js ClientRequest
  * @param body - Request body
@@ -1445,8 +1467,29 @@ async function pipeBodyToNodeReq(
   } else if (typeof body === "string") {
     req.end(body);
   } else {
-    req.end();
+    // The raw Node transports bypass fetch, so bodies fetch would normally
+    // serialize (URLSearchParams, Blob) must be encoded here. Skipping them
+    // silently sent an empty body to the server.
+    const bytes = await serializeRawBody(body);
+    req.end(bytes);
   }
+}
+
+/**
+ * Serialize body types that `fetch` would normally encode for us, so the raw
+ * Node HTTP/1.1 and HTTP/2 transports do not silently send an empty payload.
+ *
+ * @param body - Request body that is not a stream, byte array, or string
+ * @returns The encoded bytes to write (empty for unsupported types)
+ */
+async function serializeRawBody(body: import("./types.ts").BodyInit): Promise<Uint8Array> {
+  if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
+    return new TextEncoder().encode(body.toString());
+  }
+  if (typeof Blob !== "undefined" && body instanceof Blob) {
+    return new Uint8Array(await body.arrayBuffer());
+  }
+  return new Uint8Array(0);
 }
 
 // ============================================================================

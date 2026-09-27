@@ -245,8 +245,8 @@ await test("parseQuery repeated keys — verified via kinetex", async () => {
   console.log("    URL with repeated keys:", url);
   const parsed = parseQuery(url.split("?")[1] || "");
   console.log("    Parsed repeated:", JSON.stringify(parsed));
-  const tags = parsed.tag;
-  assert.ok(Array.isArray(tags));
+  assert.equal(url, "https://httpbin.org/get?tag=a&tag=b&tag=c");
+  assert.deepEqual(parsed.tag, ["a", "b", "c"]);
 });
 
 await test("mergeQuery result sent via kinetex", async () => {
@@ -1003,14 +1003,16 @@ await test("Real API: httpbin /user-agent with kinetex", async () => {
   const r = await bin.get("/user-agent");
   const data = r.data as { "user-agent": string | null };
   console.log("    User-Agent:", data["user-agent"]);
-  assert.ok(data["user-agent"] === null || typeof data["user-agent"] === "string");
+  assert.deepEqual(Object.keys(data), ["user-agent"]);
+  // kinetex does not inject a User-Agent, so httpbin reports null
+  assert.equal(data["user-agent"], null);
 });
 
 await test("Real API: httpbin /cookies with kinetex", async () => {
   const r = await bin.get("/cookies");
   const data = r.data as { cookies: Record<string, string> };
   console.log("    Cookies:", JSON.stringify(data.cookies));
-  assert.ok(typeof data.cookies === "object");
+  assert.deepEqual(data.cookies, {});
 });
 
 await test("Real API: httpbin /redirect/1 verified with native fetch", async () => {
@@ -1511,8 +1513,13 @@ await test("percentDecode malformed sequence fallback", async () => {
   // Malformed UTF-8 sequences cause decodeURIComponent to throw
   // %E0%80%AF is an overlong UTF-8 sequence that throws in Node.js
   const result = percentDecode("%E0%80%AF");
-  // The fallback uses manual decode which returns the raw bytes as chars
-  assert.ok(typeof result === "string");
+  // The fallback decodes each byte as Latin-1 rather than throwing
+  assert.equal(result, "à¯");
+  assert.equal(result.length, 3);
+  assert.deepEqual(
+    [...result].map((ch) => ch.charCodeAt(0)),
+    [0xe0, 0x80, 0xaf],
+  );
 });
 
 await test("mergeQuery null value deletes key", async () => {
@@ -1551,23 +1558,39 @@ await test("URLBuilder.withHost changes host", async () => {
 
 await test("diffURLs detects protocol difference", async () => {
   const diff = diffURLs("http://example.com/a", "https://example.com/a");
-  assert.deepEqual(diff.protocol, ["http:", "https:"], `Expected protocol diff but got: ${JSON.stringify(diff.protocol)}`);
+  assert.deepEqual(
+    diff.protocol,
+    ["http:", "https:"],
+    `Expected protocol diff but got: ${JSON.stringify(diff.protocol)}`,
+  );
 });
 
 await test("diffURLs detects hostname difference", async () => {
   const diff = diffURLs("https://a.com/x", "https://b.com/x");
-  assert.deepEqual(diff.hostname, ["a.com", "b.com"], `Expected hostname diff but got: ${JSON.stringify(diff.hostname)}`);
+  assert.deepEqual(
+    diff.hostname,
+    ["a.com", "b.com"],
+    `Expected hostname diff but got: ${JSON.stringify(diff.hostname)}`,
+  );
 });
 
 await test("diffURLs detects port difference", async () => {
   const diff = diffURLs("https://example.com:80/p", "https://example.com:443/p");
   // URL constructor normalizes default port 443 to "" for HTTPS
-  assert.deepEqual(diff.port, ["80", ""], `Expected port diff but got: ${JSON.stringify(diff.port)}`);
+  assert.deepEqual(
+    diff.port,
+    ["80", ""],
+    `Expected port diff but got: ${JSON.stringify(diff.port)}`,
+  );
 });
 
 await test("diffURLs detects hash difference", async () => {
   const diff = diffURLs("https://example.com/p#a", "https://example.com/p#b");
-  assert.deepEqual(diff.hash, ["#a", "#b"], `Expected hash diff but got: ${JSON.stringify(diff.hash)}`);
+  assert.deepEqual(
+    diff.hash,
+    ["#a", "#b"],
+    `Expected hash diff but got: ${JSON.stringify(diff.hash)}`,
+  );
 });
 
 await test("stripQuery handles invalid URL", async () => {

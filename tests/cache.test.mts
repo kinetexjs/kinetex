@@ -800,8 +800,8 @@ await test("eviction by maxEntries", async () => {
     { status: 200, statusText: "OK", headers: {}, body: "z" },
   );
   const s = cache.getStats();
-  assert.ok(s.totalEntries <= 2, `Entries: ${s.totalEntries}`);
-  assert.ok(s.evictions >= 1, `Evictions: ${s.evictions}`);
+  assert.equal(s.totalEntries, 2);
+  assert.equal(s.evictions, 1);
 });
 
 await test("LRU touch promotes accessed key", async () => {
@@ -844,7 +844,9 @@ await test("eviction by maxSizeBytes", async () => {
     { status: 200, statusText: "OK", headers: {}, body: "z" },
   );
   const s = cache.getStats();
-  assert.ok(s.evictions >= 1, `Evictions by size: ${s.evictions}`);
+  assert.equal(s.evictions, 2);
+  assert.equal(s.totalEntries, 1);
+  assert.equal(s.totalSizeBytes, 257);
 });
 
 await test("hitRate computed correctly", async () => {
@@ -858,7 +860,9 @@ await test("hitRate computed correctly", async () => {
   );
   await cache.get({ url: `${BASE}/hr1`, method: "GET", headers: {} });
   const s = cache.getStats();
-  assert.ok(s.hitRate > 0, `Hit rate should be > 0, got ${s.hitRate}`);
+  assert.equal(s.hits, 1);
+  assert.equal(s.misses, 1);
+  assert.equal(s.hitRate, 0.5);
 });
 
 // ============================================================================
@@ -869,18 +873,18 @@ suite("Factory Functions");
 
 await test("createMemoryCache creates HTTPCache", async () => {
   const c = createMemoryCache();
-  assert.ok(c instanceof HTTPCache, "should be HTTPCache instance");
+  assert.equal(c instanceof HTTPCache, true, "should be HTTPCache instance");
 });
 
 await test("createMemoryCache with config", async () => {
   const c = createMemoryCache({ maxEntries: 10 });
-  assert.ok(c instanceof HTTPCache, "should be HTTPCache instance");
+  assert.equal(c instanceof HTTPCache, true, "should be HTTPCache instance");
 });
 
 await test("createTwoTierCache works", async () => {
   const l2 = new MemoryStorageAdapter();
   const c = createTwoTierCache(l2);
-  assert.ok(c instanceof HTTPCache, "should be HTTPCache instance");
+  assert.equal(c instanceof HTTPCache, true, "should be HTTPCache instance");
 });
 
 await test("createLocalStorageCache throws in Node.js", async () => {
@@ -896,7 +900,7 @@ await test("createSessionStorageCache throws in Node.js", async () => {
 await test("createKVCache creates HTTPCache", async () => {
   const { createKVCache } = await import("../src/cache.ts");
   const cache = createKVCache({} as any);
-  assert.ok(cache instanceof HTTPCache, "should be HTTPCache instance");
+  assert.equal(cache instanceof HTTPCache, true, "should be HTTPCache instance");
 });
 
 // ============================================================================

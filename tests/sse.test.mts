@@ -177,9 +177,7 @@ await test("sendJSON produces correct event", async () => {
   s.sendJSON("evt", { x: 1 }, { id: "abc" });
   const r = s.stream.getReader();
   const { value } = await r.read();
-  assert.ok(value!.includes("event: evt"));
-  assert.ok(value!.includes('data: {"x":1}'));
-  assert.ok(value!.includes("id: abc"));
+  assert.equal(value, 'id: abc\nevent: evt\ndata: {"x":1}\n\n');
   s.close();
 });
 
@@ -188,7 +186,7 @@ await test("heartbeat sends comment", async () => {
   s.heartbeat();
   const r = s.stream.getReader();
   const { value } = await r.read();
-  assert.ok(value!.includes("heartbeat"));
+  assert.equal(value, ": heartbeat\n\n");
   s.close();
 });
 
@@ -197,7 +195,7 @@ await test("setReconnectDelay enqueues retry", async () => {
   s.setReconnectDelay(5000);
   const r = s.stream.getReader();
   const { value } = await r.read();
-  assert.ok(value!.includes("retry: 5000"));
+  assert.equal(value, "retry: 5000\n\n");
   s.close();
 });
 
@@ -220,7 +218,10 @@ await test("send after close is no-op", async () => {
   s.sendEvent("e", "d");
   s.heartbeat();
   s.setReconnectDelay(1000);
-  assert.ok(s.closed);
+  assert.equal(s.closed, true);
+  // Nothing may reach the stream after close()
+  const { done } = await s.stream.getReader().read();
+  assert.equal(done, true);
 });
 
 // ── SSETransformStream ──────────────────────────────────────────────────
@@ -229,9 +230,9 @@ suite("SSETransformStream");
 
 await test("constructs with parser and decoder", async () => {
   const ts = new SSETransformStream();
-  assert.ok(ts instanceof TransformStream);
-  assert.ok(ts.readable instanceof ReadableStream);
-  assert.ok(ts.writable instanceof WritableStream);
+  assert.equal(ts instanceof TransformStream, true);
+  assert.equal(ts.readable instanceof ReadableStream, true);
+  assert.equal(ts.writable instanceof WritableStream, true);
 });
 
 await test("accepts onParseError option", async () => {
@@ -241,7 +242,8 @@ await test("accepts onParseError option", async () => {
       called = true;
     },
   });
-  assert.ok(ts instanceof TransformStream);
+  assert.equal(ts instanceof TransformStream, true);
+  assert.equal(called, false, "onParseError must not fire before any input");
 });
 
 // ── SSEClient (real SSE server) ────────────────────────────────────────
@@ -410,7 +412,7 @@ await test("onJSON parse error silently ignored", async () => {
     called = true;
   });
   await r.dispatch({ event: "b", data: "bad", id: null, retry: null, raw: [] });
-  assert.ok(!called);
+  assert.equal(called, false);
 });
 
 await test("consume iterates all events", async () => {
@@ -430,14 +432,14 @@ await test("consume iterates all events", async () => {
 suite("SSEServerResponse basic");
 
 await test("closed initially false", async () => {
-  assert.ok(!new SSEServerResponse().closed);
+  assert.equal(new SSEServerResponse().closed, false);
 });
 
 await test("send and close", async () => {
   const s = new SSEServerResponse();
   s.send("t");
   s.close();
-  assert.ok(s.closed);
+  assert.equal(s.closed, true);
 });
 
 await test("toResponse returns correct content-type", async () => {
@@ -506,12 +508,13 @@ suite("Factory");
 
 await test("createSSEStream returns async iterable", async () => {
   const s = createSSEStream({ url: "http://localhost:5630", validateResponse: () => true });
-  assert.ok(Symbol.asyncIterator in s);
+  assert.equal(typeof s[Symbol.asyncIterator], "function");
+  assert.equal(s.url, "http://localhost:5630");
 });
 
 await test("createJSONSSEStream returns async iterable", async () => {
   const s = createJSONSSEStream({ url: "http://localhost:5630", validateResponse: () => true });
-  assert.ok(Symbol.asyncIterator in s);
+  assert.equal(typeof s[Symbol.asyncIterator], "function");
 });
 
 // ── Cleanup ─────────────────────────────────────────────────────────────

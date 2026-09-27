@@ -1066,6 +1066,31 @@ export interface CacheControlDirectives {
  * @param value - Raw `Cache-Control` header value
  * @returns Structured directives object with boolean flags and numeric values
  */
+/**
+ * Split a `Cache-Control` value on commas, ignoring commas inside a quoted
+ * string. RFC 7234 §5.2 allows quoted-string values that contain commas, e.g.
+ * `private="field1, field2"`, so a plain `split(",")` corrupts them.
+ *
+ * @param value - Raw `Cache-Control` header value
+ * @returns Each directive as its own (untrimmed) string
+ */
+function splitCacheControlDirectives(value: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (const ch of value) {
+    if (ch === '"') inQuotes = !inQuotes;
+    if (ch === "," && !inQuotes) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  parts.push(current);
+  return parts;
+}
+
 export function parseCacheControl(value: string): CacheControlDirectives {
   const d: CacheControlDirectives = {
     noCache: false,
@@ -1087,7 +1112,7 @@ export function parseCacheControl(value: string): CacheControlDirectives {
     unknown: new Map(),
   };
 
-  for (const part of value.split(",")) {
+  for (const part of splitCacheControlDirectives(value)) {
     const t = part.trim();
     const eq = t.indexOf("=");
     const k = (eq === -1 ? t : t.slice(0, eq)).trim().toLowerCase();
@@ -1636,17 +1661,64 @@ export function normalizeForwardedHeaders(headers: HttpHeaders): ForwardedValue 
   };
 }
 
+/** Options for {@link getClientIP}. */
+export interface GetClientIPOptions {
+  /**
+   * Number of trusted reverse proxies in front of this server.
+   *
+   * X-Forwarded-For is attacker-controlled: the left-most entry is added by the
+   * client and can be anything. `trustedHops` selects the entry that is
+   * `trustedHops` positions from the right, i.e. the first address written by a
+   * proxy you actually operate. 0 (the default) means "no proxy is trusted" and
+   * returns the left-most, spoofable value — the historical behaviour, kept as
+   * the default only for backwards compatibility.
+   *
+   * @default 0
+   */
+  trustedHops?: number;
+}
+
 /**
- * Extract the real client IP from Forwarded, X-Forwarded-For, or X-Real-IP
- * headers (in priority order).
+ * Extract the client IP from Forwarded, X-Forwarded-For, or X-Real-IP.
+ *
+ * ⚠️ SECURITY: the value is derived from client-supplied headers and must NOT be
+ * used for access control, rate limiting or audit trails unless `trustedHops` is
+ * set to the real number of proxies in front of the server. The returned string
+ * is also not validated as an IP address.
  *
  * @param headers - Source headers object
- * @returns First client IP found, or `null` if none present
+ * @param options - Trust configuration
+ * @returns The selected client IP, or `null` if none present
  */
-export function getClientIP(headers: HttpHeaders): string | null {
+export function getClientIP(headers: HttpHeaders, options: GetClientIPOptions = {}): string | null {
+  const trustedHops = Math.max(0, Math.trunc(options.trustedHops ?? 0));
   const fwd = normalizeForwardedHeaders(headers);
-  if (fwd.for.length > 0) return fwd.for[0]!;
-  return headers.get(HeaderName.XRealIP);
+  if (fwd.for.length > 0) {
+    const list = fwd.for;
+    // Right-most entry is the closest hop. trustedHops = 1 → the entry the
+    // nearest trusted proxy appended; index = length - trustedHops.
+    const index = trustedHops === 0 ? 0 : list.length - trustedHops;
+    const value = list[index] ?? list[0];
+    return stripIPPortAndBrackets(value!);
+  }
+  return stripIPPortAndBrackets(headers.get(HeaderName.XRealIP) ?? "") || null;
+}
+
+/**
+ * Normalize a Forwarded/XFF entry to a bare host: strip `for="…"` quoting,
+ * `[ipv6]:port`, and a bare `:port` suffix.
+ */
+function stripIPPortAndBrackets(value: string): string {
+  let v = value.trim();
+  if (v.startsWith('"') && v.endsWith('"') && v.length >= 2) v = v.slice(1, -1);
+  if (v.startsWith("[")) {
+    const end = v.indexOf("]");
+    if (end !== -1) return v.slice(1, end);
+  }
+  // Only strip a trailing :digits (never the colons inside an IPv6 literal).
+  const m = /^(.*):\d+$/.exec(v);
+  if (m && (m[1] ?? "").includes(".")) return m[1]!;
+  return v;
 }
 
 // ============================================================================

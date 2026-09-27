@@ -125,8 +125,8 @@ suite("Fluent chain API");
 
 await test(".GET().json<T>() parses and types response body", async () => {
   const data = await bin.GET("/get").json<{ url: string; origin: string }>();
-  assert.ok(data.url.includes("/get"));
-  assert.ok(typeof data.origin === "string");
+  assert.match(data.url, /^https:\/\/httpbin\.org\/get$/);
+  assert.equal(typeof data.origin, "string");
 });
 
 await test(".GET().text() returns raw string body", async () => {
@@ -139,11 +139,11 @@ await test(".GET().text() returns raw string body", async () => {
 await test(".GET().bytes() returns Uint8Array", async () => {
   const bytes = await bin.GET("/get").bytes();
   assert.ok(bytes instanceof Uint8Array);
-  assert.ok(bytes.length > 0);
   // Decode and verify it's valid JSON
   const text = new TextDecoder().decode(bytes);
   const parsed = JSON.parse(text);
-  assert.ok(typeof parsed.origin === "string");
+  assert.equal(typeof parsed.origin, "string");
+  assert.match(parsed.url, /^https:\/\/httpbin\.org\/get$/);
 });
 
 await test(".GET().send<T>() returns full KinetexResponse", async () => {
@@ -551,10 +551,12 @@ await test("Fluent .timeout() overrides client config timeout", async () => {
   } catch (err) {
     caught = err;
   }
-  assert.ok(
+  assert.equal(
     caught instanceof TimeoutError,
+    true,
     `Expected TimeoutError got ${(caught as Error)?.constructor?.name}`,
   );
+  assert.equal((caught as KinetexError).code, "ETIMEOUT");
 });
 
 // ============================================================================
@@ -620,9 +622,11 @@ suite("Response properties");
 
 await test("durationMs is positive and plausible", async () => {
   const r = await bin.get("/get");
-  assert.ok(typeof r.durationMs === "number");
+  assert.equal(typeof r.durationMs, "number");
   assert.ok(r.durationMs > 0, "durationMs should be > 0");
   assert.ok(r.durationMs < 30_000, "durationMs should be < 30s");
+  assert.equal(r.status, 200);
+  assert.equal(r.request.method, "GET");
 });
 
 await test("r.request reflects what was sent", async () => {
@@ -670,15 +674,19 @@ await test("Response interceptor fires and receives real response", async () => 
 await test("Error interceptor fires on 4xx when throwOnError:true", async () => {
   const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: T, throwOnError: true });
   let interceptedCode = "";
+  let interceptedStatus = 0;
   client.useError((ctx) => {
-    interceptedCode = (ctx.error as KinetexError)?.code ?? "";
+    const err = ctx.error as HTTPStatusError;
+    interceptedCode = err?.code ?? "";
+    interceptedStatus = err?.response?.status ?? 0;
   });
   try {
     await client.get("/status/404");
   } catch {
     /* expected */
   }
-  assert.ok(interceptedCode.length > 0, "Error interceptor should have fired");
+  assert.equal(interceptedCode, "EHTTPSTATUS");
+  assert.equal(interceptedStatus, 404);
 });
 
 await test("Eject() removes interceptor — subsequent requests unmodified", async () => {
@@ -691,7 +699,12 @@ await test("Eject() removes interceptor — subsequent requests unmodified", asy
   });
   eject();
   const data = await client.GET("/headers").json<{ headers: Record<string, string> }>();
-  assert.ok(!data.headers["X-Should-Disappear"], "Ejected interceptor should not fire");
+  assert.equal(
+    Object.keys(data.headers).find((k) => k.toLowerCase() === "x-should-disappear"),
+    undefined,
+    "Ejected interceptor should not fire",
+  );
+  assert.equal(data.headers["Host"], "httpbin.org");
 });
 
 await test("Multiple interceptors chain in order", async () => {
@@ -760,7 +773,12 @@ await test("extend() child can override timeout from parent", async () => {
   assert.ok(caught !== undefined, "Child should have timed out");
   assert.ok(elapsed < 5_000, `Elapsed ${elapsed}ms — child timeout should fire within 5s`);
   const isTimeout = caught instanceof TimeoutError || (caught as KinetexError)?.code === "ETIMEOUT";
-  assert.ok(isTimeout, `Expected TimeoutError, got ${(caught as Error)?.constructor?.name}`);
+  assert.equal(
+    isTimeout,
+    true,
+    `Expected TimeoutError, got ${(caught as Error)?.constructor?.name}`,
+  );
+  assert.equal((caught as KinetexError).code, "ETIMEOUT");
 });
 
 // ============================================================================
@@ -777,9 +795,15 @@ await test("SizeLimitError thrown when response exceeds maxResponseSize", async 
   } catch (e) {
     caught = e;
   }
-  assert.ok(
+  assert.equal(
     caught instanceof SizeLimitError,
+    true,
     `Expected SizeLimitError, got ${(caught as Error)?.constructor?.name}`,
+  );
+  assert.equal((caught as SizeLimitError).limit, 100);
+  assert.ok(
+    (caught as SizeLimitError).bytesRead > 100,
+    `bytesRead must exceed the limit, got ${(caught as SizeLimitError).bytesRead}`,
   );
 });
 
@@ -984,27 +1008,31 @@ await test("SSEClient parses events from a streaming endpoint", async () => {
   // httpbin /sse sends SSE events (if available), otherwise skip gracefully
   const { SSEClient } = await import("../src/sse.ts");
 
-  // Test SSEClient with a real SSE-compatible URL
-  // We'll use our own local SSE server if external isn't available
-  // For the real-world test, verify SSEClient is instantiatable and connects
+  // Stub the transport so the parse path is exercised deterministically.
+  const body = "data: first\n\nevent: ping\ndata: second\nid: 42\n\n";
   const client = new SSEClient({
-    url: "https://httpbin.org/get", // Not SSE but tests connection
+    url: "https://sse.example.com/events",
     reconnect: false,
+    fetch: (async () =>
+      new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      })) as unknown as typeof globalThis.fetch,
   });
 
-  // Verify the client can connect and get a response (even if not SSE format)
-  let connectionAttempted = false;
-  try {
-    for await (const _event of client) {
-      connectionAttempted = true;
-      break; // just need one iteration
-    }
-  } catch (_e) {
-    connectionAttempted = true; // connection made, not SSE format = expected
+  const events: { id: string | null; event: string; data: string }[] = [];
+  for await (const ev of client) {
+    events.push({ id: ev.id, event: ev.event, data: ev.data });
+    if (events.length === 2) break;
   }
+  client.close();
 
-  assert.ok(connectionAttempted || true, "SSEClient should attempt connection");
-  // Real SSE test is in tests/runtimes/cloudflare-worker.ts
+  assert.deepEqual(events, [
+    { id: null, event: "message", data: "first" },
+    { id: "42", event: "ping", data: "second" },
+  ]);
+  assert.equal(client.closed, true);
+  assert.equal(client.streamHealth.totalEvents, 2);
 });
 
 // ============================================================================
@@ -1154,22 +1182,19 @@ await test("percentDecode decodes percent-encoded strings", async () => {
 
 await test("encodePathComponent encodes slashes and spaces", async () => {
   const encoded = encodePathComponent("hello world/path");
-  assert.ok(!encoded.includes(" "));
-  assert.ok(!encoded.includes("/"));
+  assert.equal(encoded, "hello%20world%2Fpath");
+  assert.equal(encodePathComponent("plain-123"), "plain-123");
 });
 
 await test("encodeQueryValue encodes query special chars", async () => {
   const encoded = encodeQueryValue("hello world&a=b");
-  assert.ok(!encoded.includes(" "));
-  assert.ok(!encoded.includes("&"));
-  assert.ok(!encoded.includes("="));
+  assert.equal(encoded, "hello%20world%26a%3Db");
+  assert.equal(decodeURIComponent(encoded), "hello world&a=b");
 });
 
 await test("stringifyQuery builds query string correctly", async () => {
   const qs = stringifyQuery({ a: "1", b: "hello world", c: "3" });
-  assert.ok(qs.includes("a=1"));
-  assert.ok(qs.includes("c=3"));
-  assert.ok(!qs.includes(" "), "Spaces must be encoded");
+  assert.equal(qs, "a=1&b=hello%20world&c=3");
 });
 
 await test("stringifyQuery handles array values as repeated keys", async () => {
@@ -1180,8 +1205,7 @@ await test("stringifyQuery handles array values as repeated keys", async () => {
 
 await test("stringifyQuery skips null and undefined values", async () => {
   const qs = stringifyQuery({ a: "1", b: null, c: undefined, d: "4" });
-  assert.ok(qs.includes("a=1") && qs.includes("d=4"));
-  assert.ok(!qs.includes("b=") && !qs.includes("c="));
+  assert.equal(qs, "a=1&d=4");
 });
 
 await test("parseQuery parses query strings into a record", async () => {
@@ -1243,9 +1267,11 @@ await test("fillPathParams substitutes :param style only (not {param})", async (
 });
 
 await test("normalizeURL removes fragment and sorts params", async () => {
-  const url = normalizeURL("http://example.com/path?b=2&a=1");
-  assert.ok(url.includes("example.com"));
-  assert.ok(url.includes("/path"));
+  assert.equal(normalizeURL("http://example.com/path?b=2&a=1"), "http://example.com/path?b=2&a=1");
+  assert.equal(
+    normalizeURL("http://example.com/p?b=2&a=1#frag", { removeFragment: true, sortParams: true }),
+    "http://example.com/p?a=1&b=2",
+  );
 });
 
 await test("URLBuilder builds URLs with setParam and appendParam", async () => {
@@ -1253,29 +1279,23 @@ await test("URLBuilder builds URLs with setParam and appendParam", async () => {
     .setParam("page", "1")
     .setParam("limit", "10")
     .toString();
-  assert.ok(url.startsWith("https://api.example.com"), `URL: ${url}`);
-  assert.ok(url.includes("/users"), `URL: ${url}`);
-  assert.ok(url.includes("page=1"), `URL: ${url}`);
-  assert.ok(url.includes("limit=10"), `URL: ${url}`);
+  assert.equal(url, "https://api.example.com/users?page=1&limit=10");
 });
 
 await test("URLBuilder.http builds http URL", async () => {
   const url = URLBuilder.http("example.com", "/api").toString();
-  assert.ok(url.startsWith("http://example.com/api"), `URL: ${url}`);
+  assert.equal(url, "http://example.com/api");
 });
 
 await test("URLBuilder.from() parses existing URL preserving params", async () => {
   const u = URLBuilder.from("https://example.com/path?a=1&b=2");
-  assert.ok(u.toString().includes("example.com"));
-  assert.ok(u.toString().includes("a=1"));
+  assert.equal(u.toString(), "https://example.com/path?a=1&b=2");
 });
 
 await test("URLBuilder.query() merges params — null deletes key", async () => {
   const u = URLBuilder.from("https://example.com?a=1&b=2").query({ a: null, c: "3" });
   const str = u.toString();
-  assert.ok(!str.includes("a=1"), `a should be deleted: ${str}`);
-  assert.ok(str.includes("b=2"), `b should remain: ${str}`);
-  assert.ok(str.includes("c=3"), `c should be added: ${str}`);
+  assert.equal(str, "https://example.com/?b=2&c=3");
 });
 
 await test("URLBuilder.appendParam() allows duplicate keys", async () => {
@@ -1289,8 +1309,7 @@ await test("URLBuilder.appendParam() allows duplicate keys", async () => {
 
 await test("URLBuilder.withPathname() replaces path", async () => {
   const u = URLBuilder.from("https://example.com/old/path").withPathname("/new").toString();
-  assert.ok(u.includes("/new"), `URL: ${u}`);
-  assert.ok(!u.includes("/old"), `URL: ${u}`);
+  assert.equal(u, "https://example.com/new");
 });
 
 await test("expandTemplate fills URI template {var} placeholders", async () => {
@@ -1301,8 +1320,9 @@ await test("expandTemplate fills URI template {var} placeholders", async () => {
 
 await test("expandTemplate handles query expansion {?var}", async () => {
   const filled = expandTemplate("/search{?q,lang}", { q: "hello", lang: "en" });
-  assert.ok(filled.includes("?"), `Expected query: ${filled}`);
-  assert.ok(filled.includes("q=hello"), `URL: ${filled}`);
+  assert.equal(filled, "/search?q=hello&lang=en");
+  assert.equal(expandTemplate("/users{/id}{/list}", { id: 7 }), "/users/7");
+  assert.equal(expandTemplate("/users{/id}{/list}", {}), "/users");
 });
 
 await test("compilePattern matches and extracts :params from URL", async () => {
@@ -1328,8 +1348,11 @@ await test("isSameOrigin compares full origins (scheme+host+port)", async () => 
 
 await test("resolveURL resolves relative URL against base", async () => {
   const resolved = resolveURL("users/1", "https://example.com/api/v1/");
-  assert.ok(resolved.includes("example.com"), `Resolved: ${resolved}`);
-  assert.ok(!resolved.includes(".."), `Should resolve ..: ${resolved}`);
+  assert.equal(resolved, "https://example.com/api/v1/users/1");
+  assert.equal(
+    resolveURL("/v1/users", "https://api.example.com"),
+    "https://api.example.com/v1/users",
+  );
 });
 
 await test("isAbsolute / isRelative detect URL type", async () => {
@@ -1362,11 +1385,16 @@ await test("diffURLs identifies which URL parts changed", async () => {
     "https://api.example.com/v1/users?page=1",
     "https://api.example.com/v2/users?page=2",
   );
-  assert.ok(
-    typeof diff === "object" && diff !== null,
-    `diff should be object: ${JSON.stringify(diff)}`,
+  assert.deepEqual(diff, {
+    addedParams: {},
+    removedParams: {},
+    changedParams: { page: ["1", "2"] },
+    pathname: ["/v1/users", "/v2/users"],
+  });
+  assert.deepEqual(
+    diffURLs("https://api.example.com/v1/users?page=1", "https://api.example.com/v1/users?page=1"),
+    { addedParams: {}, removedParams: {}, changedParams: {} },
   );
-  // At minimum the diff object exists — structure varies by implementation
 });
 
 // ============================================================================
@@ -1435,7 +1463,8 @@ await test("HttpHeaders.append collects multiple values", async () => {
   h.append("accept", "text/html");
   h.append("accept", "application/json");
   const values = h.getAll("accept");
-  assert.ok(Array.isArray(values) && values.length === 2);
+  assert.deepEqual(values, ["text/html", "application/json"]);
+  assert.equal(h.get("accept"), "text/html, application/json");
 });
 
 await test("parseContentType returns mediaType, type, subtype, charset", async () => {
@@ -1454,8 +1483,8 @@ await test("parseContentType returns mediaType, type, subtype, charset", async (
 await test("formatContentType builds content-type string", async () => {
   // params in formatContentType must be a plain object (keys/values)
   const fmt = formatContentType({ mediaType: "application/json", charset: "utf-8" });
-  assert.ok(fmt.includes("application/json"), `Formatted: ${fmt}`);
-  assert.ok(fmt.includes("charset=utf-8"), `Formatted: ${fmt}`);
+  assert.equal(fmt, "application/json; charset=utf-8");
+  assert.equal(formatContentType({ mediaType: "application/json" }), "application/json");
 });
 
 await test("parseContentDisposition parses attachment with filename", async () => {
@@ -1466,8 +1495,8 @@ await test("parseContentDisposition parses attachment with filename", async () =
 
 await test("formatContentDisposition builds content-disposition string", async () => {
   const fmt = formatContentDisposition({ type: "attachment", filename: "test.txt" });
-  assert.ok(fmt.includes("attachment"), `Formatted: ${fmt}`);
-  assert.ok(fmt.includes("test.txt"), `Formatted: ${fmt}`);
+  assert.equal(fmt, 'attachment; filename="test.txt"');
+  assert.equal(formatContentDisposition({ type: "inline" }), "inline");
 });
 
 await test("parseCacheControl parses all common directives", async () => {
@@ -1488,9 +1517,9 @@ await test("parseCacheControl parses all common directives", async () => {
 
 await test("formatCacheControl builds cache-control string", async () => {
   const str = formatCacheControl({ maxAge: 3600, mustRevalidate: true, public: true });
-  assert.ok(str.includes("max-age=3600"), `Formatted: ${str}`);
-  assert.ok(str.includes("must-revalidate"), `Formatted: ${str}`);
-  assert.ok(str.includes("public"), `Formatted: ${str}`);
+  assert.equal(str, "public, must-revalidate, max-age=3600");
+  assert.equal(formatCacheControl({ maxAge: 3600, noCache: true }), "no-cache, max-age=3600");
+  assert.equal(formatCacheControl({ sMaxAge: 60, public: true }), "public, s-maxage=60");
 });
 
 await test("parseAuthorization — scheme is lowercased in return value", async () => {
@@ -1520,15 +1549,26 @@ await test("formatBasic creates correct base64 Basic header value", async () => 
 
 await test("parseAccept returns quality-sorted accept types", async () => {
   const values = parseAccept("text/html,application/json;q=0.9,*/*;q=0.8");
-  assert.ok(Array.isArray(values) && values.length >= 2);
-  const types = values.map((v) => v.value);
-  assert.ok(types.includes("text/html") && types.includes("application/json"));
+  assert.deepEqual(
+    values.map((v) => [v.value, v.quality]),
+    [
+      ["text/html", 1],
+      ["application/json", 0.9],
+      ["*/*", 0.8],
+    ],
+  );
 });
 
 await test("parseAcceptEncoding returns array of encodings", async () => {
   const values = parseAcceptEncoding("gzip, deflate;q=0.9, br;q=0.8");
-  assert.ok(values.some((v) => v.value === "gzip"));
-  assert.ok(values.some((v) => v.value === "deflate"));
+  assert.deepEqual(
+    values.map((v) => [v.value, v.quality]),
+    [
+      ["gzip", 1],
+      ["deflate", 0.9],
+      ["br", 0.8],
+    ],
+  );
 });
 
 await test("negotiateContentType selects from available types", async () => {
@@ -1536,18 +1576,21 @@ await test("negotiateContentType selects from available types", async () => {
     "application/json",
     "text/plain",
   ]);
-  assert.ok(selected !== null);
-  assert.ok(selected === "application/json" || selected === "text/plain");
+  assert.equal(selected, "application/json");
+  assert.equal(negotiateContentType("text/html", ["application/json"]), null);
 });
 
 await test("parseLinkHeader returns array with uri and rel", async () => {
   const links = parseLinkHeader(
     '<https://api.example.com/page/2>; rel="next", <https://api.example.com/page/10>; rel="last"',
   );
-  assert.ok(Array.isArray(links) && links.length >= 1);
-  const next = links.find((l) => l.rel === "next");
-  assert.ok(next !== undefined);
-  assert.ok(next!.uri.includes("page/2"));
+  assert.deepEqual(
+    links.map((l) => [l.uri, l.rel]),
+    [
+      ["https://api.example.com/page/2", "next"],
+      ["https://api.example.com/page/10", "last"],
+    ],
+  );
 });
 
 await test("formatLinkHeader builds Link header string (source bug fixed)", async () => {
@@ -1556,8 +1599,10 @@ await test("formatLinkHeader builds Link header string (source bug fixed)", asyn
     { uri: "https://api.example.com/page/2", rel: "next", params: {} },
     { uri: "https://api.example.com/page/1", rel: "prev", params: {} },
   ]);
-  assert.ok(header.includes('rel="next"') || header.includes("page/2"), `Header: ${header}`);
-  assert.ok(header.includes("page/2"), `Header: ${header}`);
+  assert.equal(
+    header,
+    '<https://api.example.com/page/2>; rel="next", <https://api.example.com/page/1>; rel="prev"',
+  );
 });
 
 await test("parseRange parses Range header bytes ranges", async () => {
@@ -1806,40 +1851,52 @@ await test("CookieJar stores and retrieves cookies by domain+path", async () => 
   const jar = createCookieJar();
   jar.setCookie("session=abc; Path=/; Domain=example.com", { url: "https://example.com" });
   const cookies = jar.getCookies({ url: "https://example.com/api" });
-  assert.ok(cookies.some((c) => c.name === "session" && c.value === "abc"));
+  assert.equal(cookies.length, 1);
+  assert.deepEqual(
+    {
+      name: cookies[0].name,
+      value: cookies[0].value,
+      domain: cookies[0].domain,
+      path: cookies[0].path,
+    },
+    { name: "session", value: "abc", domain: "example.com", path: "/" },
+  );
 });
 
 await test("CookieJar enforces domain isolation", async () => {
   const jar = createCookieJar();
   jar.setCookie("secret=value; Path=/; Domain=example.com", { url: "https://example.com" });
   const otherCookies = jar.getCookies({ url: "https://other.com/api" });
-  assert.ok(!otherCookies.some((c) => c.name === "secret"));
+  assert.deepEqual(otherCookies, []);
 });
 
 await test("CookieJar enforces path scoping", async () => {
   const jar = createCookieJar();
   jar.setCookie("admin=yes; Path=/admin; Domain=example.com", { url: "https://example.com" });
-  assert.ok(
-    jar.getCookies({ url: "https://example.com/admin/users" }).some((c) => c.name === "admin"),
+  assert.deepEqual(
+    jar.getCookies({ url: "https://example.com/admin/users" }).map((c) => c.name),
+    ["admin"],
   );
-  assert.ok(!jar.getCookies({ url: "https://example.com/public" }).some((c) => c.name === "admin"));
+  assert.deepEqual(jar.getCookies({ url: "https://example.com/public" }), []);
 });
 
 await test("CookieJar enforces Secure flag (HTTPS only)", async () => {
   const jar = createCookieJar();
   jar.setCookie("secure_val=yes; Secure; Path=/", { url: "https://example.com" });
-  assert.ok(jar.getCookies({ url: "https://example.com/" }).some((c) => c.name === "secure_val"));
-  assert.ok(!jar.getCookies({ url: "http://example.com/" }).some((c) => c.name === "secure_val"));
+  assert.deepEqual(
+    jar.getCookies({ url: "https://example.com/" }).map((c) => [c.name, c.secure]),
+    [["secure_val", true]],
+  );
+  assert.deepEqual(jar.getCookies({ url: "http://example.com/" }), []);
 });
 
 await test("loadCookieJar restores serialized state", async () => {
   const jar = createCookieJar();
   jar.setCookie("token=xyz; Path=/; Domain=example.com", { url: "https://example.com" });
   const restored = loadCookieJar(jar.toJSON());
-  assert.ok(
-    restored
-      .getCookies({ url: "https://example.com/" })
-      .some((c) => c.name === "token" && c.value === "xyz"),
+  assert.deepEqual(
+    restored.getCookies({ url: "https://example.com/" }).map((c) => [c.name, c.value]),
+    [["token", "xyz"]],
   );
 });
 
@@ -1847,7 +1904,7 @@ await test("CookieJar.deleteCookie removes cookie", async () => {
   const jar = createCookieJar();
   jar.setCookie("remove_me=value; Path=/; Domain=example.com", { url: "https://example.com" });
   jar.removeCookie("example.com", "/", "remove_me"); // positional: (domain, path, name)
-  assert.ok(!jar.getCookies({ url: "https://example.com/" }).some((c) => c.name === "remove_me"));
+  assert.deepEqual(jar.getCookies({ url: "https://example.com/" }), []);
 });
 
 // ============================================================================
@@ -1935,22 +1992,17 @@ await test("formatBytes formats sizes with correct units", async () => {
 });
 
 await test("formatRate returns string with B, KB, or MB suffix", async () => {
-  const r1 = formatRate(1024);
-  assert.ok(r1.includes("KB") || r1.includes("B"), `Rate: ${r1}`);
-  const r2 = formatRate(1024 * 1024);
-  assert.ok(r2.includes("MB") || r2.includes("KB"), `Rate: ${r2}`);
+  assert.equal(formatRate(500), "500 B/s");
+  assert.equal(formatRate(1024), "1 KB/s");
+  assert.equal(formatRate(1024 * 1024), "1 MB/s");
 });
 
 await test("formatETA returns human-readable time string", async () => {
-  const etaZero = formatETA(0);
-  assert.ok(typeof etaZero === "string");
-  const etaSecs = formatETA(5000);
-  assert.ok(
-    etaSecs.includes("s") || etaSecs.includes("sec") || etaSecs.includes("0"),
-    `ETA: ${etaSecs}`,
-  );
-  const etaMins = formatETA(120_000);
-  assert.ok(etaMins.includes("m") || etaMins.includes("2"), `ETA: ${etaMins}`);
+  assert.equal(formatETA(0), "0s");
+  assert.equal(formatETA(5000), "5s");
+  assert.equal(formatETA(120_000), "2m 0s");
+  assert.equal(formatETA(-1), "∞");
+  assert.equal(formatETA(Number.NaN), "∞");
 });
 
 await test("formatProgress formats ProgressSnapshot to string", async () => {
@@ -1965,7 +2017,7 @@ await test("formatProgress formats ProgressSnapshot to string", async () => {
     bytesLoaded: 500_000,
   };
   const str = formatProgress(snap);
-  assert.ok(typeof str === "string" && str.length > 0);
+  assert.equal(str, "488.28 KB / 976.56 KB (50.0%) @ 97.66 KB/s ETA 5s");
 });
 
 await test("ProgressTracker tracks loaded bytes, total, percent", async () => {
@@ -2104,7 +2156,7 @@ await test("detectRuntime returns a known runtime string", async () => {
     "workerd",
     "unknown",
   ];
-  assert.ok(valid.includes(runtime), `Invalid runtime: ${runtime}`);
+  assert.equal(valid.includes(runtime), true, `Invalid runtime: ${runtime}`);
 });
 
 await test("RUNTIME constant equals detectRuntime()", async () => {
@@ -2228,9 +2280,10 @@ import {
 } from "../src/logging.ts";
 
 await test("LogLevel has ascending numeric values DEBUG < INFO < WARN < ERROR", async () => {
-  assert.ok(LogLevel.DEBUG < LogLevel.INFO);
-  assert.ok(LogLevel.INFO < LogLevel.WARN);
-  assert.ok(LogLevel.WARN < LogLevel.ERROR);
+  assert.deepEqual(
+    [LogLevel.TRACE, LogLevel.DEBUG, LogLevel.INFO, LogLevel.WARN, LogLevel.ERROR, LogLevel.SILENT],
+    [0, 1, 2, 3, 4, 5],
+  );
 });
 
 await test("JSONTransport writes valid JSON line per log entry", async () => {
@@ -2245,17 +2298,40 @@ await test("JSONTransport writes valid JSON line per log entry", async () => {
 });
 
 await test("ConsoleTransport creates successfully and accepts LogEntry writes", async () => {
-  // ConsoleTransport writes directly to console.log — cannot intercept in tests
-  // Verify: (1) creates without error, (2) write() does not throw
-  const transport = new ConsoleTransport({ pretty: false, useColors: false });
-  assert.ok(typeof transport.write === "function");
+  // Capture a real LogEntry so the transport is fed a well-formed value
+  const entries: unknown[] = [];
+  new HTTPLogger({
+    transports: [{ write: (e: unknown) => entries.push(e) }],
+    level: "DEBUG",
+  }).logRequest("req-console", "GET", "https://example.com", {}, null, 1000);
+
+  // ConsoleTransport takes an onWrite callback — capture instead of hitting stdout
+  const raw: string[] = [];
+  const transport = new ConsoleTransport({ pretty: false, onWrite: (l) => raw.push(l) });
+  transport.write(entries[0] as never);
+  assert.equal(raw.length, 1);
+  assert.equal(JSON.parse(raw[0]).type, "request");
+  assert.equal(JSON.parse(raw[0]).requestId, "req-console");
+
+  const pretty: string[] = [];
+  new ConsoleTransport({ pretty: true, onWrite: (l) => pretty.push(l) }).write(entries[0] as never);
+  assert.equal(pretty.length, 1);
+  // The pretty formatter truncates the request id to its last 8 characters
+  assert.match(
+    pretty[0],
+    /^\[\d{2}:\d{2}:\d{2}\.\d{3}\] INFO\s+← GET https:\/\/example\.com\/ \[-console\]$/,
+  );
+
   // Use JSONTransport (interceptable) for output verification
   const lines: string[] = [];
   const json = new JSONTransport((line) => lines.push(line));
   const logger = new HTTPLogger({ transports: [json], level: "DEBUG" });
   logger.logRequest("req-1", "GET", "https://example.com", {}, null, Date.now());
   logger.logResponse("req-1", 200, "OK", {}, null, Date.now(), false);
-  assert.ok(lines.length >= 2, `Expected 2+ lines, got ${lines.length}`);
+  assert.equal(lines.length, 2);
+  assert.equal(JSON.parse(lines[0]).type, "request");
+  assert.equal(JSON.parse(lines[1]).type, "response");
+  assert.equal(JSON.parse(lines[1]).status, 200);
 });
 
 await test("MultiTransport distributes to all inner transports equally", async () => {
@@ -2267,7 +2343,9 @@ await test("MultiTransport distributes to all inner transports equally", async (
   ]);
   const logger = new HTTPLogger({ transports: [multi], level: "DEBUG" });
   logger.logRequest("r1", "POST", "https://api.example.com", {}, null, Date.now());
-  assert.ok(l1.length >= 1 && l2.length >= 1 && l1.length === l2.length);
+  assert.equal(l1.length, 1);
+  assert.equal(l2.length, 1);
+  assert.deepEqual(JSON.parse(l1[0]), JSON.parse(l2[0]));
 });
 
 await test("BatchingTransport flushes on explicit flush() call", async () => {
@@ -2280,8 +2358,13 @@ await test("BatchingTransport flushes on explicit flush() call", async () => {
   const logger = new HTTPLogger({ transports: [transport], level: "DEBUG" });
   logger.logRequest("r1", "GET", "https://a.com", {}, null, Date.now());
   logger.logRequest("r2", "GET", "https://b.com", {}, null, Date.now());
+  assert.equal(
+    written.length,
+    0,
+    "Batched entries must not reach the inner transport before flush()",
+  );
   await transport.flush();
-  assert.ok(written.length >= 2, `Expected 2 entries after flush, got ${written.length}`);
+  assert.equal(written.length, 2);
 });
 
 await test("HTTPLogger filters entries below configured level", async () => {
@@ -2302,7 +2385,17 @@ await test("HTTPLogger.logError always logs at ERROR level", async () => {
     level: "ERROR",
   });
   logger.logError("req-1", new Error("Network failure"), Date.now());
-  assert.ok(entries.length >= 1);
+  assert.equal(entries.length, 1);
+  const entry = entries[0] as {
+    type: string;
+    level: string;
+    requestId: string;
+    error: Error;
+  };
+  assert.equal(entry.type, "error");
+  assert.equal(entry.level, "ERROR");
+  assert.equal(entry.requestId, "req-1");
+  assert.equal(entry.error.message, "Network failure");
 });
 
 await test("Redactor.redactHeaders masks configured header names", async () => {
@@ -2320,9 +2413,7 @@ await test("Redactor.redactHeaders masks configured header names", async () => {
 await test("Redactor.redactURL masks configured query params", async () => {
   const r = new Redactor({ queryParams: ["token", "api_key"] });
   const redacted = r.redactURL("https://api.example.com/data?token=secret&api_key=abc&page=1");
-  assert.ok(!redacted.includes("secret"), `Token not masked: ${redacted}`);
-  assert.ok(!redacted.includes("abc"), `api_key not masked: ${redacted}`);
-  assert.ok(redacted.includes("page=1"), `Non-sensitive param removed: ${redacted}`);
+  assert.equal(redacted, "https://api.example.com/data?token=***&api_key=***&page=1");
 });
 
 await test("Redactor.redactBody masks sensitive body fields", async () => {
@@ -2357,11 +2448,11 @@ await test("toOTelSpan returns an object with expected OTEL fields", async () =>
     timestamp: Date.now(),
   };
   const span = toOTelSpan(entry);
-  assert.ok(typeof span === "object" && span !== null);
-  // Should have some standard OTel field
-  assert.ok(
-    "name" in span || "attributes" in span || "spanId" in span || Object.keys(span).length > 0,
-  );
+  assert.deepEqual(span, {
+    "http.request.id": "req-1",
+    "http.request.method": "GET",
+    "url.full": "https://example.com/api",
+  });
 });
 
 await test("createLogger returns HTTPLogger with logRequest/logResponse/logError", async () => {
@@ -2458,9 +2549,12 @@ await test("Accept-Encoding: gzip, deflate, br is injected on every request", as
   const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: T });
   const r = await client.get<{ headers: Record<string, string> }>("/headers");
   const ae = r.data.headers["Accept-Encoding"] ?? r.data.headers["accept-encoding"] ?? "";
-  assert.ok(
-    ae.includes("gzip") && (ae.includes("br") || ae.includes("deflate")),
-    `Accept-Encoding must include gzip+br/deflate. Got: "${ae}"`,
+  assert.equal(r.status, 200);
+  assert.equal(ae.includes("gzip"), true, `Accept-Encoding must include gzip. Got: "${ae}"`);
+  assert.equal(
+    ae.includes("br") || ae.includes("deflate"),
+    true,
+    `Accept-Encoding must include br or deflate. Got: "${ae}"`,
   );
 });
 
@@ -2470,10 +2564,7 @@ await test("caller-supplied Accept-Encoding is not overridden", async () => {
     headers: { "accept-encoding": "identity" },
   });
   const ae = r.data.headers["Accept-Encoding"] ?? r.data.headers["accept-encoding"] ?? "";
-  assert.ok(
-    ae.includes("identity"),
-    `Caller's Accept-Encoding: identity must be preserved, got: "${ae}"`,
-  );
+  assert.equal(ae, "identity", `Caller's Accept-Encoding must be preserved verbatim`);
 });
 
 // ============================================================================
@@ -2530,9 +2621,13 @@ await test("Download progress percent is 0–100 when Content-Length is known", 
   });
 
   assert.ok(percents.length > 0, "Must have progress events");
+  assert.equal(
+    percents.filter((p) => p === null).length,
+    0,
+    "percent must be known when Content-Length is sent",
+  );
   const last = percents[percents.length - 1];
-  assert.ok(last !== null, "percent must not be null when Content-Length is known");
-  assert.ok(last! >= 90 && last! <= 100, `Final percent must be near 100, got ${last}`);
+  assert.equal(last, 100, `Final percent must be exactly 100, got ${last}`);
 });
 
 await test("Upload progress: loaded equals body byte length on completion", async () => {
@@ -2562,7 +2657,7 @@ await test("Upload progress: Uint8Array body is tracked correctly", async () => 
   });
 
   const last = events[events.length - 1];
-  assert.ok(last.loaded >= 2048, `Uint8Array upload loaded must be ≥ 2048, got ${last.loaded}`);
+  assert.equal(last.loaded, 2048);
 });
 
 await test("Fluent .onDownloadProgress() fires identically to options-style", async () => {
@@ -2583,10 +2678,8 @@ await test("Fluent .onDownloadProgress() fires identically to options-style", as
   // Both should reach the same total
   const optTotal = optEvents[optEvents.length - 1].loaded;
   const fluentTotal = fluentEvents[fluentEvents.length - 1].loaded;
-  assert.ok(
-    Math.abs(optTotal - fluentTotal) <= 64,
-    `Options and fluent final loaded should match (±64): ${optTotal} vs ${fluentTotal}`,
-  );
+  assert.equal(optTotal, 2048);
+  assert.equal(fluentTotal, 2048);
 });
 
 // ============================================================================
@@ -2663,12 +2756,8 @@ await test("Three-level inheritance: gp → p → c all fire in order", async ()
 
   await c.get("/get");
 
-  assert.ok(order.includes("gp"), "Grandparent interceptor must fire");
-  assert.ok(order.includes("p"), "Parent interceptor must fire");
-  assert.ok(order.includes("c"), "Child interceptor must fire");
   // gp fires before p, p fires before c (registration order preserved)
-  assert.ok(order.indexOf("gp") < order.indexOf("p"), "gp must fire before p");
-  assert.ok(order.indexOf("p") < order.indexOf("c"), "p must fire before c");
+  assert.deepEqual(order, ["gp", "p", "c"]);
 });
 
 await test("Child response interceptor sees parent's auth-injected header echoed back", async () => {
@@ -2679,17 +2768,31 @@ await test("Child response interceptor sees parent's auth-injected header echoed
     auth: { type: "bearer", token: "parent-token" },
   });
 
+  let seenStatus = 0;
+  let seenUrl = "";
   const child = parent.extend({});
   child.useResponse(async (ctx) => {
-    const resp = ctx.response as { data?: { headers?: Record<string, string> } } | null;
-    const auth = (resp?.data as Record<string, unknown>)?.headers as Record<string, string>;
-    if (auth?.["Authorization"]) authValues.push(auth["Authorization"]);
+    const resp = ctx.response as { status?: number; url?: string; data?: unknown } | null;
+    if (resp) {
+      seenStatus = resp.status ?? 0;
+      seenUrl = resp.url ?? "";
+    }
+    const data = resp?.data as { headers?: Record<string, string> } | undefined;
+    const auth = data?.headers?.["Authorization"];
+    if (auth) authValues.push(auth);
   });
 
-  await child.get<{ headers: Record<string, string> }>("/headers");
-  // The response interceptor ran — even if the header wasn't echoed by httpbin,
-  // the interceptor must have fired without throwing.
-  assert.ok(true, "Child response interceptor ran on child request without error");
+  const res = await child.get("/headers");
+  const echoed = (res.data as { headers: Record<string, string> }).headers;
+  assert.equal(seenStatus, 200, "Child response interceptor must observe the response");
+  assert.equal(seenUrl, res.url);
+  assert.equal(echoed["Host"], "httpbin.org");
+  // httpbin may not echo Authorization; when it does, it must be the parent's token.
+  assert.equal(
+    authValues.every((v) => v === "Bearer parent-token"),
+    true,
+    `Echoed auth must be the parent token, got ${JSON.stringify(authValues)}`,
+  );
 });
 
 // ============================================================================
@@ -2733,9 +2836,13 @@ await test("CLOSED → OPEN after threshold HTTP 503 failures", async () => {
     }
   }
 
-  assert.ok(opens.length >= 1, "onOpen callback must fire when threshold exceeded");
+  assert.equal(opens.length, 1);
   const anyOpen = Object.values(client.circuitSnapshots).some((s) => s.state === "OPEN");
-  assert.ok(anyOpen, `Circuit must be OPEN. Snapshots: ${JSON.stringify(client.circuitSnapshots)}`);
+  assert.equal(
+    anyOpen,
+    true,
+    `Circuit must be OPEN. Snapshots: ${JSON.stringify(client.circuitSnapshots)}`,
+  );
 });
 
 await test("CircuitOpenError thrown when circuit is OPEN — no network call made", async () => {
@@ -3172,9 +3279,16 @@ await test("Async iterator terminates cleanly when close() is called", async () 
   ws.close();
   await iterDone; // must not hang
 
-  assert.ok(
-    collected.some((m) => m.includes("iter-msg-")),
-    "Iterator must yield our sent messages",
+  const echoes = collected.filter((m) => m.startsWith("iter-msg-"));
+  assert.equal(
+    echoes.includes("iter-msg-1"),
+    true,
+    `Iterator must yield iter-msg-1, got ${JSON.stringify(collected)}`,
+  );
+  assert.equal(
+    echoes.includes("iter-msg-2"),
+    true,
+    `Iterator must yield iter-msg-2, got ${JSON.stringify(collected)}`,
   );
 });
 
@@ -3224,11 +3338,12 @@ await test("request() rejects with WSError on timeout when no reply matches", as
   }
   ws.close();
 
-  assert.ok(
+  assert.equal(
     caught instanceof WSError,
+    true,
     `Expected WSError from timeout, got ${(caught as Error)?.constructor?.name}`,
   );
-  assert.ok((caught as WSError).message.includes("timed out"), (caught as WSError).message);
+  assert.equal((caught as WSError).message, "request() timed out after 300ms waiting for reply");
 });
 
 await test("Metrics: messagesSent/bytesReceived increment correctly", async () => {
@@ -3389,14 +3504,19 @@ await test("traceparent header is sent and received by httpbin in W3C format", a
   const r = await client.get<{ headers: Record<string, string> }>("/headers");
 
   const tp = r.data.headers["Traceparent"] ?? r.data.headers["traceparent"];
-  assert.ok(
-    tp,
+  assert.equal(
+    typeof tp,
+    "string",
     `traceparent header must be received by httpbin. Headers: ${JSON.stringify(Object.keys(r.data.headers))}`,
   );
 
   // Strict W3C Trace Context Level 1 format
   const W3C_REGEX = /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/;
-  assert.ok(W3C_REGEX.test(tp), `traceparent "${tp}" must match 00-<32hex>-<16hex>-<flags>`);
+  assert.equal(
+    W3C_REGEX.test(tp as string),
+    true,
+    `traceparent "${tp}" must match 00-<32hex>-<16hex>-<flags>`,
+  );
 });
 
 await test("Each request gets a unique traceparent (no ID reuse)", async () => {
@@ -3536,14 +3656,10 @@ await test("beforeRequest + afterResponse hooks fire and have correct context", 
   client.attachHookRegistry(reg);
   await client.get("/get");
 
-  assert.ok(
-    fired.some((f) => f.phase === "before" && f.method === "GET"),
-    "beforeRequest must fire with method=GET",
-  );
-  assert.ok(
-    fired.some((f) => f.phase === "after" && f.status === 200),
-    "afterResponse must fire with status=200",
-  );
+  assert.deepEqual(fired, [
+    { phase: "before", method: "GET" },
+    { phase: "after", status: 200 },
+  ]);
 });
 
 await test("Priority ordering: lower number fires first", async () => {
@@ -3692,13 +3808,18 @@ await test("startedDateTime is a valid ISO 8601 timestamp within request window"
   const after = Date.now();
 
   const har = client.getHAR();
-  assert.ok(har.entries.length >= 1, "HAR must have at least one entry");
+  assert.equal(har.entries.length, 1);
 
   const ts = har.entries[0].startedDateTime;
   const ms = new Date(ts).getTime();
-  assert.ok(!isNaN(ms), `startedDateTime must be a valid ISO 8601 date. Got: "${ts}"`);
-  assert.ok(
+  assert.equal(
+    ts,
+    new Date(ms).toISOString(),
+    "startedDateTime must be a normalized ISO 8601 string",
+  );
+  assert.equal(
     ms >= before - 200 && ms <= after + 200,
+    true,
     `startedDateTime (${ts}) must fall within request window [${new Date(before).toISOString()}, ${new Date(after).toISOString()}]`,
   );
 });
@@ -3709,13 +3830,17 @@ await test("HAR entry.time ≈ actual measured elapsed ms (within 30%)", async (
   await client.get("/delay/0.3"); // 300ms server-side delay
   const measured = Date.now() - t0;
 
-  const entry = client.getHAR().entries[0];
-  assert.ok(
+  const har = client.getHAR();
+  assert.equal(har.entries.length, 1);
+  const entry = har.entries[0];
+  assert.equal(
     entry.time >= 200,
+    true,
     `HAR time must be ≥ 200ms (server added 300ms delay), got ${entry.time}ms`,
   );
-  assert.ok(
+  assert.equal(
     entry.time >= measured * 0.5 && entry.time <= measured * 1.5,
+    true,
     `HAR time ${entry.time}ms must be within 50% of measured ${measured}ms`,
   );
 });
@@ -3733,7 +3858,11 @@ await test("HAR records all requests including retried ones separately", async (
   await client.get("/uuid");
 
   const har = client.getHAR();
-  assert.ok(har.entries.length >= 3, `HAR must record all 3 requests, got ${har.entries.length}`);
+  assert.equal(har.entries.length, 3);
+  assert.deepEqual(
+    har.entries.map((e) => new URL(e.request.url).pathname),
+    ["/get", "/status/200", "/uuid"],
+  );
 });
 
 // ============================================================================
@@ -3762,8 +3891,14 @@ await test("Aborting an in-flight request terminates it well before the server r
 
   const elapsed = Date.now() - start;
   assert.ok(caught !== undefined, `Request to /delay/10 must throw when aborted. Got: ${caught}`);
-  assert.ok(
+  assert.equal(
+    (caught as KinetexError).isAbort,
+    true,
+    `Abort must raise an abort error, got ${(caught as Error)?.constructor?.name}`,
+  );
+  assert.equal(
     elapsed < 3_000,
+    true,
     `Abort must cancel the in-flight request. Expected < 3000ms, got ${elapsed}ms`,
   );
 });
@@ -3775,18 +3910,24 @@ await test("Abort during retry sleep cancels immediately", async () => {
   ctrl.abort(); // pre-aborted
 
   const start = Date.now();
-  let threw = false;
+  let caught: unknown = null;
   try {
     // sleep is not exported — test indirectly by making a request with pre-aborted signal
     const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: T });
     await client.get("/status/200", { signal: ctrl.signal, retry: false });
-  } catch {
-    threw = true;
+  } catch (e) {
+    caught = e;
   }
 
   const elapsed = Date.now() - start;
-  assert.ok(threw, "Pre-aborted signal must throw immediately");
-  assert.ok(elapsed < 500, `Pre-aborted request must throw in < 500ms, took ${elapsed}ms`);
+  assert.ok(caught !== null, "Pre-aborted signal must throw immediately");
+  // The retry loop's pre-flight abort check raises the library AbortError, so
+  // the caller sees the same EABORT contract as every other abort path. Assert
+  // the code rather than the message text, which is not a stable contract.
+  assert.equal((caught as Error).name, "AbortError");
+  assert.equal((caught as KinetexError).code, "EABORT");
+  assert.equal((caught as KinetexError).isAbort, true);
+  assert.equal(elapsed < 500, true, `Pre-aborted request must throw in < 500ms, took ${elapsed}ms`);
 });
 
 // ============================================================================
@@ -4015,7 +4156,8 @@ await test("Custom fetch function is used when provided", async () => {
 
   await client.get("/get");
   assert.ok(fetchCalledWith, "Custom fetch should be called when using HTTP/1.1");
-  assert.ok(fetchCalledWith.url.includes("httpbin.org"));
+  assert.equal(new URL(String(fetchCalledWith.url)).pathname, "/get");
+  assert.equal((fetchCalledWith.init as RequestInit | undefined)?.method, "GET");
 });
 
 // Test httpVersion: "HTTP/1.1" uses fetch transport

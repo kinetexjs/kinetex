@@ -79,23 +79,17 @@ await test("formatDateStamp handles year boundary", async () => {
 
 await test("sigV4UriEncode encodes correctly", async () => {
   const result = sigV4UriEncode("test & more");
-  assert.ok(result.includes("%2520") || result.includes("%26"));
+  assert.equal(result, "test%2520%2526%2520more");
 });
 
 await test("sigV4UriEncode encodes special characters", async () => {
-  const encoded = sigV4UriEncode("test+value=123");
-  assert.ok(encoded.includes("%"));
-
-  const encoded2 = sigV4UriEncode("hello world/foo");
-  assert.ok(encoded2.includes("%2520"));
-  assert.ok(encoded2.includes("%252F"));
+  assert.equal(sigV4UriEncode("test+value=123"), "test%252Bvalue%253D123");
+  assert.equal(sigV4UriEncode("hello world/foo"), "hello%2520world%252Ffoo");
 });
 
 await test("sigV4UriEncode without double encode (S3 mode)", async () => {
   const result = sigV4UriEncode("test value/foo", false);
-  assert.ok(result.includes("%20"));
-  assert.ok(result.includes("%2F"));
-  assert.ok(!result.includes("%2520"));
+  assert.equal(result, "test%20value%2Ffoo");
 });
 
 await test("sigV4UriEncode handles unreserved chars", async () => {
@@ -295,21 +289,32 @@ suite("IMDS Credentials");
 
 await test("imdsCredentials fails fast with short timeout (not on EC2)", async () => {
   const provider = imdsCredentials({ timeout: 50 });
+  const start = Date.now();
+  let caught: unknown = null;
   try {
     await provider();
-    console.log("     [on EC2] IMDS succeeded unexpectedly");
   } catch (err) {
-    assert.ok(err instanceof Error);
-    const msg = (err as Error).message;
-    assert.ok(
-      msg.includes("timed out") ||
-        msg.includes("aborted") ||
-        msg.includes("IMDS") ||
-        msg.includes("ETIMEOUT") ||
-        msg.includes("Network"),
-      `Expected IMDS timeout/network error, got: ${msg}`,
-    );
+    caught = err;
   }
+  const elapsed = Date.now() - start;
+  if (caught === null) {
+    // Only reachable when the suite actually runs on an EC2 instance
+    console.log("     [on EC2] IMDS succeeded unexpectedly");
+    return;
+  }
+  assert.equal(caught instanceof Error, true);
+  const msg = (caught as Error).message;
+  assert.equal(
+    msg.includes("timed out") ||
+      msg.includes("aborted") ||
+      msg.includes("IMDS") ||
+      msg.includes("ETIMEOUT") ||
+      msg.includes("Network") ||
+      msg.includes("fetch failed"),
+    true,
+    `Expected IMDS timeout/network error, got: ${msg}`,
+  );
+  assert.equal(elapsed < 5_000, true, `IMDS must fail fast, took ${elapsed}ms`);
 });
 
 await test("imdsCredentials throws on invalid endpoint (SSRF protection)", async () => {
@@ -335,13 +340,20 @@ await test("imdsCredentials throws on invalid URL format", async () => {
 
 await test("imdsCredentials validates IPv6 endpoint (strips brackets)", async () => {
   const provider = imdsCredentials({ endpoint: "http://[fd00:ec2::254]", timeout: 50 });
+  let caught: unknown = null;
   try {
     await provider();
-    console.log("     [on EC2] IPv6 IMDS succeeded");
   } catch (err) {
-    assert.ok(err instanceof Error);
-    // Validation passed but fetch failed (not on EC2) - this proves bracket stripping works
+    caught = err;
   }
+  if (caught === null) {
+    // Only reachable when the suite actually runs on an EC2 instance
+    console.log("     [on EC2] IPv6 IMDS succeeded");
+    return;
+  }
+  // Reaching fetch at all proves bracket stripping worked — a bad URL is rejected earlier
+  assert.equal(caught instanceof Error, true);
+  assert.equal((caught as Error).message, "fetch failed");
 });
 
 // ============================================================================
@@ -621,10 +633,16 @@ await test("SigV4Signer.presign creates presigned URL", async () => {
     { method: "GET", url: "https://s3.amazonaws.com/bucket/key", headers: {}, body: null },
     { expiresIn: 3600 },
   );
-  assert.ok(result.includes("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
-  assert.ok(result.includes("X-Amz-Credential="));
-  assert.ok(result.includes("X-Amz-Signature="));
-  assert.ok(result.includes("X-Amz-Expires=3600"));
+  const params = new URL(result).searchParams;
+  assert.equal(params.get("X-Amz-Algorithm"), "AWS4-HMAC-SHA256");
+  assert.equal(params.get("X-Amz-Expires"), "3600");
+  assert.equal(params.get("X-Amz-SignedHeaders"), "host");
+  assert.match(
+    params.get("X-Amz-Credential") as string,
+    /^AKIAIOSFODNN7EXAMPLE\/\d{8}\/us-east-1\/s3\/aws4_request$/,
+  );
+  assert.match(params.get("X-Amz-Date") as string, /^\d{8}T\d{6}Z$/);
+  assert.match(params.get("X-Amz-Signature") as string, /^[0-9a-f]{64}$/);
 });
 
 await test("SigV4Signer.presign with session token", async () => {
@@ -641,7 +659,7 @@ await test("SigV4Signer.presign with session token", async () => {
     { method: "GET", url: "https://s3.amazonaws.com/bucket/key", headers: {}, body: null },
     {},
   );
-  assert.ok(result.includes("X-Amz-Security-Token=SESSION"));
+  assert.equal(new URL(result).searchParams.get("X-Amz-Security-Token"), "SESSION");
 });
 
 await test("SigV4Signer.presign omits session token when requested", async () => {
@@ -658,7 +676,7 @@ await test("SigV4Signer.presign omits session token when requested", async () =>
     { method: "GET", url: "https://s3.amazonaws.com/bucket/key", headers: {}, body: null },
     { omitSessionToken: true },
   );
-  assert.ok(!result.includes("X-Amz-Security-Token"));
+  assert.equal(new URL(result).searchParams.has("X-Amz-Security-Token"), false);
 });
 
 await test("SigV4Signer.presign with extra params", async () => {
@@ -671,7 +689,7 @@ await test("SigV4Signer.presign with extra params", async () => {
     { method: "GET", url: "https://s3.amazonaws.com/bucket/key", headers: {}, body: null },
     { extraParams: { "response-content-disposition": "attachment" } },
   );
-  assert.ok(result.includes("response-content-disposition"));
+  assert.equal(new URL(result).searchParams.get("response-content-disposition"), "attachment");
 });
 
 await test("SigV4Signer.presign warns on invalid expiresIn", async () => {
@@ -685,7 +703,9 @@ await test("SigV4Signer.presign warns on invalid expiresIn", async () => {
     { method: "GET", url: "https://s3.amazonaws.com/bucket/key", headers: {}, body: null },
     { expiresIn: 700000 },
   );
-  assert.ok(result.includes("X-Amz-Signature="));
+  const params = new URL(result).searchParams;
+  assert.equal(params.get("X-Amz-Expires"), "700000");
+  assert.match(params.get("X-Amz-Signature") as string, /^[0-9a-f]{64}$/);
 });
 
 await test("SigV4Signer.presign warns for non-s3 service with >1h", async () => {
@@ -698,7 +718,13 @@ await test("SigV4Signer.presign warns for non-s3 service with >1h", async () => 
     { method: "GET", url: "https://api.example.com/path", headers: {}, body: null },
     { expiresIn: 7200 },
   );
-  assert.ok(result.includes("X-Amz-Signature="));
+  const params = new URL(result).searchParams;
+  assert.equal(params.get("X-Amz-Expires"), "7200");
+  assert.match(
+    params.get("X-Amz-Credential") as string,
+    /^AKIAIOSFODNN7EXAMPLE\/\d{8}\/us-east-1\/execute-api\/aws4_request$/,
+  );
+  assert.match(params.get("X-Amz-Signature") as string, /^[0-9a-f]{64}$/);
 });
 
 await test("SigV4Signer.updateClockSkew updates skew", async () => {
@@ -839,8 +865,7 @@ await test("signFinalChunk terminates chunked upload", async () => {
     body: null,
   });
   const final = await signFinalChunk(state);
-  assert.ok(final.startsWith("0;chunk-signature="));
-  assert.ok(final.endsWith("\r\n\r\n"));
+  assert.match(final, /^0;chunk-signature=[0-9a-f]{64}\r\n\r\n$/);
 });
 
 // ============================================================================
@@ -862,7 +887,9 @@ await test("presignRequest exports and works", async () => {
     { method: "GET", url: "https://s3.amazonaws.com/bucket/key", headers: {}, body: null },
     { credentials: testCredentials, region: "us-east-1", service: "s3" },
   );
-  assert.ok(result.includes("X-Amz-Signature="));
+  const params = new URL(result).searchParams;
+  assert.equal(params.get("X-Amz-Algorithm"), "AWS4-HMAC-SHA256");
+  assert.match(params.get("X-Amz-Signature") as string, /^[0-9a-f]{64}$/);
 });
 
 await test("signS3PostPolicy exports and works", async () => {
@@ -896,7 +923,7 @@ await test("SigV4Signer initChunked with string body input", async () => {
     body: null,
   });
   const { chunkHeader } = await signChunk("string data", state);
-  assert.ok(chunkHeader.includes("chunk-signature="));
+  assert.match(chunkHeader, /^b;chunk-signature=[0-9a-f]{64}\r\n$/);
 });
 
 // ============================================================================

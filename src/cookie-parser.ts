@@ -1877,9 +1877,12 @@ export function domainMatch(requestHost: string, cookieDomain: string): boolean 
   if (isIPAddress(cd)) return false;
 
   // RFC 6265 §5.3: cookie domain must not be a public suffix
-  // e.g., "com" or "co.uk" should not be allowed as cookie domain
-  const psl = getPublicSuffix(rh);
-  if (psl === rh) return false; // requestHost is a public suffix
+  // The COOKIE DOMAIN must not be a public suffix: "com" or "co.uk" must
+  // never be accepted as a cookie domain. This check used to test the request
+  // host instead, so it could never fire and a Domain=com cookie was reported
+  // as matching every .com host. (HTTPCookieJar.setCookie guards it separately
+  // with isPublicSuffix(cd); this exported helper must be correct on its own.)
+  if (isPublicSuffix(cd)) return false;
 
   return true;
 }

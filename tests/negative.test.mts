@@ -252,7 +252,8 @@ async function main() {
 
   await test("parseBody with no content-type returns raw bytes", () => {
     const result = parseBody(new TextEncoder().encode("hello"), null);
-    assert.ok(result instanceof Uint8Array);
+    assert.equal(result instanceof Uint8Array, true);
+    assert.equal(new TextDecoder().decode(result as Uint8Array), "hello");
   });
 
   suite("7. Timeout / abort edge cases");

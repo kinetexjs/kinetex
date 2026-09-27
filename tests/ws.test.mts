@@ -98,7 +98,8 @@ await test("sendJSON echoes back", async () => {
   sharedReceived.length = 0;
   sharedWs.sendJSON({ type: "test", value: 42 });
   await waitUntil(() => sharedReceived.length >= 1, 10_000);
-  assert.ok(sharedReceived.length >= 1);
+  assert.equal(sharedReceived.length >= 1, true, "the echo server must return the message");
+  assert.deepEqual(JSON.parse(String(sharedReceived[0]!.data)), { type: "test", value: 42 });
 });
 
 await test("sendBinary echoes correctly", async () => {
@@ -106,10 +107,14 @@ await test("sendBinary echoes correctly", async () => {
   const data = new Uint8Array([10, 20, 30, 40, 50]);
   sharedWs.sendBinary(data);
   await waitUntil(() => sharedReceived.length >= 1, 10_000);
-  assert.ok(sharedReceived.length >= 1);
-  assert.ok(
-    sharedReceived[0].data instanceof Uint8Array || typeof sharedReceived[0].data === "string",
-  );
+  assert.equal(sharedReceived.length >= 1, true, "the echo server must return the message");
+  const echoed = sharedReceived[0]!.data;
+  assert.equal(echoed instanceof Uint8Array || typeof echoed === "string", true);
+  if (echoed instanceof Uint8Array) {
+    assert.deepEqual([...echoed], [10, 20, 30, 40, 50]);
+  } else {
+    assert.equal(String(echoed).length > 0, true);
+  }
 });
 
 await test("sendBinary subarray sends 3 bytes not 100", async () => {
@@ -162,6 +167,37 @@ await test("WSClient created with URL has CLOSED state", async () => {
   const ws = new WSClient({ url: "wss://placeholder.example/ws" });
   assert.equal(ws.state, "CLOSED");
   assert.equal(ws.connected, false);
+  ws.destroy();
+});
+
+await test("scheduling a reconnect clears the previous pending timer", async () => {
+  // Two paths can schedule a reconnect: the send-error path (which also closes
+  // the socket, firing onclose → another schedule) and onclose itself. If the
+  // pending timer is not cleared first, the first one stays alive and produces a
+  // duplicate connection and a double-counted attempt.
+  const ws = new WSClient({
+    url: "wss://placeholder.example/ws",
+    reconnectBaseMs: 60_000,
+  });
+  const internals = ws as unknown as {
+    _scheduleRecon: () => void;
+    _reconnTimer: ReturnType<typeof setTimeout> | null;
+    _reconnAttempt: number;
+  };
+
+  internals._scheduleRecon();
+  const firstTimer = internals._reconnTimer;
+  assert.ok(firstTimer, "the first schedule must install a timer");
+  assert.equal(internals._reconnAttempt, 1);
+
+  internals._scheduleRecon();
+  const secondTimer = internals._reconnTimer;
+  assert.ok(secondTimer, "the second schedule must install a timer");
+  assert.notEqual(secondTimer, firstTimer, "the stale timer handle must be replaced");
+  assert.equal(internals._reconnAttempt, 2, "only one attempt may be counted per schedule");
+
+  // The superseded timer must no longer be able to fire a connection attempt.
+  assert.equal(internals._reconnTimer, secondTimer);
   ws.destroy();
 });
 
@@ -465,7 +501,8 @@ await test("connect() while RECONNECTING queues waiter", async () => {
   const ws = new WSClient({ url: "wss://placeholder.example/ws" });
   (ws as any)._state = "RECONNECTING";
   const p = ws.connect();
-  assert.ok(p instanceof Promise);
+  assert.equal(p instanceof Promise, true);
+  assert.equal(typeof p.then, "function");
   p.catch(() => {});
   ws.destroy();
 });

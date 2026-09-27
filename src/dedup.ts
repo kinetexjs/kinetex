@@ -196,6 +196,15 @@ export class DedupMap<T = unknown> {
         if (effectiveWindowMs <= 0) {
           this.inflight.delete(key);
         } else {
+          // Clear any previous timer for this key first. Registering a new
+          // window without clearing the old one let the stale timer fire later
+          // and `inflight.delete(key)` — wiping the *new*, still-in-flight entry
+          // out from under callers that were sharing it.
+          const stale = this.timeouts.get(key);
+          if (stale !== undefined) {
+            clearTimeout(stale);
+            this.timeouts.delete(key);
+          }
           const timeoutId = setTimeout(() => {
             this.inflight.delete(key);
             this.timeouts.delete(key);
@@ -242,13 +251,6 @@ export class DedupMap<T = unknown> {
     return [...this.inflight.keys()];
   }
 
-  /**
-   * Get comprehensive deduplication statistics.
-   * NOTE: inFlightCount and trackedKeys reflect snapshot time; entries may
-   * resolve asynchronously between sampling and return (non-blocking, acceptable).
-   *
-   * @returns Snapshot of hits, misses, hit rate, and tracked entries
-   */
   /**
    * Get comprehensive deduplication statistics.
    *
