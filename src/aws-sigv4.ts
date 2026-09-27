@@ -347,8 +347,11 @@ export function imdsCredentials(
     if (!role) throw new NetworkError("No IAM role found in IMDS response");
 
     // Step 3: Get credentials for role
+    // encodeURIComponent: the role name comes from the metadata response and
+    // was interpolated raw, so a `../` or `?` in it could redirect the
+    // credentials request to another path on the metadata endpoint.
     const credsRes = await fetchWithTimeout(
-      `${endpoint}/latest/meta-data/iam/security-credentials/${role}`,
+      `${endpoint}/latest/meta-data/iam/security-credentials/${encodeURIComponent(role)}`,
       { headers: { "x-aws-ec2-metadata-token": token } },
       timeout,
     );

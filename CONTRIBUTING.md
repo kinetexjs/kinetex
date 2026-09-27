@@ -50,15 +50,17 @@ npm run node:battle
 And check coverage:
 
 ```bash
-npm run test:coverage
+npm run coverage            # lcov + text summary
+npm run coverage:summary    # text summary only
 ```
 
 ## Code Style
 
-- TypeScript strict mode — no `any`, no non-null assertions without justification
-- No `eslint-disable` or `deno-lint-ignore` suppressions — fix the underlying issue
+- TypeScript strict mode — avoid `any`; where it is unavoidable (dynamic runtime probing, third-party interop) confine it to a narrow, commented cast rather than letting it spread
+- Suppressions (`eslint-disable`, `deno-lint-ignore`) are a last resort and must carry a comment saying why the underlying fix is not possible — a few exist today for `ban-types`/`no-explicit-any` on deliberate interop boundaries
 - Internal imports use `.ts` extensions (required for Deno/JSR)
 - `node:` prefix for all Node.js built-ins (e.g. `import { Buffer } from "node:buffer"`)
+- Do not add new non-null assertions (`!`) without a comment justifying the invariant
 
 ## Adding a New Feature
 

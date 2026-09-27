@@ -8,13 +8,7 @@
 
 /** Supported runtime identifiers. */
 export type Runtime =
-  | "node"
-  | "deno"
-  | "bun"
-  | "browser"
-  | "cloudflare-workers"
-  | "edge"
-  | "unknown";
+  "node" | "deno" | "bun" | "browser" | "cloudflare-workers" | "edge" | "unknown";
 
 // ============================================================================
 // §2  HTTP PRIMITIVES
@@ -22,15 +16,7 @@ export type Runtime =
 
 /** HTTP method strings (upper-cased). */
 export type HTTPMethod =
-  | "GET"
-  | "POST"
-  | "PUT"
-  | "PATCH"
-  | "DELETE"
-  | "HEAD"
-  | "OPTIONS"
-  | "TRACE"
-  | "CONNECT";
+  "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "TRACE" | "CONNECT";
 
 /**
  * HTTP protocol versions supported by the library.
@@ -56,7 +42,7 @@ export type HTTPVersion = "HTTP/1.0" | "HTTP/1.1" | "HTTP/2" | "HTTP/3";
  * type UserId  = Brand<string, "UserId">;
  * type OrderId = Brand<number, "OrderId">;
  *
- * function getUser(id: UserId) { /* ... *&#47; }
+ * function getUser(id: UserId) { ... }
  * getUser("abc" as UserId);    // OK
  * getUser(123 as unknown as UserId); // Error
  * ```
@@ -137,6 +123,16 @@ export interface KinetexRequest<M extends HTTPMethod = HTTPMethod> {
    * - `"error"` — throw on any redirect.
    */
   readonly redirect?: "follow" | "manual" | "error";
+  /**
+   * Whether redirects are followed. `false` returns the 3xx response as-is,
+   * matching `redirect: "manual"`. Default: true.
+   */
+  readonly followRedirects?: boolean;
+  /**
+   * Maximum number of redirect hops to follow. `0` disables following.
+   * Default: 20 (browser-compatible).
+   */
+  readonly maxRedirects?: number;
 }
 
 /**
@@ -1085,6 +1081,20 @@ export interface PipelineStep {
  *
  * @typeParam T - Expected parsed response body type.
  */
+/**
+ * A request body accepted by the public API.
+ *
+ * In addition to the standard `BodyInit` values, a plain object or array is
+ * accepted: when the caller has not set a `content-type` header, kinetex
+ * JSON-encodes the value and sends `content-type: application/json`. Setting a
+ * `content-type` explicitly disables that behaviour, so the value is then
+ * treated as an already-prepared `BodyInit`.
+ *
+ * (`KinetexRequest.body` stays `BodyInit | null` because the encoding has
+ * already happened by the time the request object is built.)
+ */
+export type RequestBody = BodyInit | Record<string, unknown> | unknown[];
+
 export interface SendOptions<T = unknown> {
   /** Override base URL for this request. */
   baseURL?: string;
@@ -1093,7 +1103,7 @@ export interface SendOptions<T = unknown> {
   /** Query parameters (merged with instance defaults). */
   params?: QueryParams;
   /** Request body. */
-  body?: BodyInit;
+  body?: RequestBody;
   /** Override timeout in ms. */
   timeout?: number;
   /** Override retry config. */

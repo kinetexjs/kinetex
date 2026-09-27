@@ -164,7 +164,9 @@ async function main(): Promise<void> {
 
   await test("Authorization is NOT forwarded to cross-origin target", async () => {
     const mk = makeMock((req) =>
-      req.url.startsWith("https://evil.example.test") ? { kind: "ok" } : { kind: "redirect", location: "https://evil.example.test/steal" },
+      req.url.startsWith("https://evil.example.test")
+        ? { kind: "ok" }
+        : { kind: "redirect", location: "https://evil.example.test/steal" },
     );
     const c = new Kinetex({ baseURL: "https://api.example.test", cookieJar: true });
     const restore = swapTransport(c, mk.transport);
@@ -178,7 +180,10 @@ async function main(): Promise<void> {
     }
     assert.ok(mk.received.length >= 2);
     const crossHop = mk.received[1];
-    assert.ok(crossHop.url.startsWith("https://evil.example.test/"), "should reach cross-origin hop");
+    assert.ok(
+      crossHop.url.startsWith("https://evil.example.test/"),
+      "should reach cross-origin hop",
+    );
     assert.equal(
       crossHop.headers["authorization"],
       undefined,
@@ -193,7 +198,9 @@ async function main(): Promise<void> {
 
   await test("Cookie header is NOT forwarded cross-origin", async () => {
     const mk = makeMock((req) =>
-      req.url.startsWith("https://evil.example.test") ? { kind: "ok" } : { kind: "redirect", location: "https://evil.example.test/c" },
+      req.url.startsWith("https://evil.example.test")
+        ? { kind: "ok" }
+        : { kind: "redirect", location: "https://evil.example.test/c" },
     );
     const c = new Kinetex({ baseURL: "https://api.example.test", cookieJar: true });
     const restore = swapTransport(c, mk.transport);
@@ -206,12 +213,18 @@ async function main(): Promise<void> {
     }
     const crossHop = mk.received[1];
     assert.ok(crossHop.url.startsWith("https://evil.example.test/"));
-    assert.equal(crossHop.headers["cookie"], undefined, "Cookie must NOT be forwarded cross-origin");
+    assert.equal(
+      crossHop.headers["cookie"],
+      undefined,
+      "Cookie must NOT be forwarded cross-origin",
+    );
   });
 
   await test("proxy-authorization is stripped cross-origin", async () => {
     const mk = makeMock((req) =>
-      req.url.startsWith("https://evil.example.test") ? { kind: "ok" } : { kind: "redirect", location: "https://evil.example.test/p" },
+      req.url.startsWith("https://evil.example.test")
+        ? { kind: "ok" }
+        : { kind: "redirect", location: "https://evil.example.test/p" },
     );
     const c = new Kinetex({ baseURL: "https://api.example.test", cookieJar: true });
     const restore = swapTransport(c, mk.transport);
@@ -227,7 +240,9 @@ async function main(): Promise<void> {
 
   await test("x-csrf-token and www-authenticate are stripped cross-origin", async () => {
     const mk = makeMock((req) =>
-      req.url.startsWith("https://evil.example.test") ? { kind: "ok" } : { kind: "redirect", location: "https://evil.example.test/s" },
+      req.url.startsWith("https://evil.example.test")
+        ? { kind: "ok" }
+        : { kind: "redirect", location: "https://evil.example.test/s" },
     );
     const c = new Kinetex({ baseURL: "https://api.example.test", cookieJar: true });
     const restore = swapTransport(c, mk.transport);
@@ -245,7 +260,9 @@ async function main(): Promise<void> {
 
   await test("applyAuth does NOT re-inject Authorization on cross-origin hop", async () => {
     const mk = makeMock((req) =>
-      req.url.startsWith("https://evil.example.test") ? { kind: "ok" } : { kind: "redirect", location: "https://evil.example.test/a" },
+      req.url.startsWith("https://evil.example.test")
+        ? { kind: "ok" }
+        : { kind: "redirect", location: "https://evil.example.test/a" },
     );
     const c = new Kinetex({ baseURL: "https://api.example.test", cookieJar: true });
     const restore = swapTransport(c, mk.transport);
@@ -265,7 +282,9 @@ async function main(): Promise<void> {
 
   await test("apikey auth header is stripped cross-origin", async () => {
     const mk = makeMock((req) =>
-      req.url.startsWith("https://evil.example.test") ? { kind: "ok" } : { kind: "redirect", location: "https://evil.example.test/k" },
+      req.url.startsWith("https://evil.example.test")
+        ? { kind: "ok" }
+        : { kind: "redirect", location: "https://evil.example.test/k" },
     );
     const c = new Kinetex({ baseURL: "https://api.example.test", cookieJar: true });
     const restore = swapTransport(c, mk.transport);
@@ -281,7 +300,9 @@ async function main(): Promise<void> {
 
   await test("x-auth-token / x-access-token / x-refresh-token stripped cross-origin", async () => {
     const mk = makeMock((req) =>
-      req.url.startsWith("https://evil.example.test") ? { kind: "ok" } : { kind: "redirect", location: "https://evil.example.test/t" },
+      req.url.startsWith("https://evil.example.test")
+        ? { kind: "ok" }
+        : { kind: "redirect", location: "https://evil.example.test/t" },
     );
     const c = new Kinetex({ baseURL: "https://api.example.test", cookieJar: true });
     const restore = swapTransport(c, mk.transport);
@@ -308,7 +329,9 @@ async function main(): Promise<void> {
 
   await test("https → http downgrade drops Authorization", async () => {
     const mk = makeMock((req) =>
-      req.url.startsWith("http://insecure.example.test") ? { kind: "ok" } : { kind: "redirect", location: "http://insecure.example.test/x" },
+      req.url.startsWith("http://insecure.example.test")
+        ? { kind: "ok" }
+        : { kind: "redirect", location: "http://insecure.example.test/x" },
     );
     const c = new Kinetex({ baseURL: "https://secure.example.test", cookieJar: true });
     const restore = swapTransport(c, mk.transport);
@@ -338,11 +361,8 @@ async function main(): Promise<void> {
     } finally {
       restore();
     }
-    assert.ok(error instanceof Error, "expected error for redirect loop");
-    assert.ok(
-      mk.received.length <= 25,
-      `should not exceed ~21 hops, got ${mk.received.length}`,
-    );
+    assert.equal(error instanceof Error, true, "expected error for redirect loop");
+    assert.equal(mk.received.length, 8, `should stop at the hop limit, got ${mk.received.length}`);
   });
 
   await test("redirect to file:// scheme is rejected", async () => {
@@ -361,10 +381,14 @@ async function main(): Promise<void> {
     } finally {
       restore();
     }
-    assert.ok(error instanceof Error, "expected rejection for file:// redirect");
+    assert.equal(error instanceof Error, true, "expected rejection for file:// redirect");
     const msg = (error as Error).message.toLowerCase();
-    assert.ok(
-      msg.includes("unsafe") || msg.includes("scheme") || msg.includes("redirect") || msg.includes("location"),
+    assert.equal(
+      msg.includes("unsafe") ||
+        msg.includes("scheme") ||
+        msg.includes("redirect") ||
+        msg.includes("location"),
+      true,
       `unexpected error: ${msg}`,
     );
   });
@@ -385,7 +409,7 @@ async function main(): Promise<void> {
     } finally {
       restore();
     }
-    assert.ok(error instanceof Error, "expected rejection for data: redirect");
+    assert.equal(error instanceof Error, true, "expected rejection for data: redirect");
   });
 
   // ── FINAL ──────────────────────────────────────────────────────────────────

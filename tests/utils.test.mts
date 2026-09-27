@@ -314,7 +314,8 @@ await test("perfNow returns positive number", () => {
 await test("sleep resolves after at least ms", async () => {
   const start = perfNow();
   await sleep(50);
-  assert.ok(perfNow() - start >= 30);
+  const elapsed = perfNow() - start;
+  assert.equal(elapsed >= 30, true, `sleep(50) returned after only ${elapsed}ms`);
 });
 
 await test("sleep with pre-aborted signal rejects", async () => {
@@ -435,7 +436,9 @@ await test("clones Map", () => {
 await test("clones Set", () => {
   const s = new Set([1, 2, 3]);
   const c = deepClone(s);
-  assert.ok(c.has(1));
+  assert.equal(c instanceof Set, true);
+  assert.deepEqual([...c], [1, 2, 3]);
+  assert.equal(c === s, false, "deepClone must return a new instance");
 });
 
 await test("returns primitives as-is", () => {
@@ -473,7 +476,10 @@ await test("two signals merged", () => {
   const a = new AbortController();
   const b = new AbortController();
   const merged = mergeSignals(a.signal, b.signal);
-  assert.ok(isAbortSignal(merged));
+  assert.equal(isAbortSignal(merged), true);
+  assert.equal(merged?.aborted, false);
+  a.abort();
+  assert.equal(merged?.aborted, true, "aborting either input must abort the merged signal");
 });
 
 await test("aborting merged signal propagates", async () => {

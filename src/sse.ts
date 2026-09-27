@@ -625,7 +625,10 @@ export class SSEClient {
           heartbeatTimer = null;
         }
 
-        await sleep(delay);
+        // Abortable: without the signal an abort() during back-off had to wait
+        // out the full delay (up to maxReconnectDelayMs) before being noticed.
+        await sleep(delay, cfg.signal);
+        if (cfg.signal?.aborted) break;
         parser.reset();
         continue;
       }
@@ -643,7 +646,14 @@ export class SSEClient {
       reconnectAttempt++;
       this.health.totalReconnects++;
 
-      const delay = Math.min(reconnectDelay, cfg.maxReconnectDelayMs);
+      // Same jitter formula as the error path — a clean server close used to
+      // reconnect with zero jitter, so every client in a fleet reconnected in
+      // lockstep after a server restart.
+      const delay = Math.min(
+        reconnectDelay + reconnectDelay * cfg.reconnectJitter * Math.random(),
+        cfg.maxReconnectDelayMs,
+      );
+      reconnectDelay = Math.min(reconnectDelay * 2, cfg.maxReconnectDelayMs);
       cfg.onReconnect(reconnectAttempt, delay);
 
       // Clear orphaned heartbeat timer before sleep to avoid firing during back-off
@@ -652,7 +662,7 @@ export class SSEClient {
         heartbeatTimer = null;
       }
 
-      await sleep(delay);
+      await sleep(delay, cfg.signal);
     }
 
     this.health.connected = false;
@@ -1031,6 +1041,21 @@ export function parseSSEText(text: string): SSEEvent[] {
 // §10  UTILITIES
 // ============================================================================
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((r) => {
+    if (signal?.aborted) {
+      r();
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      r();
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      r();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }

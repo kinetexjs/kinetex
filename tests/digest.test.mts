@@ -216,39 +216,44 @@ async function main() {
       "f2/wE",
       "00000001",
     );
-    assert.ok(header.startsWith("Digest "));
-    assert.ok(header.includes(`username="Mufasa"`));
-    assert.ok(header.includes(`realm="testrealm@host.com"`));
-    assert.ok(header.includes(`nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093"`));
-    assert.ok(header.includes(`uri="/dir/index.html"`));
-    assert.ok(header.includes(`response="6629fae49393a05397450978507c4ef1"`));
-    assert.ok(header.includes(`opaque="5ccc069c403ebaf9f0171e9517f40e41"`));
+    assert.equal(
+      header,
+      'Digest username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", uri="/dir/index.html", response="6629fae49393a05397450978507c4ef1", opaque="5ccc069c403ebaf9f0171e9517f40e41"',
+    );
   });
 
   await test("includes qop, nc, cnonce when qop is present", () => {
     const challenge = parseDigestChallenge(`Digest realm="r", nonce="n", qop="auth"`);
     const header = formatDigestAuth(challenge, "u", "resp", "/", "cnonce", "00000001");
-    assert.ok(header.includes("qop=auth"));
-    assert.ok(header.includes("nc=00000001"));
-    assert.ok(header.includes(`cnonce="cnonce"`));
+    assert.equal(
+      header,
+      'Digest username="u", realm="r", nonce="n", uri="/", response="resp", qop=auth, nc=00000001, cnonce="cnonce"',
+    );
   });
 
   await test("omits opaque when not in challenge", () => {
     const challenge = parseDigestChallenge(`Digest realm="r", nonce="n", qop="auth"`);
     const header = formatDigestAuth(challenge, "u", "resp", "/");
-    assert.ok(!header.includes("opaque="));
+    assert.match(
+      header,
+      /^Digest username="u", realm="r", nonce="n", uri="\/", response="resp", qop=auth, nc=00000001, cnonce="[0-9a-f]{10}"$/,
+    );
+    assert.equal(header.includes("opaque="), false);
   });
 
   await test("omits algorithm when MD5 (default)", () => {
     const challenge = parseDigestChallenge(`Digest realm="r", nonce="n"`);
     const header = formatDigestAuth(challenge, "u", "resp", "/");
-    assert.ok(!header.includes("algorithm="));
+    assert.equal(header, 'Digest username="u", realm="r", nonce="n", uri="/", response="resp"');
   });
 
   await test("includes algorithm when non-MD5", () => {
     const challenge = parseDigestChallenge(`Digest realm="r", nonce="n", algorithm=SHA-256`);
     const header = formatDigestAuth(challenge, "u", "resp", "/");
-    assert.ok(header.includes("algorithm=SHA-256"));
+    assert.equal(
+      header,
+      'Digest username="u", realm="r", nonce="n", uri="/", response="resp", algorithm=SHA-256',
+    );
   });
 
   await test("auto-generates cnonce when omitted", () => {
@@ -265,7 +270,10 @@ async function main() {
   await test("selects first qop value when multiple offered", () => {
     const challenge = parseDigestChallenge(`Digest realm="r", nonce="n", qop="auth-int,auth"`);
     const header = formatDigestAuth(challenge, "u", "resp", "/");
-    assert.ok(header.includes("qop=auth-int"));
+    assert.match(
+      header,
+      /^Digest username="u", realm="r", nonce="n", uri="\/", response="resp", qop=auth-int, nc=00000001, cnonce="[0-9a-f]{10}"$/,
+    );
   });
 
   suite("createDigestAuthorization");

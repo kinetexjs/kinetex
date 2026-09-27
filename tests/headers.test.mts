@@ -142,9 +142,16 @@ await test("HttpHeaders set overwrites", async () => {
 
 await test("HttpHeaders keys/values/entries iteration", async () => {
   const h = new HttpHeaders({ a: "1", b: "2" });
-  const keys = [...h.keys()];
-  assert.ok(keys.includes("a"));
-  assert.ok(keys.includes("b"));
+  // Exact sets: `includes` would not catch a duplicated or spurious entry.
+  assert.deepEqual([...h.keys()].sort(), ["a", "b"]);
+  assert.deepEqual([...h.values()].sort(), ["1", "2"]);
+  assert.deepEqual(
+    [...h.entries()].map(([k, v]) => [k, v]),
+    [
+      ["a", "1"],
+      ["b", "2"],
+    ],
+  );
 });
 
 await test("HttpHeaders toObject", async () => {
@@ -222,20 +229,29 @@ await test("freeze() creates immutable copy", async () => {
 
 await test("request guard forbids certain headers", async () => {
   const h = new HttpHeaders({}, "request");
-  try {
-    h.set("host", "example.com");
-  } catch (e) {
-    console.log("    ✓ request guard works:", (e as Error).message);
-  }
+  assert.throws(
+    () => h.set("host", "example.com"),
+    /forbidden|not allowed|request/i,
+    "setting a forbidden request header must throw",
+  );
+  // The guard must not have silently written the value. (get() returns null
+  // for a missing header, per its `string | null` signature.)
+  assert.equal(h.get("host"), null);
+  // ...and a permitted header on the same instance still works.
+  h.set("x-allowed", "yes");
+  assert.equal(h.get("x-allowed"), "yes");
 });
 
 await test("response guard forbids set-cookie", async () => {
   const h = new HttpHeaders({}, "response");
-  try {
-    h.set("set-cookie", "a=b");
-  } catch (e) {
-    console.log("    ✓ response guard works:", (e as Error).message);
-  }
+  assert.throws(
+    () => h.set("set-cookie", "a=b"),
+    /forbidden|not allowed|response/i,
+    "setting a forbidden response header must throw",
+  );
+  assert.equal(h.get("set-cookie"), null);
+  h.set("content-type", "application/json");
+  assert.equal(h.get("content-type"), "application/json");
 });
 
 suite("HeaderName constants");
@@ -280,8 +296,9 @@ await test("parseContentType with boundary", async () => {
 
 await test("formatContentType builds string", async () => {
   const ct = formatContentType({ mediaType: "text/html", charset: "utf-8" });
-  assert.ok(ct.includes("text/html"));
-  assert.ok(ct.includes("charset=utf-8"));
+  assert.equal(ct, "text/html; charset=utf-8");
+  // charset must be omitted entirely when not supplied.
+  assert.equal(formatContentType({ mediaType: "text/html" }), "text/html");
 });
 
 suite("parseContentDisposition");
@@ -300,8 +317,11 @@ await test("parseContentDisposition form-data", async () => {
 
 await test("formatContentDisposition builds string", async () => {
   const cd = formatContentDisposition({ type: "attachment", filename: "test.txt" });
-  assert.ok(cd.includes("attachment"));
-  assert.ok(cd.includes("test.txt"));
+  assert.equal(cd, 'attachment; filename="test.txt"');
+  assert.equal(
+    formatContentDisposition({ type: "form-data", name: "field" }),
+    'form-data; name="field"',
+  );
 });
 
 suite("parseCacheControl");
@@ -320,8 +340,10 @@ await test("parseCacheControl with stale-while-revalidate", async () => {
 
 await test("formatCacheControl builds string", async () => {
   const cc = formatCacheControl({ maxAge: 3600, noCache: true });
-  assert.ok(cc.includes("max-age=3600"));
-  assert.ok(cc.includes("no-cache"));
+  assert.equal(cc, "no-cache, max-age=3600");
+  assert.equal(formatCacheControl({ public: true, maxAge: 60 }), "public, max-age=60");
+  // An empty directive set must not emit stray separators.
+  assert.equal(formatCacheControl({}), "");
 });
 
 suite("parseAuthorization");
@@ -346,7 +368,9 @@ await test("formatBearer builds string", async () => {
 
 await test("formatBasic builds string", async () => {
   const b = formatBasic("user", "pass");
-  assert.ok(b.startsWith("Basic "));
+  // Exact base64 of "user:pass" — a wrong encoding would still start with "Basic ".
+  assert.equal(b, "Basic dXNlcjpwYXNz");
+  assert.equal(formatBasic("u", "p"), `Basic ${Buffer.from("u:p").toString("base64")}`);
 });
 
 suite("parseWWWAuthenticate");
@@ -417,7 +441,13 @@ await test("parseLinkHeader basic", async () => {
 
 await test("formatLinkHeader builds string", async () => {
   const links = formatLinkHeader([{ uri: "https://example.com", rel: "preload" }]);
-  assert.ok(links.includes("preload"));
+  assert.equal(links, '<https://example.com>; rel="preload"');
+  assert.equal(
+    formatLinkHeader([
+      { uri: "https://a.com/x", rel: "next", title: "Next page", type: "text/html" },
+    ]),
+    '<https://a.com/x>; rel="next"; type="text/html"; title="Next page"',
+  );
 });
 
 suite("parseForwarded / normalizeForwardedHeaders");
@@ -432,7 +462,11 @@ await test("normalizeForwardedHeaders from X-Forwarded-For", async () => {
   const h = new HttpHeaders();
   h.set("x-forwarded-for", "203.0.113.1, 70.41.3.18");
   const fwd = normalizeForwardedHeaders(h);
-  assert.ok(fwd.for.length > 0);
+  assert.deepEqual(fwd.for, ["203.0.113.1", "70.41.3.18"]);
+  assert.deepEqual(
+    { by: fwd.by, host: fwd.host, proto: fwd.proto },
+    { by: null, host: null, proto: null },
+  );
 });
 
 await test("getClientIP returns client IP", async () => {
@@ -464,20 +498,28 @@ await test("parseHSTS basic", async () => {
 
 await test("formatHSTS builds string", async () => {
   const hsts = formatHSTS({ maxAge: 31536000, includeSubDomains: true, preload: false });
-  assert.ok(hsts.includes("max-age=31536000"));
+  // preload:false must not emit the directive.
+  assert.equal(hsts, "max-age=31536000; includeSubDomains");
 });
 
 suite("parseCSP / formatCSP");
 
 await test("parseCSP basic", async () => {
   const csp = parseCSP("default-src 'self'; script-src 'unsafe-inline'");
-  assert.ok(csp.has("default-src"));
-  assert.ok(csp.has("script-src"));
+  assert.deepEqual(Array.from(csp.entries()), [
+    ["default-src", ["'self'"]],
+    ["script-src", ["'unsafe-inline'"]],
+  ]);
 });
 
 await test("formatCSP builds string", async () => {
   const csp = formatCSP(new Map([["default-src", ["'self'"]]]));
-  assert.ok(csp.includes("default-src"));
+  assert.equal(csp, "default-src 'self'");
+  // A directive with no values must be emitted bare, without a trailing space.
+  assert.equal(
+    formatCSP(new Map([["upgrade-insecure-requests", []]])),
+    "upgrade-insecure-requests",
+  );
 });
 
 suite("parseServerTiming / formatServerTiming");
@@ -490,7 +532,7 @@ await test("parseServerTiming basic", async () => {
 
 await test("formatServerTiming builds string", async () => {
   const st = formatServerTiming([{ name: "db", duration: 50, description: "Query" }]);
-  assert.ok(st.includes("db"));
+  assert.equal(st, 'db;dur=50;desc="Query"');
 });
 
 suite("parseAltSvc");
@@ -509,15 +551,19 @@ suite("securityHeaders");
 
 await test("securityHeaders default creates secure headers", async () => {
   const h = securityHeaders();
-  assert.ok(h.has("strict-transport-security"));
-  assert.ok(h.has("x-frame-options"));
+  assert.deepEqual(h.toObject(), {
+    "strict-transport-security": "max-age=31536000; includeSubDomains",
+    "x-frame-options": "DENY",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "strict-origin-when-cross-origin",
+  });
 });
 
 await test("securityHeaders with options", async () => {
   const h = securityHeaders({ hsts: { maxAge: 31536000, includeSubDomains: true, preload: true } });
   const hsts = h.get("strict-transport-security");
   console.log("    Generated HSTS:", hsts);
-  assert.ok(hsts?.includes("max-age="));
+  assert.equal(hsts, "max-age=31536000; includeSubDomains; preload");
 });
 
 suite("corsHeaders");
@@ -543,7 +589,7 @@ await test("fromNodeHeaders converts Node-style headers", async () => {
 await test("toNodeHeaders converts to Node-style", async () => {
   const h = new HttpHeaders({ "content-type": "application/json" });
   const nodeHeaders = toNodeHeaders(h);
-  assert.ok("content-type" in nodeHeaders);
+  assert.deepEqual(nodeHeaders, { "content-type": "application/json" });
 });
 
 suite("fromWebHeaders");
@@ -634,7 +680,7 @@ await test("parseContentType returns null for empty", async () => {
 
 await test("parseCacheControl handles unknown directives", async () => {
   const cc = parseCacheControl("unknown-directive=123");
-  assert.ok(cc.unknown.has("unknown-directive"));
+  assert.deepEqual([...cc.unknown.entries()], [["unknown-directive", "123"]]);
 });
 
 await test("HttpHeaders handles case-insensitive keys", async () => {
@@ -646,7 +692,7 @@ await test("HttpHeaders handles case-insensitive keys", async () => {
 await test("HttpHeaders toHTTP1String", async () => {
   const h = new HttpHeaders({ a: "1", b: "2" });
   const http1 = h.toHTTP1String();
-  assert.ok(http1.includes("\r\n"));
+  assert.equal(http1, "a: 1\r\nb: 2");
 });
 
 suite("Headers guard edge cases");
@@ -686,7 +732,7 @@ await test("RichHeaders contentType setter (string)", async () => {
 await test("RichHeaders contentType setter (object)", async () => {
   const h = new RichHeaders();
   h.contentType = { mediaType: "text/html", charset: "utf-8" };
-  assert.ok(h.get("content-type")?.includes("text/html"));
+  assert.equal(h.get("content-type"), "text/html; charset=utf-8");
 });
 
 await test("RichHeaders contentLength getter", async () => {
@@ -712,7 +758,7 @@ await test("RichHeaders cacheControl getter", async () => {
 await test("RichHeaders cacheControl setter", async () => {
   const h = new RichHeaders();
   h.cacheControl = { maxAge: 7200, noStore: true };
-  assert.ok(h.get("cache-control")?.includes("max-age=7200"));
+  assert.equal(h.get("cache-control"), "no-store, max-age=7200");
 });
 
 suite("Factory helpers");
@@ -748,7 +794,7 @@ await test("RichHeaders date getter", async () => {
   h.set("date", "Wed, 06 May 2026 12:00:00 GMT");
   const d = h.date;
   console.log("    Real API response date:", d);
-  assert.ok(d instanceof Date);
+  assert.equal(d instanceof Date ? d.toISOString() : null, "2026-05-06T12:00:00.000Z");
 });
 
 await test("RichHeaders age getter", async () => {
@@ -762,7 +808,7 @@ await test("RichHeaders vary getter", async () => {
   h.set("vary", "Accept, Accept-Encoding");
   const vary = h.vary;
   console.log("    Real API response vary:", vary);
-  assert.ok(Array.isArray(vary));
+  assert.deepEqual(vary, ["accept", "accept-encoding"]);
 });
 
 await test("RichHeaders clientIP getter", async () => {
@@ -850,15 +896,17 @@ await test("RichHeaders lastModified getter", async () => {
   h.set("last-modified", "Wed, 06 May 2026 12:00:00 GMT");
   const lm = h.lastModified;
   console.log("    Real API response lastModified:", lm);
-  assert.ok(lm instanceof Date);
-  assert.ok(lm.getTime() > 0);
+  assert.equal(lm instanceof Date ? lm.toISOString() : null, "2026-05-06T12:00:00.000Z");
 });
 
 await test("RichHeaders expires getter", async () => {
   const h = new RichHeaders();
   h.set("expires", "Thu, 07 May 2027 12:00:00 GMT");
   console.log("    Real API response expires:", h.expires);
-  assert.ok(h.expires instanceof Date);
+  assert.equal(
+    h.expires instanceof Date ? h.expires.toISOString() : null,
+    "2027-05-07T12:00:00.000Z",
+  );
 });
 
 await test("RichHeaders contentEncoding getter", async () => {
@@ -1042,7 +1090,7 @@ await test("RichHeaders etag setter with quotes", async () => {
   h.etag = "abc123";
   const etagValue = h.etag;
   console.log("    etag value:", etagValue);
-  assert.ok(etagValue?.startsWith('"'));
+  assert.equal(etagValue, '"abc123"');
 });
 
 await test("RichHeaders etag setter null", async () => {
@@ -1057,7 +1105,13 @@ await test("RichHeaders links getter", async () => {
   h.set("link", '<https://a.com>; rel="a", <https://b.com>; rel="b"');
   const links = h.links;
   console.log("    Real API response links:", links?.length);
-  assert.ok(links && links.length > 0);
+  assert.deepEqual(
+    links?.map((l) => [l.uri, l.rel]),
+    [
+      ["https://a.com", "a"],
+      ["https://b.com", "b"],
+    ],
+  );
 });
 
 await test("RichHeaders allow getter", async () => {
@@ -1240,20 +1294,21 @@ await test("headers.forEach iteration", async () => {
 });
 
 await test("headers.toWebHeaders", async () => {
-  const h = new RichHeaders({ a: "1" });
-  try {
-    const webH = h.toWebHeaders();
-    console.log("    toWebHeaders works");
-  } catch (e) {
-    console.log("    toWebHeaders not available in this runtime:", (e as Error).message);
-  }
+  const h = new RichHeaders({ "x-a": "1", "content-type": "application/json" });
+  const webH = h.toWebHeaders();
+  assert.ok(webH instanceof Headers, "toWebHeaders must return a Headers instance");
+  assert.equal(webH.get("x-a"), "1");
+  assert.equal(webH.get("content-type"), "application/json");
+  // Round-trip: a Headers object built from these values reads back identically.
+  const round = new RichHeaders(webH);
+  assert.equal(round.get("x-a"), "1");
 });
 
 await test("headers.toHTTP1String format", async () => {
   const h = new HttpHeaders({ "content-type": "application/json" });
   const str = h.toHTTP1String();
   console.log("    HTTP/1.1 string:", str);
-  assert.ok(str.includes("content-type:"));
+  assert.equal(str, "content-type: application/json");
 });
 
 await test("HttpHeaders from constructed with array of pairs", async () => {
@@ -1323,9 +1378,7 @@ await test("RichHeaders wwwAuthenticate setter with extra params", async () => {
     },
   ];
   const v = h.get("www-authenticate");
-  assert.ok(v?.startsWith('digest realm="test"'));
-  assert.ok(v?.includes("nonce=abc123"));
-  assert.ok(v?.includes("algorithm=MD5"));
+  assert.equal(v, 'digest realm="test"; nonce=abc123, algorithm=MD5');
 });
 
 await test("RichHeaders wwwAuthenticate setter with null clears header", async () => {
@@ -1378,7 +1431,7 @@ await test("RichHeaders proxyAuthorization setter with AuthCredentials (basic)",
     basic: { username: "user", password: "pass" },
   };
   const val = h.get("proxy-authorization");
-  assert.ok(val?.startsWith("Basic "));
+  assert.equal(val, "Basic dXNlcjpwYXNz");
 });
 
 await test("RichHeaders proxyAuthorization setter with AuthCredentials (token)", async () => {
@@ -1515,7 +1568,7 @@ await test("formatContentType with Map params includes non-standard", async () =
       ["foo", "bar"],
     ]),
   });
-  assert.ok(result.includes("foo=bar"));
+  assert.equal(result, "text/html; foo=bar");
 });
 
 await test("formatContentType with object params", async () => {
@@ -1523,7 +1576,7 @@ await test("formatContentType with object params", async () => {
     mediaType: "application/json",
     params: { charset: "utf-8" } as any,
   });
-  assert.ok(result.includes("application/json"));
+  assert.equal(result, "application/json");
 });
 
 await test("formatContentType quotes value with spaces", async () => {
@@ -1531,7 +1584,7 @@ await test("formatContentType quotes value with spaces", async () => {
     mediaType: "text/html",
     params: new Map([["foo", "bar baz"]]),
   });
-  assert.ok(result.includes('"bar baz"'));
+  assert.equal(result, 'text/html; foo="bar baz"');
 });
 
 suite("ContentDisposition edge cases");
@@ -1557,7 +1610,7 @@ await test("formatContentDisposition with non-ASCII filename adds RFC 5987", asy
     name: null,
     params: new Map(),
   } as ContentDispositionValue);
-  assert.ok(cd.includes("filename*=UTF-8''"));
+  assert.equal(cd, "attachment; filename=\"héllo.txt\"; filename*=UTF-8''h%C3%A9llo.txt");
 });
 
 await test("formatContentDisposition with name field", async () => {
@@ -1567,7 +1620,7 @@ await test("formatContentDisposition with name field", async () => {
     filename: null,
     params: new Map(),
   } as ContentDispositionValue);
-  assert.ok(cd.includes('name="field1"'));
+  assert.equal(cd, 'form-data; name="field1"');
 });
 
 suite("CacheControl edge cases");
@@ -1585,13 +1638,13 @@ await test("parseCacheControl max-stale without value", async () => {
 
 await test("parseCacheControl private with quoted values", async () => {
   const cc = parseCacheControl('private="field1, field2"');
-  // Quoted values with commas inside are split by the outer parser
-  assert.ok(Array.isArray(cc.private) || cc.private === true);
+  // A comma inside a quoted string must not split the directive (RFC 7234 §5.2)
+  assert.deepEqual(cc.private, ["field1", "field2"]);
 });
 
 await test("formatCacheControl with s-maxage", async () => {
   const result = formatCacheControl({ sMaxAge: 3600 });
-  assert.ok(result.includes("s-maxage=3600"));
+  assert.equal(result, "s-maxage=3600");
 });
 
 await test("formatCacheControl with max-stale Infinity", async () => {
@@ -1601,8 +1654,7 @@ await test("formatCacheControl with max-stale Infinity", async () => {
 
 await test("formatCacheControl with private array", async () => {
   const result = formatCacheControl({ private: ["field1", "field2"] });
-  assert.ok(result.includes("private=field1"));
-  assert.ok(result.includes("field2"));
+  assert.equal(result, "private=field1, field2");
 });
 
 await test("formatCacheControl with private true", async () => {
@@ -1622,8 +1674,7 @@ await test("formatCacheControl with unknown boolean directive", async () => {
 
 await test("formatCacheControl with must-understand and must-revalidate", async () => {
   const result = formatCacheControl({ mustUnderstand: true, mustRevalidate: true });
-  assert.ok(result.includes("must-understand"));
-  assert.ok(result.includes("must-revalidate"));
+  assert.equal(result, "must-revalidate, must-understand");
 });
 
 suite("parseParams edge cases");
@@ -1726,8 +1777,10 @@ await test("formatLinkHeader with all fields", async () => {
       ]),
     },
   ]);
-  assert.ok(link.includes("stylesheet"));
-  assert.ok(link.includes("extra"));
+  assert.equal(
+    link,
+    '<https://example.com>; rel="stylesheet"; type="text/css"; hreflang="en"; title="Style"; media="screen"; extra="val"',
+  );
 });
 
 suite("parseForwarded edge cases");
@@ -1749,7 +1802,8 @@ await test("parseHSTS returns null for invalid max-age", async () => {
 
 await test("formatHSTS with preload", async () => {
   const result = formatHSTS({ maxAge: 31536000, includeSubDomains: false, preload: true });
-  assert.ok(result.includes("preload"));
+  // includeSubDomains:false must not emit that directive.
+  assert.equal(result, "max-age=31536000; preload");
 });
 
 suite("CSP edge cases");
@@ -1761,7 +1815,7 @@ await test("formatCSP with empty directive", async () => {
 
 await test("formatCSP with values", async () => {
   const result = formatCSP(new Map([["default-src", ["'self'", "example.com"]]]));
-  assert.ok(result.includes("example.com"));
+  assert.equal(result, "default-src 'self' example.com");
 });
 
 suite("Server-Timing edge cases");
@@ -1773,7 +1827,8 @@ await test("parseServerTiming with description", async () => {
 
 await test("formatServerTiming with description", async () => {
   const result = formatServerTiming([{ name: "db", duration: null, description: "query" }]);
-  assert.ok(result.includes('desc="query"'));
+  // A null duration must be omitted, not rendered as "null".
+  assert.equal(result, 'db;desc="query"');
 });
 
 suite("Security headers edge cases");
@@ -1790,7 +1845,7 @@ await test("securityHeaders with CSP string", async () => {
 
 await test("securityHeaders with CSP Map", async () => {
   const h = securityHeaders({ csp: new Map([["default-src", ["'self'"]]]) });
-  assert.ok(h.get("content-security-policy")?.includes("default-src"));
+  assert.equal(h.get("content-security-policy"), "default-src 'self'");
 });
 
 await test("securityHeaders with noSniff disabled", async () => {
@@ -1925,14 +1980,14 @@ await test("HttpHeaders append preserves original name casing", async () => {
   const h = new HttpHeaders();
   h.append("X-Custom", "val");
   const str = h.toHTTP1String();
-  assert.ok(str.includes("X-Custom"));
+  assert.equal(str, "X-Custom: val");
 });
 
 await test("HttpHeaders set preserves original name casing", async () => {
   const h = new HttpHeaders();
   h.set("X-Custom", "val");
   const str = h.toHTTP1String();
-  assert.ok(str.includes("X-Custom"));
+  assert.equal(str, "X-Custom: val");
 });
 
 suite("RichHeaders edge cases");

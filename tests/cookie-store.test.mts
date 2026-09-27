@@ -195,7 +195,7 @@ await test("Max-Age capped at 400 days", () => {
   jar.setCookie("x=1; Max-Age=99999999", { url: "https://example.com/" });
   const cookies = jar.getCookies({ url: "https://example.com/" });
   const remaining = cookies[0].expires - Date.now();
-  assert.ok(remaining <= 400 * 86400000 + 2000);
+  assert.equal(remaining, 400 * 86400000);
 });
 
 await test("Expires capped at 400 days from now", () => {
@@ -203,7 +203,7 @@ await test("Expires capped at 400 days from now", () => {
   const jar = createCookieJar();
   jar.setCookie(`x=1; Expires=${farFuture}`, { url: "https://example.com/" });
   const age = jar.getCookies({ url: "https://example.com/" })[0].expires - Date.now();
-  assert.ok(age <= 400 * 86400000 + 2000);
+  assert.equal(age, 400 * 86400000);
 });
 
 await test("cookie over 4096 bytes rejected", () => {
@@ -455,9 +455,26 @@ await test("toString returns pretty JSON", () => {
   const jar = createCookieJar();
   jar.setCookie("x=1", { url: "https://example.com/" });
   const str = jar.toString();
-  assert.ok(str.includes('"name"'));
-  assert.ok(str.includes('"value"'));
-  assert.ok(str.includes('"x"'));
+  assert.equal(str.startsWith('[\n  {\n    "name": "x"'), true, `not pretty-printed: ${str}`);
+  const parsed = JSON.parse(str) as Record<string, unknown>[];
+  assert.equal(parsed.length, 1);
+  assert.deepEqual(
+    { ...parsed[0], createdAt: 0, lastAccessed: 0 },
+    {
+      name: "x",
+      value: "1",
+      domain: "example.com",
+      path: "/",
+      expires: null,
+      maxAge: null,
+      secure: false,
+      httpOnly: false,
+      sameSite: "Unset",
+      createdAt: 0,
+      lastAccessed: 0,
+      hostOnly: true,
+    },
+  );
 });
 
 await test("serialize + deserialize full round-trip", () => {
@@ -564,7 +581,7 @@ await test("custom max limits work", () => {
   for (let i = 0; i < 10; i++) {
     jar.setCookie(`x${i}=1; Domain=example.com; Path=/p${i}`, { url: `https://example.com/p${i}` });
   }
-  assert.ok(jar.count <= 5);
+  assert.equal(jar.count, 5);
 });
 
 await test("destroy cleans up interval timer", () => {
@@ -718,10 +735,12 @@ await test("cookie with Max-Age and Expires both set uses Max-Age", () => {
   jar.setCookie("x=1; Max-Age=3600; Expires=" + future, { url: "https://example.com/" });
   const expires = jar.getCookies({ url: "https://example.com/" })[0].expires;
   const expectedMaxAge = Date.now() + 3600000;
-  assert.ok(
+  assert.equal(
     Math.abs(expires - expectedMaxAge) < 5000,
+    true,
     `expected ~1h, got ${expires - Date.now()}ms`,
   );
+  assert.equal(expires - Date.now(), 3600000);
 });
 
 await test("update preserves createdAt across multiple updates", () => {
@@ -759,7 +778,7 @@ await test("custom max limits work", () => {
   for (let i = 0; i < 10; i++) {
     jar.setCookie(`x${i}=1; Domain=example.com; Path=/p${i}`, { url: `https://example.com/p${i}` });
   }
-  assert.ok(jar.count <= 5);
+  assert.equal(jar.count, 5);
 });
 
 await test("destroy cleans up interval timer", () => {
@@ -878,10 +897,8 @@ await test("cookie jar with multiple Set-Cookie from response-headers", async ()
   const res = await httpbin.get("/response-headers?Set-Cookie=m1=v1&Set-Cookie=m2=v2");
   const { extractSetCookieHeaders } = await import("../src/cookie-parser.ts");
   const raw = extractSetCookieHeaders(res.headers);
-  assert.ok(raw.length > 0, "Should extract Set-Cookie from response");
-  // Verify at least one of our values is present
-  const all = raw.join(" ");
-  assert.ok(all.includes("m1=v1") || all.includes("m2=v2"));
+  assert.equal(raw.length, 2, `Should extract both Set-Cookie headers, got ${JSON.stringify(raw)}`);
+  assert.deepEqual(raw.map((c) => c.split(";")[0]).sort(), ["m1=v1", "m2=v2"]);
 });
 
 await test("direct CookieJar with real httpbin Set-Cookie", async () => {

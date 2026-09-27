@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import {
   collectAll,
   collectPages,
@@ -124,13 +125,14 @@ await test("serializePaginationState roundtrips", async () => {
 });
 
 await test("deserializePaginationState throws on invalid input", async () => {
-  let threw = false;
+  let caught: unknown = null;
   try {
     deserializePaginationState("!!not-base64!!");
-  } catch {
-    threw = true;
+  } catch (err) {
+    caught = err;
   }
-  assertOk(threw);
+  assert.equal(caught instanceof Error, true, "invalid state must throw");
+  assert.equal(typeof (caught as Error).message, "string");
 });
 
 // ── paginate core ────────────────────────────────────────────────────────
@@ -322,9 +324,9 @@ await test("toPaginationIterator wraps generator with return", async () => {
   });
   const iter = toPaginationIterator(gen);
   const first = await iter.next();
-  assertOk(!first.done);
+  assert.equal(first.done, false);
   const returned = await iter.return!();
-  assertOk(returned.done);
+  assert.equal(returned.done, true);
 });
 
 await test("toPaginationIterator return when iterator lacks return", async () => {
@@ -655,7 +657,12 @@ await test("Keyset paginator with startKey uses initial cursor", async () => {
   })) {
     if (callNum > 2) break;
   }
-  assertOk(urls[0]?.includes("after=initial-key"));
+  assert.equal(urls[0], "https://api.test/items?after=initial-key");
+  assert.equal(
+    urls.every((u) => u.startsWith("https://api.test/items?after=")),
+    true,
+    `unexpected URLs: ${JSON.stringify(urls)}`,
+  );
 });
 
 await test("Keyset paginator getLastKey returns null stops pagination", async () => {

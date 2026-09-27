@@ -260,10 +260,11 @@ describe("HAR redaction battle", () => {
 
     const har = client.getHAR();
     const json = JSON.stringify(har);
-    assert.ok(har, "HAR log should exist");
-    assert.ok(!json.includes("super-secret"), "Authorization value leaked into HAR");
-    assert.ok(!json.includes("k-123"), "API key leaked into HAR");
-    assert.ok(!json.includes("secret123"), "Set-Cookie value leaked into HAR");
+    assert.equal(har.version, "1.2");
+    assert.equal(har.entries.length, 1);
+    assert.equal(json.includes("super-secret"), false, "Authorization value leaked into HAR");
+    assert.equal(json.includes("k-123"), false, "API key leaked into HAR");
+    assert.equal(json.includes("secret123"), false, "Set-Cookie value leaked into HAR");
     client.destroy();
   });
 });

@@ -304,7 +304,15 @@ describe("mod - Fluent Request Builder", () => {
     console.log("Fluent text() - actual response:");
     console.log("Response length:", text.length);
 
-    assert.ok(text.length > 0);
+    assert.equal(typeof text, "string");
+    // httpbin's UTF-8 demo is an HTML document with multi-byte characters
+    assert.equal(text.startsWith("<h1>Unicode Demo</h1>"), true);
+    assert.equal(text.includes("UTF-8 encoded sample plain-text file"), true);
+    assert.equal(
+      text.includes("Markus Kuhn [ˈmaʳkʊs kuːn]"),
+      true,
+      "multi-byte characters must survive decoding",
+    );
     client.destroy();
   });
 
@@ -462,7 +470,8 @@ describe("mod - Client Configuration", () => {
       ),
     );
 
-    assert.ok(res.request.url.includes("httpbin.org"));
+    assert.equal(res.request.url, "https://httpbin.org/get");
+    assert.equal(res.status, 200);
     client.destroy();
   });
 
@@ -1340,9 +1349,13 @@ describe("mod - HAR Recording", () => {
       ),
     );
 
-    assert.ok(har.version === "1.2");
-    assert.ok(Array.isArray(har.entries));
-    assert.ok(har.entries.length >= 2);
+    assert.equal(har.version, "1.2");
+    assert.equal(Array.isArray(har.entries), true);
+    assert.equal(har.entries.length, 2);
+    assert.deepEqual(
+      har.entries.map((e) => e.request.method),
+      ["GET", "POST"],
+    );
 
     client.destroy();
   });
@@ -1354,10 +1367,10 @@ describe("mod - HAR Recording", () => {
     });
 
     await client.get("/get", { throwOnError: false });
-    assert.ok(client.getHAR().entries.length === 1);
+    assert.equal(client.getHAR().entries.length, 1);
 
     client.clearHAR();
-    assert.ok(client.getHAR().entries.length === 0);
+    assert.equal(client.getHAR().entries.length, 0);
 
     console.log("clearHAR() works correctly");
     client.destroy();
@@ -1715,8 +1728,10 @@ describe("mod - Error Handling", () => {
       },
     });
 
-    assert.ok(successCalled === true);
+    assert.equal(successCalled, true);
     assert.ok(successResponse !== null);
+    assert.equal(successResponse.status, 200);
+    assert.equal(successResponse.request.method, "GET");
     client.destroy();
   });
 
@@ -1749,8 +1764,11 @@ describe("mod - Error Handling", () => {
       // Error already handled by onError
     }
 
-    assert.ok(errorCalled === true);
+    assert.equal(errorCalled, true);
     assert.ok(errorResponse !== null);
+    assert.equal(errorResponse.name, "HTTPStatusError");
+    assert.equal(errorResponse.code, "EHTTPSTATUS");
+    assert.equal(errorResponse.status, 500);
     client.destroy();
   });
 });
@@ -2032,6 +2050,7 @@ describe("mod - AbortController", () => {
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 100);
 
+    let caught: unknown = null;
     try {
       await client.get("/delay/5", {
         signal: controller.signal,
@@ -2039,6 +2058,7 @@ describe("mod - AbortController", () => {
         throwOnError: false,
       });
     } catch (err) {
+      caught = err;
       console.log("AbortController - actual error:");
       console.log(
         JSON.stringify(
@@ -2050,8 +2070,11 @@ describe("mod - AbortController", () => {
           2,
         ),
       );
-      assert.ok(err instanceof Error);
     }
+    assert.ok(caught !== null, "aborting after 100ms must reject the in-flight request");
+    assert.equal((caught as Error).name, "KinetexError");
+    assert.equal((caught as { code?: string }).code, "EABORT");
+    assert.equal((caught as { isAbort?: boolean }).isAbort, true);
 
     client.destroy();
   });

@@ -6,6 +6,7 @@
 
 import assert from "node:assert/strict";
 import { kinetex } from "../src/mod.ts";
+import { HTTPStatusError, KinetexError } from "../src/types.ts";
 
 let passed = 0,
   failed = 0;
@@ -107,8 +108,8 @@ suite("Fluent chain API (GET, POST, PUT, etc.)");
 await test("client.GET().json() returns parsed data", async () => {
   const data = await bin.GET("/get").json<{ url: string; origin: string }>();
   console.log(`    → GET().json(): url=${data.url}, origin=${data.origin}`);
-  assert.ok(data.url.includes("/get"));
-  assert.ok(typeof data.origin === "string");
+  assert.match(data.url, /^https:\/\/httpbin\.org\/get$/);
+  assert.equal(typeof data.origin, "string");
 });
 
 await test("client.GET().text() returns raw string", async () => {
@@ -122,7 +123,8 @@ await test("client.GET().bytes() returns Uint8Array", async () => {
   const bytes = await bin.GET("/get").bytes();
   console.log(`    → GET().bytes(): length=${bytes.length}, type=${bytes.constructor.name}`);
   assert.ok(bytes instanceof Uint8Array);
-  assert.ok(bytes.length > 0);
+  const parsed = JSON.parse(new TextDecoder().decode(bytes)) as { url: string };
+  assert.match(parsed.url, /^https:\/\/httpbin\.org\/get$/);
 });
 
 await test("client.GET().send() returns full response", async () => {
@@ -190,9 +192,9 @@ await test("client.GET().apiKey() adds API key header", async () => {
     .apiKey("x-api-key", "secret-key")
     .json<{ headers: Record<string, string> }>();
   console.log(`    → GET().apiKey(): headers received: ${JSON.stringify(data.headers)}`);
-  assert.ok(
-    data.headers["x-api-key"] === "secret-key" || data.headers["X-Api-Key"] === "secret-key",
-  );
+  const sent = Object.entries(data.headers).filter(([k]) => k.toLowerCase() === "x-api-key");
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0][1], "secret-key");
 });
 
 await test("config auth with apikey", async () => {
@@ -208,8 +210,9 @@ await test("config auth with apikey", async () => {
       .join(", ")}`,
   );
   // Verify apikey was added (header name might be normalized to lowercase)
-  const headerKeys = Object.keys(data.headers).map((k) => k.toLowerCase());
-  assert.ok(headerKeys.includes("x-api-key"), "x-api-key header should be present");
+  const sent = Object.entries(data.headers).filter(([k]) => k.toLowerCase() === "x-api-key");
+  assert.equal(sent.length, 1, "x-api-key header should be present exactly once");
+  assert.equal(sent[0][1], "my-api-key");
 });
 
 await test("client.GET().noThrow() returns 404 without throwing", async () => {
@@ -233,13 +236,13 @@ await test("client.GET().timeout() sets timeout", async () => {
 await test("client.GET().noRetry() disables retry", async () => {
   const data = await bin.GET("/get").noRetry().json<{ origin: string }>();
   console.log(`    → GET().noRetry(): ${data.origin}`);
-  assert.ok(typeof data.origin === "string");
+  assert.equal(typeof data.origin, "string");
 });
 
 await test("client.GET().retry() configures retry", async () => {
   const data = await bin.GET("/get").retry(2, { baseDelayMs: 100 }).json<{ origin: string }>();
   console.log(`    → GET().retry(2): ${data.origin}`);
-  assert.ok(typeof data.origin === "string");
+  assert.equal(typeof data.origin, "string");
 });
 
 await test("client.GET().maxSize() sets response size limit", async () => {
@@ -263,19 +266,20 @@ await test("client.GET().http2() requests HTTP/2", async () => {
 await test("client.GET().http1() requests HTTP/1.1", async () => {
   const res = await bin.GET("/get").http1().send();
   console.log(`    → GET().http1(): httpVersion=${res.httpVersion}`);
-  assert.ok(res.httpVersion === "HTTP/1.1" || res.httpVersion === "HTTP/2");
+  assert.equal(res.httpVersion, "HTTP/1.1");
+  assert.equal(res.status, 200);
 });
 
 await test("client.GET().noCache() forces fresh fetch", async () => {
   const data = await bin.GET("/get").noCache().json<{ origin: string }>();
   console.log(`    → GET().noCache(): ${data.origin}`);
-  assert.ok(typeof data.origin === "string");
+  assert.equal(typeof data.origin, "string");
 });
 
 await test("client.GET().tags() adds cache tags", async () => {
   const data = await bin.GET("/get").tags("tag1", "tag2").json<{ origin: string }>();
   console.log(`    → GET().tags(): ${data.origin}`);
-  assert.ok(typeof data.origin === "string");
+  assert.equal(typeof data.origin, "string");
 });
 
 await test("client.GET().meta() attaches metadata", async () => {
@@ -312,46 +316,52 @@ await test("client.subscribe() executes with callbacks", async () => {
 await test("client.POST().withBody() sets raw body", async () => {
   const data = await bin.POST("/post").withBody("raw text content").text();
   console.log(`    → POST().withBody(): length=${data.length}`);
-  assert.ok(data.includes("raw text content"));
+  assert.match(data, /"data":\s*"raw text content"/);
 });
 
 await test("client.GET().data() returns just the data", async () => {
   const data = await bin.GET("/get").data<{ origin: string }>();
   console.log(`    → data(): ${data.origin}`);
-  assert.ok(typeof data.origin === "string");
+  assert.equal(typeof data.origin, "string");
 });
 
 await test("client.GET().blob() returns Blob", async () => {
   const blob = await bin.GET("/bytes/100").blob();
   console.log(`    → blob(): size=${blob.size}, type=${blob.type}`);
   assert.ok(blob instanceof Blob);
-  assert.ok(blob.size > 0);
+  assert.equal(blob.size, 100);
+  assert.equal(new Uint8Array(await blob.arrayBuffer()).length, 100);
 });
 
 await test("client.GET().onUploadProgress() callback is called", async () => {
-  let progressCalled = false;
-  const data = await bin
-    .GET("/get")
+  const loaded: number[] = [];
+  const res = await bin
+    .POST("/post")
+    .withBody(new Uint8Array(2048).fill(65))
     .onUploadProgress((event) => {
-      progressCalled = true;
+      loaded.push(event.loaded);
       console.log(`    → upload progress: ${event.loaded} bytes`);
     })
-    .json<{ origin: string }>();
-  console.log(`    → onUploadProgress called: ${progressCalled}`);
-  assert.ok(typeof data.origin === "string");
+    .send();
+  console.log(`    → onUploadProgress events: ${loaded.length}`);
+  assert.equal(res.status, 200);
+  assert.equal(loaded.length > 0, true, "onUploadProgress must fire for a body-bearing request");
+  assert.equal(loaded[loaded.length - 1], 2048);
 });
 
 await test("client.GET().onDownloadProgress() callback is called", async () => {
-  let progressCalled = false;
-  const data = await bin
-    .GET("/get")
+  const loaded: number[] = [];
+  const res = await bin
+    .GET("/bytes/2048")
     .onDownloadProgress((event) => {
-      progressCalled = true;
+      loaded.push(event.loaded);
       console.log(`    → download progress: ${event.loaded} bytes`);
     })
-    .json<{ origin: string }>();
-  console.log(`    → onDownloadProgress called: ${progressCalled}`);
-  assert.ok(typeof data.origin === "string");
+    .send();
+  console.log(`    → onDownloadProgress events: ${loaded.length}`);
+  assert.equal(res.status, 200);
+  assert.equal(loaded.length > 0, true, "onDownloadProgress must fire");
+  assert.equal(loaded[loaded.length - 1], 2048);
 });
 
 await test("client.GET().withForm() sets FormData body", async () => {
@@ -365,7 +375,8 @@ await test("client.GET().withForm() sets FormData body", async () => {
 await test("meta.traceId generates traceparent header without error", async () => {
   const res = await bin.GET("/get").meta({ traceId: "test-trace-123" }).send();
   console.log(`    → meta with traceId: sent successfully`);
-  assert.ok(res.request.meta?.traceId !== undefined);
+  assert.equal(res.request.meta?.traceId, "test-trace-123");
+  assert.equal(res.status, 200);
 });
 
 await test("retry with onRetry callback", async () => {
@@ -382,7 +393,15 @@ await test("retry with onRetry callback", async () => {
   });
   const res = await client.get("/status/503", { throwOnError: false });
   console.log(`    → retry onStatus: status=${res.status}, retries=${retryInfo.length}`);
-  assert.ok(retryInfo.length > 0);
+  assert.equal(res.status, 503);
+  assert.deepEqual(
+    retryInfo.map((r) => r.attempt),
+    [1, 2],
+  );
+  assert.equal(
+    retryInfo.every((r) => r.delayMs >= 0),
+    true,
+  );
 });
 
 await test("retry with shouldRetry custom function", async () => {
@@ -401,23 +420,31 @@ await test("retry with shouldRetry custom function", async () => {
 });
 
 await test("onError hook is called on error", async () => {
+  let hookCalls = 0;
+  let hookError: unknown;
   const client = kinetex({
     baseURL: "https://httpbin.org",
     timeout: T,
     hooks: {
       onError: [
         async (err) => {
-          console.log(`    → onError hook: ${err.message}`);
+          hookCalls++;
+          hookError = err;
         },
       ],
     },
   });
   try {
     await client.get("/status/500");
-  } catch {
-    /* expected */
+  } catch (err) {
+    // A 5xx must surface as an HTTPStatusError carrying the response.
+    assert.ok(err instanceof HTTPStatusError, `expected HTTPStatusError, got ${String(err)}`);
+    assert.equal((err as HTTPStatusError).status, 500);
   }
-  console.log(`    → onError hook: executed`);
+  // The hook must have fired exactly once, with that same error.
+  assert.equal(hookCalls, 1, "onError hook must fire exactly once");
+  assert.ok(hookError instanceof Error, "onError hook must receive an Error");
+  client.destroy();
 });
 
 await test("onSuccess hook is called on success", async () => {
@@ -519,10 +546,20 @@ await test("retry with already aborted signal throws", async () => {
     await client.get("/delay/1", { signal: controller.signal });
   } catch (err: unknown) {
     caughtErr = err;
-    threw = err instanceof Error && (err.name === "AbortError" || err.constructor.name === "DOMException");
-    console.log(`    → already aborted signal: ${err instanceof Error ? err.constructor.name : typeof err}`);
+    threw =
+      err instanceof Error &&
+      (err.name === "AbortError" || err.constructor.name === "DOMException");
+    console.log(
+      `    → already aborted signal: ${err instanceof Error ? err.constructor.name : typeof err}`,
+    );
   }
-  assert.ok(threw, `Expected AbortError or DOMException but got: ${caughtErr instanceof Error ? caughtErr.constructor.name : typeof caughtErr}`);
+  assert.equal(
+    threw,
+    true,
+    `Expected AbortError or DOMException but got: ${caughtErr instanceof Error ? caughtErr.constructor.name : typeof caughtErr}`,
+  );
+  assert.equal((caughtErr as Error).name, "AbortError");
+  assert.equal((caughtErr as Error).message, "Aborted");
 });
 
 await test("client.GET().proxy() fails fast (proxy is not wired into transports)", async () => {
@@ -603,14 +640,23 @@ await test("abort during retry delay", async () => {
   // Abort after first failure but before first retry
   setTimeout(() => controller.abort(), 150);
 
+  let caught: any = null;
   try {
     await client.get("/status/503", {
       signal: controller.signal,
       throwOnError: false,
     });
   } catch (err: any) {
-    console.log(`    → abort during retry: ${err.name || "Error"}`);
+    caught = err;
   }
+  // Aborting mid-retry must reject rather than resolving normally.
+  assert.ok(caught, "aborting during the retry delay must reject");
+  // The contract is the EABORT code, not the exported AbortError class: the
+  // retry-sleep path raises a KinetexError. Assert on the stable contract so
+  // a change of error class is caught here rather than silently tolerated.
+  assert.ok(caught instanceof KinetexError, `expected KinetexError, got ${String(caught)}`);
+  assert.equal(caught.code, "EABORT");
+  assert.equal(caught.isAbort, true);
   client.destroy();
 });
 
@@ -677,7 +723,14 @@ await test("client with throwOnError:true config throws on error", async () => {
     threw = err instanceof Error;
   }
   console.log(`    → throwOnError:true config threw: ${threw}`);
-  assert.ok(threw, `Expected an Error to be thrown but got: ${caughtErr instanceof Error ? caughtErr.constructor.name : typeof caughtErr}`);
+  assert.equal(
+    threw,
+    true,
+    `Expected an Error to be thrown but got: ${caughtErr instanceof Error ? caughtErr.constructor.name : typeof caughtErr}`,
+  );
+  assert.equal(caughtErr instanceof HTTPStatusError, true);
+  assert.equal((caughtErr as HTTPStatusError).code, "EHTTPSTATUS");
+  assert.equal((caughtErr as HTTPStatusError).response?.status, 500);
   client.destroy();
 });
 
@@ -812,7 +865,7 @@ await test("useError interceptor receives error", async () => {
     /* expected */
   }
   console.log(`    → error interceptor: capturedError length=${capturedError.length}`);
-  assert.ok(capturedError.length > 0);
+  assert.equal(capturedError.startsWith("HTTP 404"), true, `Unexpected message: ${capturedError}`);
 });
 
 await test("eject() removes interceptor", async () => {
@@ -905,12 +958,8 @@ await test("array params sent as repeated keys", async () => {
     .params({ tag: ["a", "b", "c"] })
     .json<{ args: Record<string, string> }>();
   console.log(`    → array params: ${JSON.stringify(data.args)}`);
-  // httpbin repeats params as comma-separated
-  assert.ok(
-    data.args["tag"]?.includes("a") &&
-      data.args["tag"]?.includes("b") &&
-      data.args["tag"]?.includes("c"),
-  );
+  // httpbin echoes repeated keys as an array
+  assert.deepEqual(data.args["tag"] as unknown, ["a", "b", "c"]);
 });
 
 // ============================================================================
@@ -978,7 +1027,8 @@ await test("retry on network error when onNetworkError=true", async () => {
   });
   const res = await client.get("/status/500", { throwOnError: false });
   console.log(`    → network retry: status=${res.status}`);
-  assert.ok(res.status >= 200, `status ${res.status} should be >= 200`);
+  assert.equal(res.status, 500);
+  assert.equal(res.attempt, 2, "maxRetries: 1 means exactly 2 attempts");
 });
 
 // ============================================================================
@@ -990,14 +1040,15 @@ suite("Response Properties");
 await test("response.durationMs is accurate", async () => {
   const res = await bin.get("/get");
   console.log(`    → durationMs: ${res.durationMs}ms`);
-  assert.ok(res.durationMs > 0);
-  assert.ok(res.durationMs < 30_000);
+  assert.equal(typeof res.durationMs, "number");
+  assert.equal(res.durationMs > 0 && res.durationMs < 30_000, true);
+  assert.equal(res.status, 200);
 });
 
 await test("response.headers contains all headers", async () => {
   const res = await bin.get("/get");
   console.log(`    → content-type: ${res.headers["content-type"]}`);
-  assert.ok(typeof res.headers["content-type"] === "string");
+  assert.match(res.headers["content-type"], /^application\/json/);
 });
 
 await test("response.request reflects sent request", async () => {
@@ -1016,7 +1067,12 @@ await test("response.cached is false for normal requests", async () => {
 await test("response.httpVersion is set", async () => {
   const res = await bin.get("/get");
   console.log(`    → httpVersion: ${res.httpVersion}`);
-  assert.ok(res.httpVersion === "HTTP/1.1" || res.httpVersion === "HTTP/2");
+  assert.equal(
+    ["HTTP/1.1", "HTTP/2"].includes(res.httpVersion),
+    true,
+    `Unexpected: ${res.httpVersion}`,
+  );
+  assert.equal(res.status, 200);
 });
 
 // ============================================================================
@@ -1170,12 +1226,10 @@ await test("GET /posts returns posts", async () => {
   console.log(
     `    → GET /posts: status=${r.status}, count=${Array.isArray(r.data) ? r.data.length : "not array"}`,
   );
-  if (r.status === 200 && Array.isArray(r.data)) {
-    assert.ok(r.data.length > 0);
-    assert.ok(typeof r.data[0].id === "number");
-  } else {
-    console.log(`    → Note: API returned status ${r.status}, skipping assertion`);
-  }
+  assert.equal(r.status, 200);
+  assert.equal(Array.isArray(r.data), true);
+  assert.equal(r.data.length, 100);
+  assert.equal(typeof r.data[0].id, "number");
 });
 
 await test("GET /posts/1 returns single post", async () => {
@@ -1195,9 +1249,9 @@ await test("POST creates new post", async () => {
     { headers: { "content-type": "application/json" }, throwOnError: false },
   );
   console.log(`    → POST: status=${r.status}`);
-  if (r.status === 201) {
-    assert.ok(r.data.id > 0);
-  }
+  assert.equal(r.status, 201);
+  assert.equal(r.data.id > 0, true);
+  assert.equal(r.data.title, "test");
 });
 
 await test("PUT replaces post", async () => {
@@ -1216,7 +1270,7 @@ await test("DELETE returns success", async () => {
   const r = await json.delete("/posts/1", { throwOnError: false });
   console.log(`    → DELETE: status=${r.status}`);
   // DELETE should succeed
-  assert.ok(r.status === 200 || r.status === 204);
+  assert.equal([200, 204].includes(r.status), true, `Unexpected DELETE status ${r.status}`);
 });
 
 await test("GET /users/1/posts returns user's posts", async () => {
@@ -1224,10 +1278,13 @@ await test("GET /users/1/posts returns user's posts", async () => {
     throwOnError: false,
   });
   console.log(`    → nested: status=${r.status}`);
-  if (r.status === 200 && Array.isArray(r.data)) {
-    assert.ok(r.data.length > 0);
-    assert.ok(r.data.every((p) => p.userId === 1));
-  }
+  assert.equal(r.status, 200);
+  assert.equal(Array.isArray(r.data), true);
+  assert.equal(r.data.length, 10);
+  assert.equal(
+    r.data.every((p) => p.userId === 1),
+    true,
+  );
 });
 
 // ============================================================================
@@ -1300,7 +1357,7 @@ await test("client.paginate() with jsonplaceholder", async () => {
       if (pageCount >= 2) break;
     }
     console.log(`    → paginate pages: ${pageCount}`);
-    assert.ok(pageCount >= 2);
+    assert.equal(pageCount, 2);
   } catch (err) {
     console.log(`    → paginate error: ${err}`);
     throw err;
@@ -1334,17 +1391,27 @@ await test("client.paginate() with maxPages limit", async () => {
 
 await test("client.ws() connects to WebSocket server", async () => {
   const client = kinetex({ baseURL: "wss://ws.postman-echo.com", timeout: 10000 });
+  let ws;
   try {
-    const ws = await client.ws("/raw");
-    console.log(`    → ws connected: true`);
-    ws.send("Hello");
-    ws.close();
-    console.log(`    → ws sent and closed`);
+    ws = await client.ws("/raw");
   } catch (err: any) {
-    console.log(`    → ws error: ${err.message.slice(0, 50)}`);
+    // Only an SSRF guard rejection is an environmental skip (the sandbox DNS
+    // resolves the public host to a private address). Anything else is a bug
+    // and must fail the test.
+    if (String(err?.message ?? "").includes("safety check")) {
+      console.log("    ⚠ skipped: sandbox SSRF guard blocks this public host");
+      client.destroy();
+      return;
+    }
+    throw err;
   }
+  assert.equal(ws.connected, true, "socket must report connected");
+  assert.equal(ws.state, "OPEN");
+  // Must survive a real send/close round trip without throwing.
+  ws.send("Hello");
+  ws.close();
+  assert.equal(ws.closed, true, "close() must mark the socket closed");
   client.destroy();
-  console.log(`    → ws test completed`);
 });
 
 await test("client.graphql() creates GraphQL client", async () => {

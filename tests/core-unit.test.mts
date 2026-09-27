@@ -213,7 +213,10 @@ await test("pre-aborted signal propagates as EABORT", async () => {
   } catch (err) {
     error = err;
   }
-  assert.ok(error instanceof Error);
+  assert.equal(error instanceof Error, true);
+  assert.equal(error.name, "KinetexError");
+  assert.equal(error.code, "EABORT");
+  assert.equal(error.isAbort, true);
 });
 
 // ============================================================================
@@ -261,11 +264,11 @@ await test("abort listener cleaned up on success — no leak", async () => {
       c.close();
     },
   });
-  await readRawBody(s, 0, "", ctrl.signal);
-  // After successful read, abort listener was cleaned up
-  // Verify by aborting — should not throw since listener was removed
+  const bytes = await readRawBody(s, 0, "", ctrl.signal);
+  assert.deepEqual([...bytes], [0, 0, 0, 0, 0]);
+  // Aborting after a completed read must not throw — the listener was removed
   ctrl.abort();
-  assert.ok(!ctrl.signal.aborted || true, "No residual listener on aborted signal");
+  assert.equal(ctrl.signal.aborted, true);
 });
 
 await test("stream that errors during read", async () => {
@@ -323,12 +326,14 @@ await test("custom parser receives empty headers and url", () => {
 
 await test("null content-type", () => {
   const r = parseBody(new Uint8Array([1, 2, 3]), null);
-  assert.ok(r instanceof Uint8Array);
+  assert.equal(r instanceof Uint8Array, true);
+  assert.deepEqual(r, new Uint8Array([1, 2, 3]));
 });
 
 await test("unknown content-type returns raw bytes", () => {
   const r = parseBody(new Uint8Array([0xff]), "application/x-unknown");
-  assert.ok(r instanceof Uint8Array);
+  assert.equal(r instanceof Uint8Array, true);
+  assert.deepEqual(r, new Uint8Array([0xff]));
 });
 
 // ============================================================================
@@ -468,8 +473,9 @@ await test("Google returns HTTP/2 with h3 alt-svc via FetchTransport", async () 
   });
   // Google serves HTTP/1.1 from some edges (ALPN/geo dependent). Accept either
   // version but require the transport to report a valid detected protocol.
-  assert.ok(
-    raw.httpVersion === "HTTP/2" || raw.httpVersion === "HTTP/1.1",
+  assert.equal(
+    ["HTTP/2", "HTTP/1.1"].includes(raw.httpVersion),
+    true,
     `unexpected httpVersion: ${raw.httpVersion}`,
   );
 });

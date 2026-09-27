@@ -276,42 +276,65 @@ export function withUploadProgress(
     });
   }
 
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const reader = source.getReader();
+  // PULL-BASED, not start()-based. The old implementation drained the whole
+  // source inside start(), enqueueing every chunk before the transport read a
+  // single byte — a large upload was fully buffered in memory and the
+  // ReadableStream highWaterMark bought nothing. pull() reads one chunk per
+  // demand, so backpressure reaches the source.
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let onUploadAbort: (() => void) | null = null;
 
+  const detach = (): void => {
+    if (onUploadAbort) {
+      options.signal?.removeEventListener("abort", onUploadAbort);
+      onUploadAbort = null;
+    }
+  };
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
       // Handle already-aborted signal immediately
       if (options.signal?.aborted) {
-        reader.cancel("aborted").catch(() => {});
         controller.error(new DOMException("Upload aborted", "AbortError"));
         return;
       }
-
-      const onUploadAbort = () => {
-        reader.cancel("aborted").catch(() => {});
+      reader = source.getReader();
+      onUploadAbort = () => {
+        const r = reader;
+        reader = null;
+        void r?.cancel("aborted").catch(() => {});
+        tracker.complete();
         controller.error(new DOMException("Upload aborted", "AbortError"));
       };
-      // Removed in the stream's finally block so repeated uploads sharing one
-      // signal do not accumulate listeners (leak fix).
+      // Removed in detach() on close/cancel/error so repeated uploads sharing
+      // one signal do not accumulate listeners (leak fix).
       options.signal?.addEventListener("abort", onUploadAbort, { once: true });
-
+    },
+    async pull(controller) {
+      if (!reader) return;
       try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            tracker.complete();
-            controller.close();
-            break;
-          }
-          tracker.update(value.byteLength);
-          controller.enqueue(value);
+        const { done, value } = await reader.read();
+        if (done) {
+          detach();
+          reader.releaseLock();
+          reader = null;
+          tracker.complete();
+          controller.close();
+          return;
         }
+        tracker.update(value.byteLength);
+        controller.enqueue(value);
       } catch (err) {
+        detach();
         tracker.complete();
         controller.error(err);
-      } finally {
-        options.signal?.removeEventListener("abort", onUploadAbort);
       }
+    },
+    cancel(reason) {
+      detach();
+      const r = reader;
+      reader = null;
+      void r?.cancel(reason).catch(() => {});
     },
   });
 
@@ -358,44 +381,66 @@ export function withDownloadProgress(
 
   const body = response.body;
 
-  const trackedStream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const reader = body.getReader();
-      let aborted = false;
+  // PULL-BASED for the same reason as withUploadProgress: the start()-based
+  // version buffered the entire download in memory before the consumer read it.
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let aborted = false;
+  let onAbort: (() => void) | null = null;
 
-      const onAbort = () => {
+  const detach = (): void => {
+    if (onAbort) {
+      options.signal?.removeEventListener("abort", onAbort);
+      onAbort = null;
+    }
+  };
+
+  const trackedStream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      if (options.signal?.aborted) {
+        aborted = true;
+        controller.error(new DOMException("Download aborted", "AbortError"));
+        return;
+      }
+      reader = body.getReader();
+      onAbort = () => {
         if (aborted) return;
         aborted = true;
+        const r = reader;
+        reader = null;
         // Ensure tracker knows we're aborting (don't wait for complete)
-        reader.cancel("aborted").catch(() => {});
+        void r?.cancel("aborted").catch(() => {});
         controller.error(new DOMException("Download aborted", "AbortError"));
       };
-
       options.signal?.addEventListener("abort", onAbort, { once: true });
-
+    },
+    async pull(controller) {
+      if (!reader) return;
       try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            tracker.complete();
-            controller.close();
-            break;
-          }
-          tracker.update(value.byteLength);
-          controller.enqueue(value);
+        const { done, value } = await reader.read();
+        if (done) {
+          detach();
+          reader.releaseLock();
+          reader = null;
+          tracker.complete();
+          controller.close();
+          return;
         }
+        tracker.update(value.byteLength);
+        controller.enqueue(value);
       } catch (err) {
+        detach();
         // Ensure tracker is marked as complete even on error
         if (!aborted) {
           tracker.complete();
         }
         controller.error(err);
-      } finally {
-        // Remove abort listener if not already triggered
-        if (!aborted) {
-          options.signal?.removeEventListener("abort", onAbort);
-        }
       }
+    },
+    cancel(reason) {
+      detach();
+      const r = reader;
+      reader = null;
+      void r?.cancel(reason).catch(() => {});
     },
   });
 
@@ -404,6 +449,21 @@ export function withDownloadProgress(
     statusText: response.statusText,
     headers: response.headers,
   });
+
+  // A reconstructed Response reports url === "" and redirected === false, which
+  // silently broke anything downstream that reads them. `url` and `redirected`
+  // are prototype getters, so shadow them with own properties on the instance.
+  for (const prop of ["url", "redirected", "type"] as const) {
+    try {
+      Object.defineProperty(trackedResponse, prop, {
+        value: (response as unknown as Record<string, unknown>)[prop],
+        enumerable: true,
+        configurable: true,
+      });
+    } catch {
+      /* non-configurable in this runtime — leave the default in place */
+    }
+  }
 
   return { response: trackedResponse, tracker };
 }
@@ -710,8 +770,7 @@ type _XMLHttpRequest = {
   getAllResponseHeaders(): string;
 };
 const _XHR = (globalThis as Record<string, unknown>)["XMLHttpRequest"] as
-  | (new () => _XMLHttpRequest)
-  | undefined;
+  (new () => _XMLHttpRequest) | undefined;
 
 /**
  * Fetch implementation using XMLHttpRequest for browsers that don't support
@@ -797,17 +856,24 @@ export function xhrFetch(
       });
     }
 
-    // Abort signal
-    options.signal?.addEventListener(
-      "abort",
-      () => {
-        xhr.abort();
-        reject(new DOMException("Request aborted", "AbortError"));
-      },
-      { once: true },
-    );
+    // Abort signal. The listener is detached on settle: with `{ once: true }`
+    // it only self-removes when it actually fires, so a caller reusing one
+    // signal across many xhrFetch calls accumulated listeners — and each one
+    // kept the whole XHR + promise closures alive after the request finished.
+    const onAbort = () => {
+      xhr.abort();
+      reject(new DOMException("Request aborted", "AbortError"));
+    };
+    const detach = () => options.signal?.removeEventListener("abort", onAbort);
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) {
+      detach();
+      onAbort();
+      return;
+    }
 
     xhr.addEventListener("load", () => {
+      detach();
       downloadTracker.complete();
 
       // Parse response headers
@@ -829,11 +895,19 @@ export function xhrFetch(
     });
 
     xhr.addEventListener("error", () => {
+      detach();
       reject(new TypeError("Network request failed"));
     });
 
     xhr.addEventListener("timeout", () => {
+      detach();
       reject(new TypeError("Request timed out"));
+    });
+
+    xhr.addEventListener("abort", () => {
+      // Covers aborts initiated from inside the XHR (not via the signal).
+      detach();
+      reject(new DOMException("Request aborted", "AbortError"));
     });
 
     xhr.send(options.body ?? null);

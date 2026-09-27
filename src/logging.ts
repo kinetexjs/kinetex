@@ -1030,7 +1030,7 @@ export class HTTPLogger {
    * ```ts
    * const logger = createProductionLogger();
    * const child = logger.child({ requestId: "req-123", userId: "user-456" });
-   * child.logRequest(...); // Logs will include both requestId and userId
+   * child.logRequest("req-123", "GET", "/users", {}, null, 1); // Logs include both requestId and userId
    * ```
    */
   child(context: Record<string, unknown>): HTTPLogger {

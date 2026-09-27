@@ -606,7 +606,7 @@ await test("createCircuitBreaker returns CircuitBreaker", async () => {
 
 await test("createCircuitBreakerRegistry returns CircuitBreakerRegistry", async () => {
   const r = createCircuitBreakerRegistry({ failureThreshold: 3 });
-  assert.ok(r instanceof CircuitBreakerRegistry);
+  assert.equal(r instanceof CircuitBreakerRegistry, true);
 });
 
 // ============================================================================

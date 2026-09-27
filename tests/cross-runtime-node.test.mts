@@ -68,7 +68,7 @@ async function main() {
 
   await test("NodeHTTP2Transport can be constructed and destroyed", () => {
     const t = new NodeHTTP2Transport({ sessionTTLMs: 100, pingIntervalMs: 0 });
-    assert.ok(t instanceof NodeHTTP2Transport);
+    assert.equal(t instanceof NodeHTTP2Transport, true);
     t.destroy();
     t.destroy();
   });

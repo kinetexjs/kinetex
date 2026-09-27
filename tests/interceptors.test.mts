@@ -46,10 +46,35 @@ suite("REAL HTTP");
 await test("GET /get", async () => assert.equal((await bin.get("/get")).status, 200));
 await test("POST echoes JSON", async () =>
   assert.deepEqual((await bin.post("/post", { a: 1 })).data.json, { a: 1 }));
-await test("/uuid", async () => assert.ok((await bin.get("/uuid")).data.uuid));
-await test("/ip", async () => assert.ok((await bin.get("/ip")).data.origin));
-await test("/headers", async () => assert.ok((await bin.get("/headers")).data.headers));
-await test("/json", async () => assert.ok((await bin.get("/json")).data.slideshow));
+test("/uuid", async () => {
+  const res = await bin.get("/uuid");
+  assert.equal(res.status, 200);
+  // Must be a well-formed v4 UUID, not merely a truthy string.
+  assert.match(
+    res.data.uuid,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+  );
+});
+test("/ip", async () => {
+  const res = await bin.get("/ip");
+  assert.equal(res.status, 200);
+  assert.match(res.data.origin, /^[0-9a-f:.]+$/i);
+});
+test("/headers", async () => {
+  const res = await bin.get("/headers");
+  assert.equal(res.status, 200);
+  assert.equal(typeof res.data.headers, "object");
+  // httpbin echoes the request headers it received; Host is always present
+  // and proves the request actually carried headers end to end.
+  assert.ok(res.data.headers["Host"], "expected the Host header to be echoed");
+  assert.equal(typeof res.data.headers["Host"], "string");
+});
+test("/json", async () => {
+  const res = await bin.get("/json");
+  assert.equal(res.status, 200);
+  assert.equal(typeof res.data.slideshow, "object");
+  assert.ok(Array.isArray(res.data.slideshow.slides), "expected slideshow.slides to be an array");
+});
 await test("/base64", async () =>
   assert.equal(String((await bin.get("/base64/SGVsbG8gV29ybGQ=")).data).trim(), "Hello World"));
 
@@ -224,9 +249,10 @@ await test("logging fires", async () => {
   const logs: string[] = [];
   const m = new InterceptorManager();
   const logging = createLoggingInterceptor({
-    log: (msg: any) => {
-      console.log("    LOG:", JSON.stringify(msg));
-      logs.push(String(msg));
+    // The option is `logger`, not `log` — passing `log` silently fell back to
+    // the default console logger, which the old weak assertion accepted.
+    logger: (entry) => {
+      logs.push(JSON.stringify(entry));
     },
   });
   m.useRequest(logging.requestInterceptor);
@@ -236,10 +262,10 @@ await test("logging fires", async () => {
     async () => await bin.get("/get"),
   );
   console.log("    Logs count:", logs.length, "Response status:", res.status);
-  assert.ok(
-    logs.length >= 1 || res.status === 200,
-    `Expected >= 1 log or status 200, got logs=${logs.length} status=${res.status}`,
-  );
+  // `>= 1 || status === 200` is satisfied by a successful call alone, so it
+  // would pass even if the logging interceptor never fired. Require the log.
+  assert.equal(res.status, 200);
+  assert.ok(logs.length >= 1, `Expected >= 1 log, got ${logs.length}`);
 });
 
 // ── HAR INTERCEPTOR with real HTTP ───────────────────────────────────────
@@ -251,7 +277,15 @@ await test("HAR records entries", async () => {
   client.useResponse(har.responseInterceptor);
   await client.get("/get");
   await client.get("/uuid");
-  assert.ok(har.getHAR().entries.length >= 2);
+  const entries = har.getHAR().entries;
+  // Exactly the two requests made — no duplicates, none dropped.
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0]!.request.url, "https://httpbin.org/get");
+  assert.equal(entries[1]!.request.url, "https://httpbin.org/uuid");
+  for (const e of entries) {
+    assert.equal(e.response.status, 200);
+    assert.ok(e.startedDateTime, "entry must record startedDateTime");
+  }
 });
 
 // ── METRICS INTERCEPTOR with real HTTP ───────────────────────────────────
@@ -407,7 +441,11 @@ await test("cache interceptor SWR and 304 paths", async () => {
     { url: "https://httpbin.org/uuid", method: "GET", headers: {} },
     async () => await bin.get<{ uuid: string }>("/uuid"),
   );
-  assert.ok(r1.data?.uuid);
+  assert.equal(typeof r1.data?.uuid, "string");
+  assert.match(
+    r1.data?.uuid as string,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+  );
 });
 
 // Rate-limit interval cleanup (lines 1175-1177): mock setTimeout to fire once
@@ -437,7 +475,10 @@ await test("HAR records with string body via execute", async () => {
     },
     async () => await bin.post("/post", "test-body", { headers: { "content-type": "text/plain" } }),
   );
-  assert.ok(har.getHAR().entries.length >= 1);
+  const entries = har.getHAR().entries;
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].request.method, "POST");
+  assert.equal(new URL(entries[0].request.url).pathname, "/post");
 });
 await test("rate limit queues excess", async () => {
   const m = new InterceptorManager();
@@ -448,7 +489,7 @@ await test("rate limit queues excess", async () => {
     m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, dispatcher),
     m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, dispatcher),
   ]);
-  assert.ok(results.filter((r) => r.status === "fulfilled").length >= 2);
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 3);
 });
 
 // ── HAR INTERCEPTOR with real HTTP ───────────────────────────────────────
@@ -466,7 +507,12 @@ await test("HAR records entries", async () => {
     { url: "https://httpbin.org/uuid", method: "GET", headers: {} },
     async () => await bin.get("/uuid"),
   );
-  assert.ok(har.getHAR().entries.length >= 2);
+  const entries = har.getHAR().entries;
+  assert.equal(entries.length, 2);
+  assert.deepEqual(
+    entries.map((e) => new URL(e.request.url).pathname),
+    ["/get", "/uuid"],
+  );
 });
 
 // ── METRICS INTERCEPTOR with real HTTP ───────────────────────────────────
@@ -574,9 +620,10 @@ await test("cache 304 response is handled", async () => {
     { url: "https://httpbin.org/get", method: "GET", headers: {} },
     dispatcher,
   );
-  // The 304 response may be returned as-is if the stale entry restoration doesn't apply
-  // This is acceptable — the code path is exercised
-  assert.ok(r2.status === 304 || r2.status === 200);
+  // A 304 without a matching cached entry is surfaced as-is (no stale restoration)
+  assert.equal(r2.status, 304);
+  assert.equal(r2.cached, false);
+  assert.equal(callNum, 2, "the second execute must revalidate rather than serve the entry");
 });
 
 // ── RATE-LIMIT INTERCEPTOR with real HTTP ────────────────────────────────
@@ -597,14 +644,27 @@ await test("rate limit queues excess requests", async () => {
     client.get("/get"),
     client.get("/get"),
   ]);
-  assert.ok(results.filter((r) => r.status === "fulfilled").length >= 2);
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 4);
 });
 
 // ── INTERCEPTOR SUITE ────────────────────────────────────────────────────
 suite("Interceptor suite");
 await test("suite creates manager", () => {
   const s = createInterceptorSuite({ timeout: { timeoutMs: 5000 }, retry: { maxRetries: 1 } });
-  assert.ok(s.manager instanceof InterceptorManager);
+  assert.equal(s.manager instanceof InterceptorManager, true);
+  assert.deepEqual(Object.keys(s), [
+    "manager",
+    "retry",
+    "auth",
+    "timeout",
+    "logging",
+    "cache",
+    "dedupe",
+    "har",
+    "metrics",
+  ]);
+  assert.equal(s.auth, null, "no auth config means no auth interceptor");
+  assert.equal(s.timeout.id, "timeout");
 });
 await test("suite with rateLimit config", () => {
   const s = createInterceptorSuite({
@@ -612,7 +672,8 @@ await test("suite with rateLimit config", () => {
     retry: { maxRetries: 1 },
     rateLimit: { limit: 10, windowMs: 1000, queue: true, maxQueue: 5 },
   });
-  assert.ok(s.manager instanceof InterceptorManager);
+  assert.equal(s.manager instanceof InterceptorManager, true);
+  assert.equal(s.rateLimit, undefined, "rateLimit is folded into the manager, not returned");
 });
 await test("suite with auth config", () => {
   const s = createInterceptorSuite({
@@ -620,7 +681,10 @@ await test("suite with auth config", () => {
     retry: { maxRetries: 1 },
     auth: { type: "bearer", token: "test" },
   });
-  assert.ok(s.manager instanceof InterceptorManager);
+  assert.equal(s.manager instanceof InterceptorManager, true);
+  assert.equal(s.auth !== null, true, "auth config must produce an auth interceptor");
+  assert.equal(typeof s.auth?.requestInterceptor, "function");
+  assert.equal(typeof s.auth?.responseInterceptor, "function");
 });
 
 // ── METRICS RESET ───────────────────────────────────────────────────────
@@ -666,7 +730,8 @@ await test("HAR handles Uint8Array request body", async () => {
     async () => await bin.post("/post", { a: 1 }),
   );
   const log = har.getHAR();
-  assert.ok(log.entries.length >= 1);
+  assert.equal(log.entries.length, 1);
+  assert.equal(log.entries[0].request.method, "POST");
 });
 await test("HAR handles ArrayBuffer request body", async () => {
   const har = createHARInterceptor();
@@ -684,7 +749,8 @@ await test("HAR handles ArrayBuffer request body", async () => {
     async () => await bin.post("/post", { b: 2 }),
   );
   const log = har.getHAR();
-  assert.ok(log.entries.length >= 1);
+  assert.equal(log.entries.length, 1);
+  assert.equal(log.entries[0].request.method, "POST");
 });
 await test("HAR handles string request body", async () => {
   const har = createHARInterceptor();
@@ -702,7 +768,8 @@ await test("HAR handles string request body", async () => {
       await bin.post("/post", "plain string", { headers: { "content-type": "text/plain" } }),
   );
   const log = har.getHAR();
-  assert.ok(log.entries.length >= 1);
+  assert.equal(log.entries.length, 1);
+  assert.equal(log.entries[0].request.method, "POST");
 });
 
 // ── Content-Type uppercase fallback (line 1294) ─────────────────────────
@@ -723,7 +790,9 @@ await test("HAR reads uppercase Content-Type", async () => {
     upperHeaders["Content-Type"] = "application/json";
     return { ...r, headers: upperHeaders };
   });
-  assert.ok(har.getHAR().entries.length >= 1);
+  const entries = har.getHAR().entries;
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].response.content.mimeType, "application/json");
 });
 
 // ── Rate-limit interval coverage ────────────────────────────────────────
@@ -742,7 +811,8 @@ await test("rate-limit refill processes queue", async () => {
     m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, dispatcher),
     m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, dispatcher),
   ]);
-  assert.ok(results.filter((r) => r.status === "fulfilled").length >= 1);
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 2);
+  assert.equal(callCount, 2);
 });
 
 // ── ADDITIONAL COVERAGE TESTS ───────────────────────────────────────────
@@ -805,7 +875,13 @@ await test("suite full config works", () => {
     cache: { ttlMs: 1000 },
     logging: { logRequests: true, logResponses: true },
   });
-  assert.ok(s.manager instanceof InterceptorManager);
+  assert.equal(s.manager instanceof InterceptorManager, true);
+  assert.equal(typeof s.har.requestInterceptor, "function");
+  assert.equal(typeof s.metrics.requestInterceptor, "function");
+  assert.equal(typeof s.dedupe.requestInterceptor, "function");
+  assert.equal(typeof s.cache.requestInterceptor, "function");
+  assert.equal(typeof s.logging.requestInterceptor, "function");
+  assert.equal(typeof s.retry.responseInterceptor, "function");
 });
 
 // InterceptorManager use() with null response

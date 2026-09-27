@@ -1153,6 +1153,15 @@ export class WSClient {
   }
 
   private _scheduleRecon(): void {
+    // Clear any pending reconnect first. Two paths can schedule one: the send
+    // -error path (which also calls ws.close(), firing `onclose` → schedule) and
+    // the `onclose` handler itself. Overwriting the handle without clearing it
+    // left the first timer alive, producing a duplicate connection and double
+    // -counted reconnect attempts on every send failure.
+    if (this._reconnTimer) {
+      clearTimeout(this._reconnTimer);
+      this._reconnTimer = null;
+    }
     this._state = "RECONNECTING";
     this._reconnAttempt++;
     const exp = this._reconnectBaseMs * Math.pow(2, this._reconnAttempt - 1);
@@ -1160,16 +1169,12 @@ export class WSClient {
     const delay = Math.floor(capped * (1 + this._reconnectJitter * Math.random()));
     this._cbReconnect?.(this._reconnAttempt, delay);
     this._reconnTimer = setTimeout(() => {
+      this._reconnTimer = null;
       if (!this._aborted) this._doConnect(true).catch(() => {});
     }, delay);
-    // Allow Node.js process to exit even with pending timer
-    if (
-      typeof this._reconnTimer === "object" &&
-      this._reconnTimer !== null &&
-      "unref" in this._reconnTimer
-    ) {
-      (this._reconnTimer as { unref: () => void }).unref();
-    }
+    // NOTE: deliberately NOT unref()'d. `open()` waiters and `for await`
+    // consumers are suspended on this timer, and unref'ing a timer a pending
+    // promise depends on lets Node exit mid-reconnect.
   }
 
   private _tx(data: string | ArrayBuffer): boolean {

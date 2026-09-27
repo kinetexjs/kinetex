@@ -550,9 +550,13 @@ async function main() {
 
   await test("parseCacheControl with non-numeric values for numeric fields", () => {
     const r = parseCacheControl("max-age=abc, s-maxage=def, stale-if-error=!@#");
-    assert.ok(Number.isNaN(r.maxAge));
-    assert.ok(Number.isNaN(r.sMaxAge));
-    assert.ok(Number.isNaN(r.staleIfError));
+    assert.equal(Number.isNaN(r.maxAge), true, `maxAge must be NaN, got ${r.maxAge}`);
+    assert.equal(Number.isNaN(r.sMaxAge), true, `sMaxAge must be NaN, got ${r.sMaxAge}`);
+    assert.equal(
+      Number.isNaN(r.staleIfError),
+      true,
+      `staleIfError must be NaN, got ${r.staleIfError}`,
+    );
   });
 
   await test("parseCacheControl captures unknown directives", () => {
@@ -807,15 +811,10 @@ async function main() {
       priority: "High",
       partitioned: true,
     });
-    assert.ok(serialized.includes("Secure"));
-    assert.ok(serialized.includes("HttpOnly"));
-    assert.ok(serialized.includes("SameSite=Strict"));
-    assert.ok(serialized.includes("SameParty"));
-    assert.ok(serialized.includes("Priority=High"));
-    assert.ok(serialized.includes("Partitioned"));
-    assert.ok(serialized.includes("Path=/app"));
-    assert.ok(serialized.includes("Domain=.example.com"));
-    assert.ok(serialized.includes("Max-Age=3600"));
+    assert.equal(
+      serialized,
+      "s=v; Path=/app; Domain=.example.com; Max-Age=3600; Secure; HttpOnly; SameSite=Strict; SameParty; Priority=High; Partitioned",
+    );
   });
 
   await test("formatSetCookieHeader quotes value with special chars", () => {
@@ -833,7 +832,7 @@ async function main() {
       priority: null,
       partitioned: false,
     });
-    assert.ok(serialized.includes('"'));
+    assert.equal(serialized, 'data="hello world; foo"; Path=/');
   });
 
   suite("Cookies — Domain Matching Edge Cases");
@@ -904,7 +903,10 @@ async function main() {
     const buf = new Uint8Array(256);
     for (let i = 0; i < 256; i++) buf[i] = i;
     const encoded = uint8ArrayToBase64(buf);
-    assert.ok(/^[A-Za-z0-9+/]*=*$/.test(encoded));
+    assert.equal(encoded.length, 344);
+    assert.equal(/^[A-Za-z0-9+/]*=*$/.test(encoded), true);
+    assert.equal(encoded.startsWith("AAECAwQFBgcICQoLDA0O"), true);
+    assert.equal(encoded.endsWith("/P3+/w=="), true);
   });
 
   suite("mergeSignals Edge Cases");

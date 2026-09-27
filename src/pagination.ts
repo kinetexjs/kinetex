@@ -86,13 +86,7 @@ export interface PaginationState {
 
 /** Supported pagination strategies. */
 export type PaginationStrategy =
-  | "offset"
-  | "page"
-  | "cursor"
-  | "relay"
-  | "link-header"
-  | "token"
-  | "keyset";
+  "offset" | "page" | "cursor" | "relay" | "link-header" | "token" | "keyset";
 
 /** Configuration for a generic paginator. All strategies build on this. */
 export interface PaginationConfig<T, R = unknown> {
@@ -917,16 +911,20 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
       r();
       return;
     }
-    const timer = setTimeout(r, ms);
-    if (signal)
-      signal.addEventListener(
-        "abort",
-        () => {
-          clearTimeout(timer);
-          r();
-        },
-        { once: true },
-      );
+    // The listener is removed on the timer path too. With `{ once: true }` it
+    // only self-removes when it FIRES, so a long-lived signal shared by many
+    // paginated requests accumulated one dead listener per completed sleep
+    // (MaxListeners warning + retained closures).
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      r();
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      r();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 

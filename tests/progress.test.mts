@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import {
   collectStream,
   formatBytes,
@@ -143,10 +144,16 @@ await test("throttle limits callbacks", async () => {
   t.update(100);
   t.update(100);
   t.update(100);
+  const afterUpdates = count;
   // complete bypasses throttle
   t.complete();
-  // at most 1 non-final callback
-  assertOk(count >= 1);
+  // three updates inside one throttle window collapse to at most one callback
+  assert.equal(
+    afterUpdates <= 1,
+    true,
+    `throttle must collapse rapid updates, got ${afterUpdates}`,
+  );
+  assert.equal(count, afterUpdates + 1, "complete() must emit a final event");
 });
 
 await test("complete bypasses throttle", async () => {
@@ -168,8 +175,11 @@ await test("ETA calculated when rate > 0 and total known", async () => {
   await delay(50);
   t.update(200);
   const s = t.snapshot();
-  // ETA should be a non-negative number
-  assertOk(s.eta === null || s.eta >= 0);
+  assert.equal(s.loaded, 300);
+  assert.equal(s.total, 10000);
+  assert.equal(s.percent, 3);
+  assert.equal(s.done, false);
+  assert.equal(s.eta !== null && s.eta >= 0, true, `eta must be non-negative, got ${s.eta}`);
 });
 
 await test("zero total yields null percent", async () => {
@@ -264,8 +274,7 @@ await test("with total", async () => {
   const t = new ProgressTracker(1000);
   t.update(456);
   const fp = formatProgress(t.snapshot());
-  assertOk(fp.includes("456 B"));
-  assertOk(fp.includes("45.6%"));
+  assert.match(fp, /^456 B \/ 1000 B \(45\.6%\) @ .+ ETA 0s$/);
 });
 
 await test("without total", async () => {
@@ -360,13 +369,14 @@ await test("with abort signal already aborted", async () => {
   ac.abort();
   const { stream } = withUploadProgress("test", 4, { signal: ac.signal });
   const reader = stream.getReader();
-  let threw = false;
+  let caught: unknown = null;
   try {
     await reader.read();
-  } catch {
-    threw = true;
+  } catch (e) {
+    caught = e;
   }
-  assertOk(threw);
+  assert.equal((caught as Error | null)?.name, "AbortError");
+  assert.equal((caught as Error | null)?.message, "Upload aborted");
 });
 
 await test("with abort signal during stream", async () => {
@@ -387,13 +397,14 @@ await test("with abort signal during stream", async () => {
   const reader = stream.getReader();
   await reader.read(); // first chunk
   ac.abort();
-  let threw = false;
+  let caught: unknown = null;
   try {
     await reader.read();
-  } catch {
-    threw = true;
+  } catch (e) {
+    caught = e;
   }
-  assertOk(threw);
+  assert.equal(caught !== null, true, "aborting mid-stream must reject the pending read");
+  assert.equal((caught as Error).name, "AbortError");
 });
 
 await test("upload error marks tracker complete", async () => {
@@ -434,7 +445,7 @@ await test("intercepts response body", async () => {
 await test("null body marks complete immediately", async () => {
   const res = new Response(null);
   const { tracker } = withDownloadProgress(res);
-  assertOk(tracker.isDone);
+  assert.equal(tracker.isDone, true);
 });
 
 await test("response with content-length", async () => {
@@ -547,14 +558,15 @@ await test("abort signal stops iteration", async () => {
   });
   // Abort before iterating
   ac.abort();
-  let threw = false;
+  let caught: unknown = null;
   try {
     for await (const _ of streamWithProgress(stream, null, { signal: ac.signal })) {
     }
-  } catch {
-    threw = true;
+  } catch (e) {
+    caught = e;
   }
-  assertOk(threw);
+  assert.equal((caught as Error | null)?.name, "AbortError");
+  assert.equal((caught as Error | null)?.message, "Stream aborted");
 });
 
 // ── collectStream ────────────────────────────────────────────────────────
@@ -594,13 +606,14 @@ await test("already aborted signal", async () => {
       c.close();
     },
   });
-  let threw = false;
+  let caught: unknown = null;
   try {
     await collectStream(stream, 1, { signal: ac.signal });
-  } catch {
-    threw = true;
+  } catch (e) {
+    caught = e;
   }
-  assertOk(threw);
+  assert.equal((caught as Error | null)?.name, "AbortError");
+  assert.equal((caught as Error | null)?.message, "Stream aborted");
 });
 
 // ── MultiPartProgressAggregator ──────────────────────────────────────────
@@ -643,7 +656,12 @@ await test("createPartTracker triggers onOverall callback", async () => {
   });
   const t1 = agg.createPartTracker(0, 1000);
   t1.update(100);
-  assertOk(callCount >= 1);
+  assert.equal(callCount, 1);
+  const { parts, overall } = agg.getOverall();
+  assert.equal(parts.length, 2);
+  assert.equal(overall.loaded, 100);
+  assert.equal(overall.percent, 10);
+  assert.equal(overall.done, false);
 });
 
 await test("overall ETA null when rate is 0", async () => {

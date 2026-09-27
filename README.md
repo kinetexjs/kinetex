@@ -1,6 +1,17 @@
-# kinetex
+<div align="center">
+
+<img src="https://raw.githubusercontent.com/GlobalTechInfo/Database/main/images/kinetex.png" alt="kinetex" width="100%" />
+
+[![NPM](https://img.shields.io/npm/v/kinetex.svg)](https://www.npmjs.com/package/kinetex)
+[![JSR](https://jsr.io/badges/@kinetexjs/kinetex)](https://jsr.io/@kinetexjs/kinetex)
+[![codecov](https://codecov.io/gh/kinetexjs/kinetex/branch/main/graph/badge.svg)](https://codecov.io/gh/kinetexjs/kinetex)
+[![Downloads](https://img.shields.io/npm/dw/kinetex?style=flat-square&label=Downloads&color=green)](https://npmjs.com/package/kinetex)
+
+</div>
 
 **Feature-rich, universal TypeScript HTTP client.** Zero dependencies. One codebase, every runtime.
+
+---
 
 ```ts
 import { kinetex } from "kinetex";
@@ -99,6 +110,8 @@ const client = kinetex({ baseURL: "https://jsonplaceholder.typicode.com" });
 
 // Convenience methods
 const users = await client.get<User[]>("/users");
+// A plain object is JSON-encoded automatically (content-type: application/json).
+// Set `content-type` yourself to send the value as an already-prepared body.
 const post = await client.post("/posts", { title: "Hello", body: "World" });
 
 // Fluent builder
@@ -129,24 +142,28 @@ console.log(res.status, res.data, res.headers, res.durationMs);
 ```ts
 const client = kinetex({
   // ── Core ──
-  baseURL: "https://api.example.com/v1",           // Base URL for relative paths
-  headers: { "X-Version": "1.0" },                 // Default headers
-  params: { api_key: "xxx" },                      // Default query params
-  timeout: 10000,                                  // Timeout in ms (default: 30000, 0 = no timeout)
-  httpVersion: "HTTP/2",                           // "HTTP/1.1" | "HTTP/2" (default: "HTTP/2")
-  throwOnError: true,                              // Throw on 4xx/5xx (default: true)
-  followRedirects: true,                           // Follow redirects (default: true)
-  maxRedirects: 10,                                // Max redirects (default: 10)
-  httpsOnly: false,                                // Reject non-HTTPS URLs
-  maxResponseSize: 10_000_000,                     // Response body size limit (0 = no limit)
-  maxRequestSize: 10_000_000,                      // Request body size limit (0 = no limit)
-  strictHeaders: false,                            // Throw on invalid headers vs warn+drop
-  onPipelineTrace: (step) => console.log(step),    // Pipeline observability callback
-  onSWRError: (err, req) => log(err),              // Background SWR revalidation error callback
+  baseURL: "https://api.example.com/v1", // Base URL for relative paths
+  headers: { "X-Version": "1.0" }, // Default headers
+  params: { api_key: "xxx" }, // Default query params
+  timeout: 10000, // Timeout in ms (default: 30000, 0 = no timeout)
+  httpVersion: "HTTP/2", // "HTTP/1.1" | "HTTP/2" (default: "HTTP/2")
+  throwOnError: true, // Throw on 4xx/5xx (default: true)
+  followRedirects: true, // Follow redirects (default: true; false returns the 3xx as-is)
+  maxRedirects: 20, // Max redirect hops (default: 20; 0 disables following)
+  httpsOnly: false, // Reject non-HTTPS URLs
+  maxResponseSize: 10_000_000, // Response body size limit (0 = no limit)
+  maxRequestSize: 10_000_000, // Request body size limit (0 = no limit)
+  strictHeaders: false, // Throw on invalid headers vs warn+drop
+  onPipelineTrace: (step) => console.log(step), // Pipeline observability callback
+  onSWRError: (err, req) => log(err), // Background SWR revalidation error callback
 
   // ── Auth ──
   auth: { type: "bearer", token: "..." },
-  awsSigning: { credentials: {...}, region: "...", service: "..." },
+  awsSigning: {
+    credentials: { accessKeyId: "AKID", secretAccessKey: "secret" },
+    region: "us-east-1",
+    service: "s3",
+  },
 
   // ── Retry ──
   retry: { maxRetries: 3, baseDelayMs: 300, statuses: [408, 429, 500, 502, 503, 504] },
@@ -161,45 +178,77 @@ const client = kinetex({
   // proxy: { url: "socks5://127.0.0.1:1080" },  // → throws with guidance
 
   // ── Cache ──
-  cache: { storage: "memory", ttlMs: 60_000, maxEntries: 1000, swr: true },
+  cache: { maxEntries: 500, defaultTtlMs: 60_000 }, // see "Caching" for the full CacheConfig
 
   // ── Cookie Jar ──
-  cookieJar: true,                                 // Auto-manage cookies
+  cookieJar: true, // Auto-manage cookies
 
   // ── Logging ──
   logger: { level: "info" },
 
   // ── HAR Recording ──
-  har: true,                                       // Enable HTTP Archive recording
+  har: true, // Enable HTTP Archive recording
 
   // ── Interceptors ──
   interceptors: {
-    request:  [myReqInterceptor],
+    request: [myReqInterceptor],
     response: [myResInterceptor],
-    error:    [myErrInterceptor],
+    error: [myErrInterceptor],
   },
 
   // ── Lifecycle Hooks ──
   hooks: {
-    onBeforeRequest:    [(req, ctx) => { ... }],
-    onAfterRequest:     [(req, ctx) => { ... }],
-    onBeforeResponse:   [(res, ctx) => { ... }],
-    onAfterResponse:    [(res, ctx) => { ... }],
-    onError:            [(err, ctx) => { ... }],
-    onRetry:            [(ctx) => { ... }],
-    onUploadProgress:   [(ev) => { ... }],
-    onDownloadProgress: [(ev) => { ... }],
+    onBeforeRequest: [
+      (req, ctx) => {
+        /* ... */
+      },
+    ],
+    onAfterRequest: [
+      (req, ctx) => {
+        /* ... */
+      },
+    ],
+    onBeforeResponse: [
+      (res, ctx) => {
+        /* ... */
+      },
+    ],
+    onAfterResponse: [
+      (res, ctx) => {
+        /* ... */
+      },
+    ],
+    onError: [
+      (err, ctx) => {
+        /* ... */
+      },
+    ],
+    onRetry: [
+      (ctx) => {
+        /* ... */
+      },
+    ],
+    onUploadProgress: [
+      (ev) => {
+        /* ... */
+      },
+    ],
+    onDownloadProgress: [
+      (ev) => {
+        /* ... */
+      },
+    ],
   },
 
   // ── Response/Request Transforms ──
-  transformResponse: (data, res) => data,           // Global response transformer
-  transformRequest: (req) => req,                   // Global request transformer
+  transformResponse: (data, res) => data, // Global response transformer
+  transformRequest: (req) => req, // Global request transformer
 
   // ── Circuit Breaker Key ──
   circuitBreakerKeyFn: (req) => `${req.method}:${new URL(req.url).origin}`,
 
   // ── Custom fetch ──
-  fetch: myCustomFetch,                              // Custom fetch implementation
+  fetch: myCustomFetch, // Custom fetch implementation
 
   // ── WebSocket defaults ──
   ws: { highWaterMark: 65536, lowWaterMark: 16384, maxSendRate: 0, keepRooms: true },
@@ -212,7 +261,7 @@ const client = kinetex({
 
 ```ts
 const get = await client.get("/resource");
-const post = await client.post("/resource", { key: "value" });
+const post = await client.post("/resource", { key: "value" }); // auto-JSON
 const put = await client.put("/resource/1", { data: "new" });
 const patch = await client.patch("/resource/1", { data: "updated" });
 const del = await client.delete("/resource/1");
@@ -253,7 +302,7 @@ const res = await client.send("/resource", "GET", options);
 
 ## Fluent Request Builder
 
-Every method returns `this` for chaining. Call `.send()`, `.json()`, `.text()`, `.bytes()`, `.blob()`, or `.data()` to execute.
+Every builder method returns `this` for chaining. Call one terminal method — `.send()`, `.json()`, `.text()`, `.bytes()`, `.blob()`, `.data()`, or `.subscribe()` — to execute; they return promises, not the builder.
 
 ```ts
 const client = kinetex({ baseURL: "https://api.example.com" });
@@ -288,13 +337,17 @@ const data = await client
   .tags("users", "active") // Cache tags
   .onUploadProgress((ev) => {}) // Upload progress callback
   .onDownloadProgress((ev) => {}) // Download progress callback
-  .send() // → Promise<KinetexResponse<T>>
-  .json<T>() // → Promise<T> (parsed JSON data)
-  .text() // → Promise<string>
-  .bytes() // → Promise<Uint8Array>
-  .blob() // → Promise<Blob>
-  .data<T>() // → Promise<T> (alias for .json)
-  .subscribe(onSuccess, onError); // callback-style (void)
+  .send(); // → Promise<KinetexResponse<T>>
+
+// The methods above all return `this`. These are the terminal calls — pick
+// exactly one, and nothing may be chained after it:
+const res = await client.GET("/users").send(); // Promise<KinetexResponse<T>>
+const data = await client.GET("/users").json<User>(); // Promise<T> (parsed JSON)
+const str = await client.GET("/users").text(); // Promise<string>
+const buf = await client.GET("/users").bytes(); // Promise<Uint8Array>
+const blob = await client.GET("/users").blob(); // Promise<Blob>
+const same = await client.GET("/users").data<User>(); // Promise<T> (alias for .json)
+client.GET("/users").subscribe(onSuccess, onError); // callback-style (void)
 ```
 
 ---
@@ -316,8 +369,8 @@ interface SendOptions<T = unknown> {
   proxy?: ProxyConfig | false; // Proxy config or disable
   cache?: CacheRequestConfig | false; // Cache config or disable
   throwOnError?: boolean; // Throw on 4xx/5xx
-  followRedirects?: boolean; // Follow redirects
-  maxRedirects?: number; // Max redirects
+  followRedirects?: boolean; // Follow redirects (default: true; false returns the 3xx as-is)
+  maxRedirects?: number; // Max redirect hops (default: 20; 0 disables following)
   httpVersion?: HTTPVersion; // Preferred HTTP version
   maxRequestSize?: number; // Request size limit (bytes)
   maxResponseSize?: number; // Response size limit (bytes)
@@ -546,13 +599,13 @@ kinetex({
 
 ```ts
 interface InterceptorContext {
-  request: KinetexRequest;
-  response: KinetexResponse<unknown> | null;
+  request: InterceptorRequest; // url, method, headers, body, signal, meta
+  response: InterceptorResponse | null;
   error: unknown | null;
   startedAt: number; // Monotonic start time (ms)
   attempt: number; // Current attempt number
   aborted: boolean; // Pipeline aborted?
-  store: Map<symbol | string, unknown>; // Pipeline-scoped shared storage
+  store: Map<symbol, unknown>; // Pipeline-scoped shared storage (symbol keys only)
 }
 ```
 
@@ -577,18 +630,25 @@ import {
   RateLimitError, // thrown by createRateLimitInterceptor
 } from "kinetex/interceptors";
 
-// Compute request body size (used internally by progress tracking)
-computeBodySize(body); // → number | null
+// Compute request body size (used internally by progress tracking).
+// Returns the byte length, 0 for an empty body, or -1 when the size is unknown
+// (e.g. a ReadableStream) — it never returns null.
+computeBodySize(body); // → number
 
-// Combine multiple built-in interceptors
+// Combine multiple built-in interceptors at documented priorities:
+//   -100 timeout · -90 rate limit · -80 dedup · -70 cache
+//   -50 auth · 50 retry · 90 logging · 95 HAR · 100 metrics
 const suite = createInterceptorSuite({
+  timeout: { timeoutMs: 5000 },
   retry: { maxRetries: 3 },
-  auth: { type: "bearer", token: "..." },
-  cache: { ttlMs: 5000 },
-  logging: true,
-  metrics: true,
+  rateLimit: { limit: 100, windowMs: 60_000 },
+  // `auth` is a bare getToken provider, not an AuthConfig
+  auth: { getToken: () => "my-token" },
+  // `cache` is a CacheConfig — the key is defaultTtlMs, there is no `ttlMs`
+  cache: { defaultTtlMs: 5000 },
+  logging: {/* Partial<LoggingConfig> */},
 });
-// suite.retry, suite.auth, suite.cache, suite.logging, suite.metrics, suite.eject
+// suite: { manager, retry, auth, timeout, logging, cache, dedupe, har, metrics }
 ```
 
 ---
@@ -695,7 +755,7 @@ import type {
 
 const registry = new HookRegistry();
 
-// All hook types:
+// All hook types (each add* returns a string id used for removal):
 // - addBeforeRequest(fn, options?)
 // - addAfterRequest(fn, options?)
 // - addBeforeResponse(fn, options?)
@@ -705,14 +765,20 @@ const registry = new HookRegistry();
 // - addOnRedirect(fn, options?)
 // - addOnUploadProgress(fn, options?)
 // - addOnDownloadProgress(fn, options?)
+// - addOnCancel(fn, options?)
+// - addOnConnection(fn, options?)
 // - addAround(fn, options?)       // wraps the entire pipeline
 
-registry.addBeforeRequest(myHook, {
-  priority: 10, // Lower number = runs first (default: 100)
+const id = registry.addBeforeRequest(myHook, {
+  id: "my-hook", // optional unique id (auto-generated if omitted)
+  priority: 10, // Lower number = runs first (default: 0)
   once: true, // Auto-eject after first run
-  if: (req) => req.method === "POST", // Conditional execution
+  condition: (ctx) => ctx.request.method === "POST", // receives the HookContext
+  safe: true, // swallow+log errors from this hook instead of propagating
 });
-registry.removeBeforeRequest(myHook); // Eject by reference
+registry.remove(id); // eject by id — there is no removeBeforeRequest()
+registry.has(id);
+registry.removeAll();
 
 // Attach registry to a client
 client.attachHookRegistry(registry); // Returns single eject function
@@ -737,9 +803,9 @@ const responsePipe = composeBeforeResponse(fn1, fn2);
 // Redirect tracking
 const redirectTracker = new RedirectTracker({ maxRedirects: 5 });
 // Error classes
-class MyHTTPError extends HTTPError {}       // extends Error
+class MyHTTPError extends HTTPError {} // extends Error
 class MyValidationError extends ResponseValidationError {} // extends Error
-class TooManyRedirectsError extends Error {}  // thrown by HookRegistry
+class TooManyRedirectsError extends Error {} // thrown by HookRegistry
 ```
 
 ### HookEmitter
@@ -748,19 +814,25 @@ For event-style hook emission separate from the registry:
 
 ```ts
 const emitter = new HookEmitter();
-emitter.on("beforeRequest", myHandler);
-emitter.emit("beforeRequest", req, ctx);
-emitter.off("beforeRequest", myHandler);
-emitter.clear();
+emitter.on("before:request", (req) => console.log(req.method, req.url));
+await emitter.emit("before:request", req); // async; takes ONE event object
+emitter.off("before:request", handler);
+emitter.once("error", (err) => console.error(err));
+emitter.removeAllListeners(); // all events
+emitter.removeAllListeners("error"); // one event
 ```
+
+Event names are colon-separated and typed: `before:request`, `after:request`, `before:response`, `after:response`, `error`, `retry`, `redirect`, `upload:progress`, `download:progress`, `cancel`, `connection`. `emit()` returns a promise and isolates listener errors. There is no `clear()` — it is `removeAllListeners()`.
 
 ### HookOptions
 
 ```ts
 interface HookOptions {
-  priority?: number; // Lower runs first (default: 100)
+  id?: string; // Unique hook id. Auto-generated if omitted.
+  priority?: number; // Lower runs first (default: 0)
   once?: boolean; // Auto-eject after first execution
-  if?: (req: KinetexRequest) => boolean; // Conditional execution predicate
+  condition?: (ctx: HookContext) => boolean; // Conditional predicate — not `if`
+  safe?: boolean; // Catch+log hook errors instead of propagating (default: false)
 }
 ```
 
@@ -768,7 +840,16 @@ interface HookOptions {
 
 ## Request Deduplication
 
-Coalesces identical concurrent GET/HEAD requests into a single network call:
+Coalesces identical concurrent GET/HEAD requests into a single network call. The dedup key includes a SHA-256 fingerprint of every credential-bearing header, so two users calling the same URL with different `Authorization` / `Cookie` / API-key headers are never coalesced into one response:
+
+```ts
+import { CREDENTIAL_HEADERS } from "kinetex/cache";
+// ["authorization", "proxy-authorization", "cookie", "x-api-key", "apikey", "api-key",
+//  "x-auth-token", "x-access-token", "x-refresh-token", "x-session-id", "x-session-token",
+//  "x-secret", "x-secret-key", "x-private-key", "x-csrf-token"]
+```
+
+> If you authenticate with a header outside that list, supply a `keyFn` that includes it (see below) — otherwise two identities can share one in-flight slot.
 
 ```ts
 client.enableDedup({ windowMs: 50 }); // Also dedupe for 50ms after completion
@@ -805,7 +886,8 @@ const result = await dedup.execute("GET", "unique-key", () => fetchData());
 const dMap = createDedupMap<KinetexResponse>({ windowMs: 50 });
 
 // Metrics
-console.log(dedup.hits, dedup.misses, dedup.inFlightCount, dedup.stats);
+console.log(dedup.hits, dedup.misses, dedup.inFlightCount, dedup.keys);
+console.log(dedup.getStats()); // a method — there is no `stats` property
 ```
 
 ---
@@ -818,10 +900,11 @@ Per-origin (or per-key) three-state machine to prevent cascading failures:
 client.enableCircuitBreaker({
   failureThreshold: 5, // Failures before OPEN (default: 5)
   resetTimeoutMs: 30_000, // Time before HALF_OPEN probe (default: 30_000)
-  successThreshold: 3, // Consecutive successes to CLOSE (default: 3)
-  windowSize: 10, // Sliding window size (0 = consecutive count) (default: 10)
-  halfOpenMaxRequests: 1, // Concurrent probes in HALF_OPEN (default: 1)
-  failureFilter: {
+  successThreshold: 2, // Consecutive successes to CLOSE (default: 2)
+  windowSize: 10, // Sliding window size (default: 10)
+  halfOpenConcurrency: 1, // Concurrent probes in HALF_OPEN (default: 1)
+  // The filter key is `failures`, not `failureFilter`
+  failures: {
     // Which failures count toward threshold
     networkErrors: true, // ENETWORK errors (default: true)
     timeouts: true, // ETIMEOUT errors (default: true)
@@ -829,9 +912,10 @@ client.enableCircuitBreaker({
     statusCodes: [503], // Specific status codes
   },
   onOpen: (state) => console.log("Circuit OPEN", state),
-  onClose: (state) => console.log("Circuit recovered"),
-  onHalfOpen: (state) => console.log("Probing..."),
-  onRejected: (req) => console.log("Rejected by CB", req.url),
+  onClose: (state) => console.log("Circuit recovered", state),
+  onHalfOpen: (state) => console.log("Probing...", state),
+  // Every callback receives a CircuitBreakerState, not the request
+  onRejected: (state) => console.log("Rejected by CB", state.state, state.failureCount),
 });
 
 // Manual control
@@ -861,17 +945,29 @@ import type {
   FailureFilter,
 } from "kinetex/circuit-breaker";
 
-const cb = createCircuitBreaker({
+// A standalone breaker takes a key as its FIRST argument, then the config.
+const cb = createCircuitBreaker("api.example.com", {
   failureThreshold: 5,
   resetTimeoutMs: 30_000,
 });
 
+await cb.execute(async () => {
+  /* throws CircuitOpenError while OPEN */
+});
+cb.state; // "CLOSED" | "OPEN" | "HALF_OPEN"
+cb.snapshot; // CircuitBreakerState
+cb.trip();
+cb.reset();
+
 const registry = new CircuitBreakerRegistry(config);
 // Thin wrapper that manages a Map<string, CircuitBreaker>
+await registry.execute("https://api.example.com", () => doRequest());
 registry.get("https://api.example.com"); // → CircuitBreaker
 registry.snapshots(); // → Record<string, CircuitBreakerState>
 registry.trip("origin");
 registry.reset("origin");
+registry.delete("origin");
+registry.size;
 registry.clear();
 ```
 
@@ -879,35 +975,63 @@ registry.clear();
 
 ## Caching
 
-RFC 7234 compliant HTTP caching with multiple storage backends:
+RFC 7234 compliant HTTP caching with pluggable storage backends. Freshness comes from the response's `Cache-Control` headers, and `Vary` is always honoured — there is no toggle for either.
 
 ```ts
+import { kinetex, MemoryStorageAdapter } from "kinetex";
+
 const client = kinetex({
   cache: {
-    storage: "memory", // "memory" | "localStorage" | "kv"
-    ttlMs: 60_000, // Default TTL (default: 60_000)
-    maxEntries: 1000, // Max cached entries (default: 1000)
-    maxBodySize: 1_000_000, // Max body size to cache
-    swr: true, // Stale-while-revalidate (default: false)
-    swrTtlMs: 30_000, // SWR TTL (default: ttlMs * 0.1)
-    vary: true, // Respect Vary header (default: true)
-    namespace: "myapp", // Cache namespace prefix
+    // maxEntries: 500, // LRU eviction
+    // maxSizeBytes: 50 * 1024 * 1024, // total bytes held
+    // maxBodySizeBytes: 5 * 1024 * 1024, // skip caching larger bodies
+    // defaultTtlMs: 60_000, // when the response has no Cache-Control (max 1 year)
+    // maxAbsoluteAgeMs: 7 * 24 * 60 * 60 * 1000, // hard cap regardless of Cache-Control
+    // honorCacheControl: true, // respect no-store / no-cache
+    // cacheMethods: ["GET", "HEAD"],
+    // cacheStatuses: [200, 203, 204, 206, 300, 301, 404, 405, 410, 414, 501],
+    storage: new MemoryStorageAdapter(), // omit for plain in-memory
+    // cacheKey: (req) => `${req.url}`, // may be async
+    // namespace: "myapp", // key prefix
   },
 });
 
-// Per-request cache control
-client.get("/users", { cache: { ttlMs: 5000 } });
-client.get("/users", { cache: { forceRefresh: true } }); // Bypass + re-cache
-client.get("/users", { cache: false }); // Bypass entirely
-client.GET("/users").cache({ ttlMs: 5000 }).json();
-client.GET("/users").noCache().json();
+// Per-request cache control — this is CacheRequestConfig, a different shape
+// from the client-level CacheConfig above (note `enabled`, not `storage`).
+client.get("/users", { cache: { ttlMs: 5000 } }); // override TTL for this call
+client.get("/users", { cache: { tags: ["users"] } }); // tag for later invalidation
+client.get("/users", { cache: { forceRefresh: true } }); // bypass + re-cache
+client.get("/users", { cache: { enabled: false } }); // bypass entirely
+client.get("/users", { cache: false }); // shorthand for { enabled: false }
 
-// SWR error callback
-kinetex({
-  cache: { swr: true },
+// Fluent equivalents
+client.GET("/users").cache({ ttlMs: 5000 }).json();
+client.GET("/users").noCache().json(); // forceRefresh: true
+```
+
+**Stale-while-revalidate needs no config flag.** There is no `swr` or `swrTtlMs` option: the SWR window is taken from the response's `Cache-Control: stale-while-revalidate=N`, and within that window kinetex serves the stale copy immediately and revalidates in the background. Two consequences worth knowing:
+
+- A per-request `cache.ttlMs` override pins the SWR window to 0 for that request. If you want SWR, let the server's `Cache-Control` decide the lifetime.
+- `onSWRError` is a **top-level client option**, not a member of `cache`:
+
+```ts
+const client = kinetex({
   onSWRError: (err, req) => console.error("SWR failed", req.url, err),
 });
 ```
+
+### Credential isolation
+
+Cache keys include a SHA-256 fingerprint of every header in `CREDENTIAL_HEADERS`, so a response fetched with one user's `Authorization`/`Cookie`/API key is never served to another. `getAuthFingerprint(headers)` exposes the same function for custom key functions:
+
+```ts
+import { getAuthFingerprint, CREDENTIAL_HEADERS } from "kinetex/cache";
+
+await getAuthFingerprint({ authorization: "Bearer …" }); // → "auth:9f86d0…"
+await getAuthFingerprint({ accept: "*/*" }); // → "" (anonymous → shared entry)
+```
+
+Default `cacheStatuses` are `200, 203, 204, 206, 300, 301, 404, 405, 410, 414, 501` — error responses are not cached, and `304` is handled by revalidation rather than stored.
 
 ### Standalone Cache
 
@@ -924,51 +1048,65 @@ import {
   CloudflareKVAdapter,
   TwoTierStorageAdapter,
   getAuthFingerprint,
+  CREDENTIAL_HEADERS,
 } from "kinetex/cache";
 import type { CacheEntry, CacheStats, CacheConfig, CacheStorageAdapter } from "kinetex/cache";
+```
 
+Each factory takes its storage first, then an optional `CacheConfig` (with `storage` omitted, since the factory supplies it):
+
+```ts
 // Memory cache
-const cache = createMemoryCache({ ttlMs: 60_000, maxEntries: 1000 });
+const cache = createMemoryCache({ defaultTtlMs: 60_000, maxEntries: 1000 });
 
-// Browser localStorage cache
-const cache = createLocalStorageCache({ prefix: "myapp:" });
+// Browser localStorage cache — note the prefix is the first positional arg
+const cache = createLocalStorageCache("myapp:", { defaultTtlMs: 60_000 });
 
 // Browser sessionStorage cache
-const cache = createSessionStorageCache({ prefix: "myapp:" });
+const cache = createSessionStorageCache("myapp:");
 
-// Cloudflare KV cache
-const cache = createKVCache({ kv: myKVNamespace, ttlMs: 60_000 });
+// Cloudflare KV cache — the namespace is the first positional arg
+const cache = createKVCache(myKVNamespace, { defaultTtlMs: 60_000 });
 
-// Two-tier (L1 memory + L2 storage)
-const cache = createTwoTierCache({
-  tier1: createMemoryCache({ ttlMs: 10_000 }),
-  tier2: createLocalStorageCache({ prefix: "myapp:" }),
+// Two-tier: L1 is always in-memory, so you pass only the L2 adapter
+const cache = createTwoTierCache(new WebStorageAdapter(localStorage, "myapp:"), {
+  defaultTtlMs: 60_000,
 });
 
-// Full HTTPCache
+// Full HTTPCache — you choose the adapter here
 const cache = new HTTPCache({
   storage: new MemoryStorageAdapter(),
-  ttlMs: 60_000,
+  defaultTtlMs: 60_000,
   maxEntries: 1000,
-  vary: true,
+  maxBodySizeBytes: 1_000_000,
+  maxAbsoluteAgeMs: 3_600_000,
   namespace: "myapp",
 });
 
+const req = { url: "https://api.example.com/users", method: "GET", headers: {} };
+
 await cache.set(
-  { url: "https://api.example.com/users", method: "GET", headers: {} },
+  req,
   { status: 200, statusText: "OK", headers: {}, body: "..." },
   { tags: ["users"] },
 );
 
-const entry = await cache.get({ url: "https://api.example.com/users", method: "GET", headers: {} });
-// entry.response, entry.stale, entry.ttlMs, entry.tags, entry.cachedAt, entry.hitCount
+const entry = await cache.get(req); // CacheEntry | null
+// entry.response, entry.createdAt, entry.expiresAt, entry.staleUntil, entry.staleOnError
+// entry.etag, entry.lastModified, entry.varyKey, entry.tags, entry.size
 
-// Tag-based invalidation
+// Tag-based and URL-prefix invalidation
 await cache.invalidateByTag("users");
+await cache.invalidateByURL("https://api.example.com/users");
 
-// Cache statistics
-const stats: CacheStats = cache.stats; // { size, hits, misses, evictions, hitRate }
-cache.clear();
+// Conditional revalidation headers for a stored entry
+cache.buildConditionalHeaders(entry); // → { "if-none-match": "…" } when an etag exists
+
+// Cache statistics — a method, not a property
+const stats: CacheStats = cache.getStats();
+// { hits, misses, staleHits, errors, evictions, totalEntries, totalSizeBytes, hitRate }
+
+await cache.clear();
 ```
 
 ---
@@ -1031,16 +1169,16 @@ jar.clearForUrl("https://example.com/api");
 interface Cookie {
   name: string;
   value: string;
-  domain: string;
+  domain: string; // canonicalized, lowercased, no leading dot
   path: string;
-  expires: number | null; // epoch ms
-  maxAge: number | null;
+  expires: number; // epoch ms; Infinity = session cookie (no Expires/Max-Age)
+  maxAge: number | null; // raw Max-Age in seconds as parsed, null if absent
   secure: boolean;
   httpOnly: boolean;
-  sameSite: "strict" | "lax" | "none";
-  createdAt: number;
-  lastAccessed: number;
-  hostOnly: boolean;
+  sameSite: SameSite; // "Strict" | "Lax" | "None" | "Unset"
+  createdAt: number; // epoch ms
+  lastAccessed: number; // epoch ms
+  hostOnly: boolean; // true = set without a Domain attribute → exact host match only
 }
 ```
 
@@ -1094,14 +1232,26 @@ extractSetCookieHeaders(headers); // → string[]
 splitSetCookieHeaders("a=1, b=2"); // → ["a=1", "b=2"]
 ```
 
-Internal storage model with LRU eviction (per-domain cap 50, global cap 3000). The `CookieStore` class handles the underlying storage:
+The jar stores cookies in a three-level map (domain → path → name) with LRU eviction — a per-domain cap of 50 and a global cap of 3000 by default. There is no separate `CookieStore` class and no `kinetex/cookie-store` entry point; `CookieJar` **is** the store. Tune the caps and domain matching through its constructor:
 
 ```ts
-import { CookieStore } from "kinetex/cookie-store";
-const store = new CookieStore({ domainLimit: 50, globalLimit: 3000, signal: controller.signal });
-store.add(cookie);
-store.get("https://example.com", { http: true });
-// Also: clear(), clearExpired(), clearSession(), clearForDomain(), clearForUrl(), toJSON()
+import { CookieJar, createCookieJar, loadCookieJar } from "kinetex/cookiejar";
+
+const jar = new CookieJar({
+  maxTotal: 3000, // default 3000
+  maxPerDomain: 50, // default 50
+  domainMatcher: (requestHost, cookieDomain) => requestHost.endsWith(cookieDomain),
+});
+
+// Cookies are read and written through the jar, not a raw store:
+jar.setCookie("session=abc123; Path=/; Secure", { url: "https://example.com/" });
+jar.getCookies({ url: "https://example.com/page", http: true }); // → Cookie[]
+jar.getCookieHeader({ url: "https://example.com/page" }); // → "session=abc123"
+jar.getAll();
+jar.getForDomain("example.com");
+
+// Also: clear(), clearExpired(), clearSession(), clearForDomain(),
+// clearForUrl(), removeCookie(domain, path, name), toJSON(), toString()
 ```
 
 ---
@@ -1132,115 +1282,160 @@ import {
 } from "kinetex/pagination";
 import type { Page, PaginationState } from "kinetex/pagination";
 
-// Offset strategy: ?offset=0&limit=100
-const pages = paginate(client, {
-  url: "/items",
-  strategy: "offset",
-  perPage: 100,
-  maxPages: 10, // Stop after N pages
-  initialOffset: 0,
-});
+// Core: paginate() takes a single PaginationConfig and an optional strategy name.
+// It does NOT take a client — you supply a `fetch` that returns the raw response.
+import {
+  paginate,
+  collectAll,
+  collectPages,
+  takeItems,
+  paginateItems,
+  prefetchPaginate,
+} from "kinetex/pagination";
 
-// Page strategy: ?page=1&per_page=100
-const pages = paginate(client, {
-  url: "/items",
-  strategy: "page",
-  perPage: 50,
-  maxPages: 5,
-  pageParam: "page", // Query param name (default: "page")
-  perPageParam: "per_page", // Query param name (default: "per_page")
-});
+const pages = paginate<Item>(
+  {
+    fetch: (state) => client.get<ItemsResponse>(`/items?offset=${state.offset}&limit=100`),
+    getItems: (res) => res.items,
+    hasNext: (res) => res.items.length === 100,
+    getNext: (res) => ({ offset: res.items.at(-1)!.id }),
+    getTotal: (res) => res.total,
+    perPage: 100,
+    startOffset: 0,
+    maxPages: 10, // 0 = unlimited (default)
+    delayMs: 0,
+    signal: controller.signal,
+    transform: (item) => item,
+    filter: (item) => !item.deleted,
+    onPage: (page) => console.log("fetched page", page.page),
+  },
+  "offset",
+);
 
-// Cursor strategy: ?cursor=abc123
-const pages = paginate(client, {
-  url: "/items",
-  strategy: "cursor",
-  perPage: 100,
-  getCursor: (res) => res.data.nextCursor,
-  setCursor: (url, cursor) => ({ ...url, query: { ...url.query, after: cursor } }),
-  getItems: (res) => res.data.items,
-});
-
-// Keyset strategy: ?after=2024-01-01
-const pages = paginate(client, {
-  url: "/items",
-  strategy: "keyset",
-  perPage: 100,
-  initialKey: new Date().toISOString(),
-  getKey: (res) => res.data.lastTimestamp,
-  setKey: (url, key) => ({ ...url, query: { ...url.query, after: key } }),
-  getItems: (res) => res.data.items,
-});
-
-// Relay strategy (GraphQL-style edges/node/pageInfo)
-const pages = paginate(client, {
-  url: "/items",
-  strategy: "relay",
-  perPage: 100,
-  getItems: (res) => res.data.edges.map((e: any) => e.node),
-  getPageInfo: (res) => res.data.pageInfo,
-});
-
-// Link header strategy (GitHub-style)
-const pages = paginate(client, {
-  url: "/items",
-  strategy: "link-header",
-  getItems: (res) => res.data,
-  parseNext: (res) => parseLinkHeaderNext(res.headers["link"]),
-});
-
-// Token strategy (Google API-style)
-const pages = paginate(client, {
-  url: "/items",
-  strategy: "token",
-  perPage: 100,
-  getToken: (res) => res.data.nextPageToken,
-  setToken: (url, token) => ({ ...url, query: { ...url.query, pageToken: token } }),
-  getItems: (res) => res.data.items,
-});
-
-// Consume pages
 for await (const page of pages) {
   console.log(page.items, page.total, page.page, page.hasNext, page.nextCursor);
 }
 
-// Collect all items across all pages
-const allItems = await collectAll(client, { url: "/items", strategy: "cursor" });
+// ── Per-strategy factories ────────────────────────────────────────────────
+// These wrap globalThis.fetch (or a `fetch` you pass) and build the config
+// for you. Each returns an AsyncGenerator<Page<T>> directly.
 
-// Collect all page objects
-const allPages = await collectPages(client, { url: "/items", strategy: "page", maxPages: 5 });
+// Offset/limit — ?offset=0&limit=100
+createOffsetPaginator<Item>({
+  url: "https://api.example.com/items",
+  limit: 100,
+  getItems: (data) => data.items,
+  getTotal: (data) => data.total,
+  maxPages: 10,
+  // paramNames: { offset: "o", limit: "l" },
+  // fetch: globalThis.fetch, headers: {}, signal,
+});
 
-// Take N items across pages
-const first50 = await takeItems(client, { url: "/items", strategy: "offset", perPage: 10 }, 50);
+// Page/per-page — ?page=1&per_page=100
+createPagePaginator<Item>({
+  url: "https://api.example.com/items",
+  perPage: 50,
+  startPage: 1,
+  getItems: (data) => data.items,
+  // paramNames: { page: "p", perPage: "pp" },
+});
 
-// Paginate items directly (yield items, not pages)
-const items = paginateItems(client, { url: "/items", strategy: "page" });
-for await (const item of items) {
-  console.log(item);
-}
+// Cursor — ?cursor=abc123
+createCursorPaginator<Item>({
+  url: "https://api.example.com/items",
+  getItems: (data) => data.items,
+  getNextCursor: (data) => data.nextCursor, // string | null
+  startCursor: null,
+  paramName: "cursor", // default "cursor"
+});
 
-// Parallel prefetch
-const pages = paginate(client, { url: "/items", strategy: "page", prefetch: 3 });
+// Keyset — ?after_id=123
+createKeysetPaginator<Item>({
+  url: "https://api.example.com/items",
+  keyParam: "after_id",
+  getItems: (data) => data.items,
+  getLastKey: (items) => String(items.at(-1)!.id),
+  hasMore: (items) => items.length > 0,
+  startKey: null,
+  pageSize: 100,
+  pageSizeParam: "limit",
+});
 
-// Merge two paginators
+// Relay (GraphQL-style connections)
+// RelayPaginationOptions has no getItems/getNext: your `fetch` must resolve to a
+// RelayConnection<T> and the paginator unwraps edges/node and pageInfo itself.
+createRelayPaginator<Item>({
+  fetch: async ({ first, after }) =>
+    graphql<RelayConnection<Item>>(
+      `
+        query ($first: Int, $after: String) {
+          items(first: $first, after: $after) {
+            edges {
+              node
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+      `,
+      { first, after },
+    ),
+  first: 100, // page size
+  startCursor: null,
+  maxPages: 10,
+});
+
+// Link header (GitHub-style) — follows the RFC 8288 `Link` header
+createLinkHeaderPaginator<Item>({
+  url: "https://api.github.com/repos/kinetexjs/kinetex/issues",
+  getItems: (data) => data,
+  headers: { Accept: "application/vnd.github+json" },
+});
+
+// Page token (Google API-style)
+createTokenPaginator<Item>({
+  url: "https://www.googleapis.com/books/v1/volumes",
+  getItems: (data) => data.items,
+  getNextToken: (data) => data.nextPageToken,
+  tokenParam: "pageToken",
+  pageSize: 10,
+});
+
+// ── Collection helpers — all take (config, strategy?) ────────────────────
+const allItems = await collectAll<Item>(config);
+const allPages = await collectPages<Item>(config);
+const first50 = await takeItems<Item>(50, config); // (n, config) — n comes FIRST
+const items = paginateItems<Item>(config); // yields items, not pages
+const prefetched = prefetchPaginate<Item>(config, "page", 3); // 3 pages in flight
+
+// Merge several paginators into one stream
 const merged = mergePaginators(paginator1, paginator2);
 
-// State serialization (resume capability)
-const state: PaginationState = serializePaginationState(paginator);
-const paginator2 = deserializePaginationState(client, state);
+// ── State serialization (base64 JSON of a PaginationState) ──────────────
+const serialized: string = serializePaginationState(state);
+const restored: PaginationState = deserializePaginationState(serialized);
 
-// Convert to async iterator
+// Convert any AsyncIterable to an AsyncIterableIterator
 const iterator = toPaginationIterator(paginator);
 ```
 
 ### Client-Level Pagination
 
 ```ts
+// Routes through the full kinetex pipeline. Takes PagePaginationOptions
+// (minus url/fetch) — there is no `strategy` key; the strategy is implied.
 const pages = await client.paginate("/items", {
-  strategy: "page",
   perPage: 50,
+  getItems: (data) => data.items,
+  getTotal: (data) => data.total,
   maxPages: 10,
 });
+
+for await (const page of pages) {
+  console.log(page.items);
+}
 ```
 
 ---
@@ -1264,21 +1459,27 @@ import {
 } from "kinetex/sse";
 import type { SSEEvent, SSEClientConfig, JSONSSEEvent } from "kinetex/sse";
 
-// SSEClient
+// SSEClient — note the real option names: reconnect (not autoReconnect),
+// reconnectDelayMs / maxReconnectDelayMs (not baseDelay / maxDelay).
+// There is no `onEvent` option; iterate the client instead.
 const sse = new SSEClient({
   url: "https://api.example.com/events",
   method: "POST",
   headers: { Authorization: "Bearer token" },
   body: JSON.stringify({ query: "..." }),
   fetch: globalThis.fetch,
-  onEvent: (event) => {
-    console.log(event.id, event.event, event.data);
-  },
-  autoReconnect: true,
-  maxReconnects: 10,
-  baseDelay: 1000,
-  maxDelay: 30000,
   signal: controller.signal,
+  lastEventId: "", // resume point
+
+  reconnect: true, // default true
+  reconnectDelayMs: 3000, // default 3000
+  maxReconnectDelayMs: 30_000, // default 30000
+  reconnectJitter: 0.3, // default 0.3
+  maxReconnects: 0, // 0 = unlimited (default)
+  onReconnect: (attempt, delayMs) => console.log(`retry ${attempt} in ${delayMs}ms`),
+  onParseError: (err, raw) => console.warn("bad SSE frame", raw, err),
+  heartbeatTimeoutMs: 0, // 0 = disabled
+  validateResponse: (res) => res.ok || "stream rejected", // false | string to stop
 });
 
 // Async iteration
@@ -1313,8 +1514,9 @@ const response = createSSEResponse(); // → Response with text/event-stream
 ### Client-Level SSE
 
 ```ts
+// Takes Partial<SSEClientConfig> and routes through the full kinetex pipeline
 const sseClient = await client.sse("/events", {
-  autoReconnect: true,
+  reconnect: true, // not `autoReconnect`
   maxReconnects: 5,
 });
 ```
@@ -1360,24 +1562,35 @@ import type {
 
 const ws = new WSClient({
   url: "wss://api.example.com/live",
+  protocols: "graphql-ws", // or string[]
   headers: { Authorization: "Bearer token" },
-  reconnect: true,
+  // There is no `reconnect` boolean or `baseDelay`/`maxDelay` — the real
+  // names are reconnectBaseMs / reconnectMaxMs. maxReconnects: 0 = unlimited.
   maxReconnects: 10,
-  baseDelay: 1000,
-  maxDelay: 30000,
+  reconnectBaseMs: 1000,
+  reconnectMaxMs: 30_000,
+  reconnectJitter: 0.3,
   connectTimeoutMs: 5000,
-  pingIntervalMs: 30000,
+  pingIntervalMs: 30_000,
+  pingPayload: "ping",
+  pongMatcher: "pong", // string | RegExp
   pongTimeoutMs: 5000,
   highWaterMark: 65536,
   lowWaterMark: 16384,
-  maxSendRate: 0,          // 0 = unlimited
+  maxSendRate: 0, // 0 = unlimited
   keepRooms: true,
+  bufferMessages: true,
+  maxBufferSize: 1000,
+  rooms: ["prices"],
   signal: controller.signal,
 
+  onOpen: (reconnectCount) => console.log(`open (${reconnectCount} prior reconnects)`),
   onMessage: (msg) => console.log(msg.data, msg.json),
   onError: (err) => console.error(err),
   onClose: (code, reason, willReconnect) => {},
-  onReconnect: (attempt) => console.log(`Reconnecting (${attempt})`),
+  onReconnect: (attempt, delayMs) => console.log(`Reconnecting (${attempt}) in ${delayMs}ms`),
+  onGiveUp: (totalAttempts) => console.warn("gave up", totalAttempts),
+  onBackpressure: (isBackpressured, info) => console.log("backpressure", info),
 });
 
 await ws.connect();
@@ -1389,11 +1602,15 @@ ws.sendBinary(new Uint8Array([1, 2, 3]));
 
 // Async iteration
 for await (const msg of ws) {
-  console.log(msg.data, msg.json?.type);
+  // `json` is `unknown` — narrow it before reading fields.
+  const payload = msg.json as { type?: string } | undefined;
+  console.log(msg.data, payload?.type);
 }
 
-// Request/response correlation
-const reply = await ws.request({ type: "ping" }, (msg) => msg.json?.type === "pong");
+// Message subscription — returns an eject function (there is no
+// built-in request/response correlation helper)
+const off = ws.onMessage((msg) => console.log(msg.data, msg.json));
+off(); // unsubscribe
 
 // Metrics
 interface WSMetrics {
@@ -1407,7 +1624,9 @@ interface WSMetrics {
 }
 
 // Utility
-const ws = await connectWS("wss://api.example.com/ws", { onMessage: ... });
+const ws = await connectWS("wss://api.example.com/ws", {
+  onMessage: (msg) => console.log(msg.data),
+});
 
 // Connection state & health
 ws.state; // "CONNECTING" | "OPEN" | "CLOSING" | "CLOSED" | "RECONNECTING"
@@ -1474,25 +1693,29 @@ const client = new GraphQLClient({
   url: "https://api.example.com/graphql",
   headers: { Authorization: "Bearer token" },
   fetch: globalThis.fetch,
-  apq: true, // Automatic Persisted Queries
-  fetchPersistedQuery: false, // Fetch persisted queries from storage
-  apqHash: "sha256", // Hash algorithm
-  retry: { maxRetries: 2 },
+  useGETForQueries: false,
+  enableAPQ: true, // Automatic Persisted Queries (not `apq`)
+  timeoutMs: 10_000,
+  retries: 2, // plain number — there is no `retry: { maxRetries }`
+  retryDelayMs: 300,
   signal: controller.signal,
   links: [
     // Middleware chain
     retryLink({ maxRetries: 3 }),
-    authLink({ getToken: () => "..." }),
+    authLink(() => "..."), // authLink(getToken, scheme = "Bearer")
     loggingLink(),
     errorLink(),
   ],
   onRequest: (req) => console.log(req),
-  onResponse: (res) => console.log(res),
+  onResponse: (res, req) => console.log(res, req),
+  onError: (err, req) => console.error(err, req),
 });
 
-// Query
-const { data, errors } = await client.query<{ user: { name: string } }>(
-  gql`
+// Query — `query()` resolves to the response's `data` field directly, not to
+// a `{ data, errors }` envelope. A non-empty `errors` array throws
+// `GraphQLClientError`, which carries `.graphqlErrors` and `.response`.
+const data = await client.query<{ user: { name: string } }>(
+  `
     query GetUser($id: ID!) {
       user(id: $id) {
         name
@@ -1502,9 +1725,9 @@ const { data, errors } = await client.query<{ user: { name: string } }>(
   { id: "1" },
 );
 
-// Mutation
+// Mutation — also resolves to `data`
 const result = await client.mutate<{ updateUser: { success: boolean } }>(
-  gql`
+  `
     mutation UpdateUser($id: ID!, $name: String!) {
       updateUser(id: $id, name: $name) {
         success
@@ -1514,9 +1737,10 @@ const result = await client.mutate<{ updateUser: { success: boolean } }>(
   { id: "1", name: "Alice" },
 );
 
-// Subscription (SSE or WebSocket transport)
-const sub = await client.subscribe(
-  gql`
+// Subscription — an async generator. The third argument is
+// { operationName, signal, url }; there is no `transport` option.
+const sub = client.subscribe(
+  `
     subscription OnPrice {
       priceUpdate {
         symbol
@@ -1525,25 +1749,29 @@ const sub = await client.subscribe(
     }
   `,
   {},
-  { transport: "sse" },
+  { operationName: "OnPrice", signal: controller.signal },
 );
 for await (const event of sub) {
   console.log(event.data);
 }
 
-// Utility
-detectOperationType(gql`query { ... }`); // → "query"
-extractOperationName(gql`query GetUser { ... }`); // → "GetUser"
+// Utility — these take a raw query string, not a template tag
+detectOperationType("query { user { id } }"); // → "query"
+extractOperationName("query GetUser { user { id } }"); // → "GetUser"
 ```
+
+> **`gql` is a one-shot function, not a template tag.** `gql(url, query, variables?, headers?)` creates a throwaway `GraphQLClient`, runs the query, and returns its `data`. For anything repeated, construct a `GraphQLClient` (or `createGraphQLClient(config)`) instead. There is no tagged-template form of `gql`.
 
 ### Client-Level GraphQL
 
+`client.graphql()` returns a `GraphQLClient` whose transport is routed through the kinetex pipeline (auth, interceptors, rate limiting, circuit breaker, OTel), not a `gql` function.
+
 ```ts
-const gql = await client.graphql("/graphql", {
-  apq: true,
-  links: [authLink({ getToken: () => "..." })],
+const gqlClient = await client.graphql("/graphql", {
+  enableAPQ: true,
+  links: [authLink(() => "...")],
 });
-const { data } = await gql.query(query, variables);
+const data = await gqlClient.query(query, variables);
 ```
 
 ---
@@ -1590,35 +1818,59 @@ const tracker = new ProgressTracker(10_000_000, {
   },
 });
 
-tracker.update(500_000); // 500KB transferred
-tracker.complete(); // Mark done
-tracker.reset(20_000_000); // Reset with new total
+tracker.update(500_000); // 500KB transferred → ProgressSnapshot
+tracker.complete(); // Mark done → ProgressSnapshot
+tracker.snapshot(); // Current ProgressSnapshot
+// There is no reset(); construct a new ProgressTracker(total, options) instead.
 
-// Wrap a ReadableStream with progress tracking
-const { stream } = withUploadProgress(readableStream, totalBytes, {
+// Wrap an upload body with progress tracking → { stream, tracker }
+const { stream: uploadStream, tracker: upTracker } = withUploadProgress(
+  readableStream,
+  totalBytes,
+  { onProgress: (snap) => {} },
+);
+
+// Download tracking returns { response, tracker } — the Response is returned
+// with an instrumented body, so there is no `stream` property here.
+const { response: tracked, tracker: downTracker } = withDownloadProgress(response, {
   onProgress: (snap) => {},
 });
 
-const { stream } = withDownloadProgress(response, {
+// Blob upload progress → { stream, tracker }
+const { stream: blobStream, tracker: blobTracker } = withBlobUploadProgress(blob, {
   onProgress: (snap) => {},
 });
+```
 
-// Blob upload progress
-const { stream } = withBlobUploadProgress(blob, {
-  onProgress: (snap) => {},
-});
+All three upload/download wrappers are **pull-based**: the source is read one chunk per downstream demand, so backpressure reaches the underlying socket/file and a multi-gigabyte transfer is not buffered in memory. Cancelling the returned stream (or aborting the supplied `signal`) propagates to the source, and the tracker is always completed or errored on the way out.
 
-const stream = streamWithProgress(readableStream, tracker);
+> Upload progress is not available for a body that cannot be replayed on retry. Retrying a `ReadableStream`/`Blob` body now fails fast with `EVALIDATION` (it was previously consumed by the first attempt, so the retry silently sent an empty body). Buffer the body first, or disable retry for that request.
 
-// Collect full stream into Uint8Array
+```ts
+// Wrap a ReadableStream with progress tracking. `streamWithProgress(stream,
+// total, options)` is an async generator yielding { chunk, progress } — it
+// returns the generator itself, not an object with a `stream` property.
+// Its options are `Omit<ProgressOptions, "onProgress">`: progress arrives as
+// the `progress` field of each yielded value instead of via a callback.
+for await (const { chunk, progress } of streamWithProgress(readableStream, totalBytes, {
+  throttleHz: 10,
+})) {
+  // … consume `chunk` …
+}
+
+// Collect a full stream into a Uint8Array
 const bytes = await collectStream(readableStream);
 
-// Multi-part progress
-const agg = new MultiPartProgressAggregator();
-const partId = agg.addPart(0, 500); // part index, bytes
-agg.update(partId, 250);
-agg.complete(partId);
-const total = agg.total(); // ProgressSnapshot with overall progress
+// Multi-part progress — create a per-part tracker, then read the roll-up.
+// There is no addPart()/update(partId)/total() API.
+const agg = new MultiPartProgressAggregator(3, (m) => {
+  console.log("overall", m.overall.percent);
+});
+const part = agg.createPartTracker(0, 500, { onProgress: (s) => console.log(s.loaded) });
+part.update(250);
+part.complete();
+
+const { parts, overall } = agg.getOverall(); // MultiPartProgress
 
 // Formatters
 formatBytes(1500); // "1.46 KB"
@@ -1676,13 +1928,15 @@ const signer = new SigV4Signer({
   },
   region: "us-east-1",
   service: "s3",
-  signingDate: new Date(), // Override signing date
-  payloadHash: "UNSIGNED-PAYLOAD", // For streaming
+  unsignedPayload: true, // Send UNSIGNED-PAYLOAD (for streaming) — not `payloadHash`
   unsignedHeaders: ["x-amz-content-sha256"], // Headers to skip
-  presignExpires: 3600, // Presigned URL TTL (seconds)
-  doubleEncode: true, // RFC 3986 double-encode (default: true)
-  normalizePath: true, // Normalize path before signing (default: true)
+  doubleEncodeUri: true, // RFC 3986 double-encode (not `doubleEncode`)
 });
+// The SigV4Signer constructor is Omit<SigningConfig, "signingDate" |
+// "clockSkewSecs">: both are managed internally (the latter tracks detected
+// clock skew). To pin a signing date, pass a full SigningConfig to
+// signRequest(request, config) / presignRequest(request, config) instead.
+// There is no `presignExpires` or `normalizePath` on SigningConfig either.
 
 // Sign a request
 const signed = await signer.sign({
@@ -1708,7 +1962,7 @@ const key = await deriveSigningKey(credentials, dateStamp, region, service);
 const provider = staticCredentials({ accessKeyId: "...", secretAccessKey: "..." });
 const provider = envCredentials(); // AWS_ACCESS_KEY_ID, etc.
 const provider = cachingCredentials(innerProvider, 5 * 60_000); // Cache with TTL
-const provider = imdsCredentials({ retries: 3 }); // EC2 IMDS
+const provider = imdsCredentials({ timeout: 1000 }); // EC2 IMDS — options are { endpoint?, timeout? }
 const provider = chainCredentials(envCredentials, imdsCredentials); // Fallback chain
 
 // Specialized signers
@@ -1726,15 +1980,24 @@ const policy = signS3PostPolicy(credentials, region, new Date(), {
 });
 
 // Chunked upload signing (S3 streaming)
-const { sessionToken, dateTime } = await initChunkedSigning(credentials, region, "s3", new Date());
-const chunkSignature = await signChunk(
-  sessionToken,
-  dateTime,
-  chunkData,
-  chunkIndex,
-  previousSignature,
+// `initChunkedSigning(request, config)` takes a SignableRequest and a
+// SigningConfig. It returns the seed request plus the state object that
+// `signChunk` / `signFinalChunk` thread through each chunk — there are no
+// `sessionToken`, `dateTime`, `chunkIndex`, or `previousSignature` arguments.
+const { signedRequest, state } = await initChunkedSigning(
+  { url: targetURL, method: "PUT", headers: {}, body: null },
+  { credentials, region, service: "s3" },
 );
-const finalSignature = await signFinalChunk(sessionToken, dateTime, chunkIndex, previousSignature);
+
+// signChunk returns the wire header and the *updated* state; feed newState
+// into the next call rather than reusing `state`.
+for await (const chunk of chunks) {
+  const { chunkHeader, newState } = await signChunk(chunk, state);
+  state = newState;
+  write(chunkHeader);
+  write(chunk);
+}
+write(await signFinalChunk(state));
 
 // Clock skew detection
 const skewMs = await detectClockSkew("https://sts.amazonaws.com", credentials);
@@ -1770,24 +2033,31 @@ import {
 } from "kinetex/socks5";
 import type { Socks5ProxyConfig, Socks5Tunnel, Socks5Target, TcpConnector } from "kinetex/socks5";
 
-// Standalone tunnel
-const tunnel = await createSocks5Tunnel({
-  proxyHost: "127.0.0.1",
-  proxyPort: 1080,
-  username: "user", // Optional: RFC 1929 auth
-  password: "pass",
-  connectTimeout: 10_000, // Connection timeout
-  retries: 2, // Connection retries
-});
+// Standalone tunnel. All three arguments are required:
+// (proxy config, target, connector). The result is a raw TCP tunnel —
+// Socks5Tunnel is { conn, boundAddr, boundPort }. It has NO .send();
+// the tunnel is not an HTTP client. Speak HTTP/TLS over `tunnel.conn`
+// yourself, or hand it to a transport that can.
+const tunnel: Socks5Tunnel = await createSocks5Tunnel(
+  {
+    host: "127.0.0.1", // not `proxyHost`
+    port: 1080, // not `proxyPort`
+    username: "user", // Optional: RFC 1929 auth
+    password: "pass",
+    remoteDns: true, // Resolve hostnames at the proxy
+    connectTimeoutMs: 10_000, // not `connectTimeout`
+    handshakeTimeoutMs: 10_000,
+    maxRetries: 2, // not `retries`
+    retryDelayMs: 500,
+  },
+  { host: "api.example.com", port: 443, tls: true, tlsServerName: "api.example.com" },
+  nodeTcpConnector,
+);
 
-const response = await tunnel.send({
-  url: "https://api.example.com/data",
-  method: "GET",
-  headers: { Accept: "application/json" },
-  body: null,
-  signal: null,
-  meta: {},
-});
+// tunnel.conn is a TcpConn: { read(buf), write(data), close() }
+tunnel.boundAddr; // string — address the proxy reported
+tunnel.boundPort; // number
+tunnel.conn.close();
 
 // Parse SOCKS5 URL
 const config = parseSocks5Url("socks5://user:pass@127.0.0.1:1080");
@@ -1796,8 +2066,8 @@ const config = parseSocks5Url("socks5://user:pass@127.0.0.1:1080");
 const nodeConnector: TcpConnector = nodeTcpConnector; // Node.js
 const denoConnector: TcpConnector = denoTcpConnector; // Deno
 const customConnector: TcpConnector = socks5Connector({
-  proxyHost: "127.0.0.1",
-  proxyPort: 1080,
+  host: "127.0.0.1",
+  port: 1080,
 }); // Returns a TcpConnector function
 
 // Client-level proxy
@@ -1815,21 +2085,25 @@ try {
 // Correct way to route through an HTTP(S) proxy — supply a proxy-aware fetch:
 import { ProxyAgent } from "undici"; // npm i undici (Node.js)
 const proxied = kinetex({
-  fetch: new ProxyAgent("http://127.0.0.1:8080").dispatch.bind(new ProxyAgent("http://127.0.0.1:8080")) as typeof fetch,
+  fetch: new ProxyAgent("http://127.0.0.1:8080").dispatch.bind(
+    new ProxyAgent("http://127.0.0.1:8080"),
+  ) as typeof fetch,
 });
 
-// Correct way to route through a SOCKS5 proxy — create a tunnel transport:
+// Correct way to route through a SOCKS5 proxy — dial through the tunnel
+// and upgrade to TLS, then hand the socket to a fetch implementation that
+// accepts a custom connection:
 import { createSocks5Tunnel } from "kinetex/socks5";
-const tunnel = createSocks5Tunnel({ proxyHost: "127.0.0.1", proxyPort: 1080 });
-const viaSocks = await tunnel.send({
-  url: "https://api.example.com/data",
-  method: "GET",
-  headers: {},
-  body: null,
-  signal: null,
-  meta: {},
-});
+const socks = await createSocks5Tunnel(
+  { host: "127.0.0.1", port: 1080 },
+  { host: "api.example.com", port: 443, tls: true },
+  nodeTcpConnector,
+);
+const tlsSocket = await upgradeToTLS(socks.conn, { servername: "api.example.com" });
+const viaSocks = kinetex({ fetch: fetchOverSocket(tlsSocket) });
 ```
+
+`createSocks5Tunnel` is a low-level primitive. It gives you a connected socket and nothing else — no request building, no redirect handling, no kinetex pipeline. For full kinetex behaviour over SOCKS5, connect a fetch implementation to the tunnel and pass it as the client's `fetch`.
 
 ---
 
@@ -1843,9 +2117,11 @@ import {
   computeDigestResponse,
   formatDigestAuth,
   createDigestAuthorization,
+  createDigestAuthorizer,
 } from "kinetex/digest";
 import type { DigestChallenge } from "kinetex/digest";
 
+// One-shot: stateless, always nc=00000001
 const authHeader = await createDigestAuthorization(
   `Digest realm="test", nonce="abc123", algorithm=MD5, qop="auth"`,
   "username",
@@ -1855,6 +2131,25 @@ const authHeader = await createDigestAuthorization(
 );
 // → 'Digest username="username", realm="test", nonce="abc123", uri="/resource", response="...", algorithm=MD5, qop=auth, nc=00000001, cnonce="..."'
 ```
+
+### Nonce counting (`nc`)
+
+RFC 7616 requires `nc` — the hex request count for the current nonce — to **increase on every request that reuses a nonce**. Servers with replay protection enabled (nginx, Apache with `AuthDigestNonceLifetime`) reject a repeated `nc=00000001`, so a long-lived client needs the stateful authorizer:
+
+```ts
+// The first argument is the raw WWW-Authenticate header string, not a
+// parsed challenge object.
+const authorize = createDigestAuthorizer();
+
+await authorize(challenge, "username", "password", "GET", "/a"); // nc=00000001
+await authorize(challenge, "username", "password", "GET", "/b"); // nc=00000002
+await authorize(challenge, "username", "password", "GET", "/c"); // nc=00000003
+
+// A new nonce from the server resets the counter
+await authorize(newChallenge, "username", "password", "GET", "/a"); // nc=00000001
+```
+
+Create one per client (do not share it across users). `Kinetex`'s built-in `auth: { type: "digest" }` interceptor uses it automatically: it answers the `401` challenge, retries once, and increments `nc` on every subsequent request.
 
 ---
 
@@ -1881,14 +2176,25 @@ const logger = createLogger({
   level: "info", // "trace" | "debug" | "info" | "warn" | "error" | "silent"
   transports: [
     new ConsoleTransport({ pretty: true }), // Console output
-    new JSONTransport({ file: "requests.log" }), // File output
+    new JSONTransport((line) => appendFileSync("requests.log", line)), // one JSON line at a time
   ],
-  redact: ["authorization", "cookie", "x-api-key", /secret.*/i], // Redaction patterns
-  redactBody: true, // Redact request/response bodies
-  bodyTruncate: 1000, // Truncate bodies to N chars
-  requestIdHeader: "x-request-id", // Extract request ID from this header
-  sampling: 0.5, // Log only 50% of requests
-  filter: (entry) => entry.status !== 200, // Only log non-200 responses
+  // Redaction is a structured config, not a flat array of patterns
+  redaction: {
+    headers: ["authorization", "cookie", "x-api-key"],
+    queryParams: ["api_key", "access_token"],
+    bodyFields: ["password", "ssn"],
+    bodyPatterns: [/secret.*/i],
+    maxBodyLength: 1000,
+    logRequestBody: true,
+    logResponseBody: true,
+    allowedBodyTypes: ["application/json"],
+  },
+  sampleRate: 0.5, // Log ~50% of requests (not `sampling`)
+  methods: ["GET", "POST"],
+  statuses: [429, 500, 503],
+  excludeURLs: [/\/health$/],
+  context: { service: "api" },
+  generateId: () => crypto.randomUUID(),
 });
 
 // Client-level logging
@@ -1898,9 +2204,9 @@ kinetex({
 });
 
 // Batching transport (async flush)
-const batch = new BatchingTransport({
-  maxBatch: 100,
-  flushIntervalMs: 5000,
+const batch = new BatchingTransport(inner, {
+  maxBatch: 100, // default 100
+  flushMs: 5000, // default 5000 — not `flushIntervalMs`
 });
 
 // Remote transport
@@ -1929,7 +2235,7 @@ await client.get("/users");
 await client.post("/posts", { title: "Test" });
 
 const har = client.getHAR();
-// HARLog { version: "1.2", creator: { name: "kinetex", version: "0.0.3" }, entries: [...] }
+// HARLog { version: "1.2", creator: { name: "kinetex", version: "1.0.0" }, entries: [...] }
 
 // Each HAREntry contains:
 // startedDateTime, time, request (method, url, httpVersion, headers, queryString, bodySize),
@@ -1939,6 +2245,21 @@ const har = client.getHAR();
 // Clear entries
 client.clearHAR();
 ```
+
+### Redaction
+
+HAR logs are routinely exported and shared, so entries are redacted before they are recorded:
+
+- **Headers** — every credential-bearing name (`authorization`, `cookie`, `set-cookie`, `x-api-key`, `apikey`, `x-session-token`, …) is replaced with `***REDACTED***`.
+- **URLs** — sensitive query parameters (`api_key`, `access_token`, `signature`, `password`, `code`, `sas`, …) and the fragment are masked, in both `request.url` and `request.queryString[]`. Non-sensitive parameters and the rest of the URL are preserved so the log stays useful.
+- **`Location`** — the redirect target is passed through the same URL redaction.
+- **Bodies** — response text is recorded only for `json`/`xml`/`text/plain`/`javascript` content types and truncated to 8 KiB; HTML and binary bodies are never recorded.
+
+```ts
+// ?api_key=SUPERSECRET&page=2  →  https://api.example.com/v1/items?api_key=***REDACTED***&page=2
+```
+
+> Redaction is deliberately conservative. If a credential travels in a non-standard header or parameter, add it to your own allow/deny handling before exporting the log.
 
 ---
 
@@ -1968,9 +2289,15 @@ client.setTracer({
       spanContext() {
         return { traceId: "x", spanId: "y", traceFlags: 1 };
       },
-      setAttribute(key, value) { return this; },
-      setStatus(status) { return this; },
-      recordException(err) { return this; },
+      setAttribute(key, value) {
+        return this;
+      },
+      setStatus(status) {
+        return this;
+      },
+      recordException(err) {
+        return this;
+      },
       end() {},
     };
   },
@@ -2043,6 +2370,7 @@ const transport = new NodeHTTP2Transport({
   maxSessions: 100, // Max concurrent sessions (default: 100)
   connectTimeoutMs: 30_000, // Connection timeout (default: 30_000)
   requestTimeoutMs: 30_000, // Per-request stream timeout (default: 30_000)
+  ca: [readFileSync("corp-ca.pem")], // Trust a private/self-signed CA for this origin
   strict: false, // Strict header validation
   onDroppedHeader: (name, value) => {},
 });
@@ -2115,7 +2443,7 @@ const raw = await sendWithTimeout(transport, request, 5000); // → RawResponse,
 const body = await readRawBody(stream, maxBytes, url, signal); // → Uint8Array, throws SizeLimitError
 
 // Parse body by content-type
-const data = parseBody<MyType>(rawBody, contentType, customParser?, onParseFailure?, headers?, url?);
+const data = parseBody<MyType>(rawBody, contentType, customParse, onParseFailure, headers, url);
 
 // Decompress body stream
 const decompressed = await decompressBodyStream(body, headers);
@@ -2185,8 +2513,8 @@ High-throughput request batching:
 import { BatchQueue } from "kinetex";
 
 const batch = new BatchQueue(client, {
-  maxBatch: 50, // Flush when 50 requests queued (default: 100)
-  flushMs: 10, // Flush after 10ms even if batch not full (default: 0)
+  maxBatch: 50, // Dispatch in groups of 50 (default: 100; must be a positive integer)
+  flushMs: 10, // Flush after 10ms even if the batch is not full (default: 0)
 });
 
 // Fire many requests — they batch automatically
@@ -2199,6 +2527,8 @@ const [r1, r2, r3] = await Promise.all([
 batch.flush(); // Force flush pending requests
 batch.pendingCount; // Number of queued requests
 ```
+
+> `maxBatch` is a **batching size, not a concurrency limit**: every request taken out of the queue is dispatched immediately and in parallel, and `flush()` drains the whole queue the same way. Use it to bound how much is dispatched per tick, and a rate limiter or semaphore to bound actual parallelism. `maxBatch: 0` (or a negative/fractional value) throws a `RangeError` in the constructor, as does a negative or non-finite `flushMs`.
 
 ---
 
@@ -2256,8 +2586,8 @@ import type {
   DataURLParts,
 } from "kinetex/url";
 
-// URL Builder (fluent, immutable)
-const url = URLBuilder.from("https://api.example.com")
+// URL Builder (fluent, immutable — every method returns a new builder)
+const builder = URLBuilder.from("https://api.example.com")
   .withPathname("/v1/users")
   .appendPath("42", "posts")
   .setParam("page", "1")
@@ -2265,29 +2595,30 @@ const url = URLBuilder.from("https://api.example.com")
   .omitParams("internal")
   .redactParams("token")
   .sortParams()
-  .addTrailingSlash()
-  .toString();
+  .addTrailingSlash();
+
+builder.toString();
 // → "https://api.example.com/v1/users/42/posts/?limit=10&page=1&token=REDACTED"
 
 URLBuilder.https("api.example.com", "/v1/users"); // Factory
 URLBuilder.http("api.example.com"); // Factory
 
-// Properties:
-url.href;
-url.protocol;
-url.hostname;
-url.host;
-url.port;
-url.pathname;
-url.search;
-url.hash;
-url.origin;
-url.searchParams; // → URLSearchParams
-url.queryObject; // → Record<string, string | string[]>
+// Properties — read these off the *builder*, not off toString():
+builder.href;
+builder.protocol;
+builder.hostname;
+builder.host;
+builder.port;
+builder.pathname;
+builder.search;
+builder.hash;
+builder.origin;
+builder.searchParams; // → URLSearchParams
+builder.queryObject; // → Record<string, string | string[]>
 
 // Percent encoding
 percentEncode("hello world"); // "hello%20world"
-percentEncode("a b", true); // "a%20b" (reserved not encoded)
+percentEncode("a b", true); // "a%20b" — true lets reserved chars (:/?#[]@!$&'()*+,;=) pass through
 percentDecode("hello%20world"); // "hello world"
 
 // Query string
@@ -2324,7 +2655,8 @@ isLocalhost("http://localhost:8080"); // true
 
 // URL resolution
 resolveURL("/v1/users", "https://api.example.com"); // "https://api.example.com/v1/users"
-relativeURL("https://api.example.com/v1/users", "https://api.example.com"); // "/v1/users"
+relativeURL("https://api.example.com/v1/users", "https://api.example.com"); // "v1/users" (no leading slash)
+relativeURL("https://other.com/x", "https://api.example.com"); // null — not under base
 
 // Data URLs
 parseDataURL("data:image/png;base64,iVBOR..."); // { mediaType: "image/png", isBase64: true, data: "iVBOR..." }
@@ -2332,7 +2664,7 @@ buildDataURL("hello", "text/plain"); // "data:text/plain;base64,aGVsbG8="
 
 // Redaction
 redactURL("https://api.example.com?token=secret&key=123", "token", "key");
-// → "https://api.example.com?token=REDACTED&key=REDACTED"
+// → "https://api.example.com/?token=REDACTED&key=REDACTED"
 
 // Diff
 diffURLs("https://a.com/path?a=1", "https://b.com/other?b=2");
@@ -2397,7 +2729,7 @@ import {
   // Forwarded
   parseForwarded,
   normalizeForwardedHeaders,
-  getClientIP,
+  getClientIP, // (headers, { trustedHops }) — see below
 
   // Retry
   parseRetryAfter,
@@ -2412,8 +2744,8 @@ import {
   parseAltSvc,
   parseWarning,
   parseParams,
-  securityHeaders, // Recommended security headers map
-  corsHeaders, // CORS headers map
+  securityHeaders, // (options) => HttpHeaders — recommended security header set
+  corsHeaders, // (options) => HttpHeaders — CORS response headers
 
   // Conversion
   fromNodeHeaders, // node:http.IncomingMessage → Record
@@ -2429,19 +2761,42 @@ HeaderName.CacheControl; // "cache-control"
 HeaderName.ETag; // "etag"
 // ... all standard headers
 
-// Cache-Control parsing
+// Cache-Control parsing — directives use camelCase keys, not kebab-case
 parseCacheControl("public, max-age=3600, stale-while-revalidate=300");
-// → { public: true, "max-age": 3600, "stale-while-revalidate": 300 }
-formatCacheControl({ public: true, "max-age": 3600 }); // "public, max-age=3600"
+// → { noCache: false, noStore: false, noTransform: false, onlyIfCached: false,
+//     maxAge: 3600, maxStale: null, minFresh: null, staleIfError: null,
+//     public: true, private: false, mustRevalidate: false, proxyRevalidate: false,
+//     sMaxAge: null, immutable: false, mustUnderstand: false,
+//     staleWhileRevalidate: 300, unknown: {} }
+formatCacheControl({ public: true, maxAge: 3600 }); // "public, max-age=3600"
 
-// Content-Type
-formatContentType("application/json", { charset: "utf-8" });
+// Content-Type — takes a single object, not (string, options)
+formatContentType({ mediaType: "application/json", charset: "utf-8" });
 // → "application/json; charset=utf-8"
 
-// Security headers preset
-securityHeaders; // { "x-content-type-options": "nosniff", "x-frame-options": "DENY", ... }
-corsHeaders; // { "access-control-allow-origin": "*", ... }
+// Security / CORS headers are functions returning HttpHeaders
+securityHeaders({ hsts: true, csp: "default-src 'self'", frameOptions: "DENY", noSniff: true });
+corsHeaders({ origin: "*", methods: ["GET", "POST"], credentials: false, maxAge: 600 });
 ```
+
+---
+
+### `getClientIP` — proxy trust
+
+`X-Forwarded-For` is client-controlled: the left-most entry is whatever the caller sent. `getClientIP` therefore takes a `trustedHops` count — the number of reverse proxies you actually operate — and returns the address the nearest trusted proxy appended:
+
+```ts
+import { getClientIP, HttpHeaders } from "kinetex/headers";
+
+const headers = new HttpHeaders(req.headers);
+
+// X-Forwarded-For: 1.1.1.1, 2.2.2.2, 3.3.3.3
+getClientIP(headers, { trustedHops: 1 }); // → "3.3.3.3" (written by your edge proxy)
+getClientIP(headers, { trustedHops: 2 }); // → "2.2.2.2"
+getClientIP(headers); // → "1.1.1.1" (client-supplied, spoofable — default for back-compat)
+```
+
+`for="…"` quoting, `[ipv6]:port` and a bare `:port` suffix are normalized away. ⚠️ Never use the default (`trustedHops: 0`) result for access control, rate limiting or audit trails; the value is not validated as an IP address.
 
 ---
 
@@ -2492,17 +2847,17 @@ const formData = await readFormData(response); // Parse as FormData
 const data = await assertOkJSON<MyType>(response); // Throws on non-2xx
 await assertOk(response); // Throws on non-2xx
 
-// Size limiting
-const limited = await readBodyWithLimit(response, {
+// Size limiting — readBodyWithLimit takes a *stream*, a url, and a limit config
+const limited = await readBodyWithLimit(response.body, response.url, {
   maxBytes: 1_000_000,
   onExceed: "throw", // "throw" | "truncate" | "abort"
   onExceedCallback: (bytesRead, limit) => log(`Exceeded ${limit}`),
 });
 
-const reader = createLimitedReader(stream, {
-  maxBytes: 1_000_000,
-  onExceed: "throw",
-});
+// createLimitedReader takes a byte count and an action — not (stream, config).
+// It returns a LimitedReader with json/text/bytes/blob/stream/ndjson methods.
+const reader = createLimitedReader(1_000_000, "throw");
+const parsed = await reader.json<Response>(response);
 
 // Multipart
 const parts = await parseMultipartResponse(response, boundary);
@@ -2511,16 +2866,17 @@ const parts = await parseMultipartResponse(response, boundary);
 const decompressed = await decompressStream(compressedStream, "gzip");
 const raw = await applyDecompression(rawBody, headers);
 
-// Server-Timing
+// Server-Timing — returns an array of metrics
 const timings = extractServerTiming(headers);
-// → { dur, desc, ... }
+// → [{ name: "db", duration: 53, description: null }]
 
 // Response diffing
 const diff = diffResponses(res1, res2);
 
 // Content type
 parseContentType("application/json; charset=utf-8");
-// { type: "application/json", parameters: { charset: "utf-8" } }
+// { mediaType: "application/json", type: "application", subtype: "json",
+//   charset: "utf-8", boundary: null }
 isJSON(response); // true if content-type is JSON
 isText(response); // true if content-type is text/*
 isBinary(response); // true if binary content-type
@@ -2623,18 +2979,30 @@ import {
 } from "kinetex";
 
 // Type guards
-isUint8Array(data);        // data is Uint8Array
-isPlainObject(obj);        // obj is Record<string, unknown>
-isAbortSignal(signal);     // signal is AbortSignal
-isFormData(data);          // data is FormData
-isBlob(data);              // data is Blob
-isAbortError(err);         // boolean
+isUint8Array(data); // data is Uint8Array
+isPlainObject(obj); // obj is Record<string, unknown>
+isAbortSignal(signal); // signal is AbortSignal
+isFormData(data); // data is FormData
+isBlob(data); // data is Blob
+isAbortError(err); // boolean
 isValidHeaderName("x-foo"); // boolean
-isValidHeaderValue("bar");  // boolean
+isValidHeaderValue("bar"); // boolean
 
 // Safe URL checking
-isSafeURL("https://evil.com"); // boolean — checks for dangerous protocols
-sanitizeURL("javascript:alert(1)"); // string — stripped or redacted
+// Rejects non-HTTP(S) schemes and any host that resolves to a blocked literal range:
+// loopback, RFC 1918, CGNAT, link-local (incl. 169.254.169.254), IETF/TEST-NET,
+// benchmarking, multicast and reserved space — including IPv4-mapped/compatible
+// IPv6, 6to4, NAT64, hex/octal/decimal IPv4 literals and WHATWG shortcut hosts.
+isSafeURL("https://api.example.com"); // true
+isSafeURL("http://127.0.0.1/"); // false
+isSafeURL("http://169.254.169.254/latest/meta-data/"); // false
+isSafeURL("http://[::ffff:127.0.0.1]/"); // false
+
+// Applied to the initial URL AND to every redirect hop, so a public host cannot
+// bounce a request into the private network. (DNS rebinding is out of scope —
+// the check is literal-address based, not a resolution.)
+sanitizeURL("javascript:alert(1)"); // null — invalid or an SSRF risk
+sanitizeURL("https://user:pass@api.example.com/x"); // "https://api.example.com/x" (credentials stripped)
 
 // Error construction
 const err = createStructuredError("EVALIDATION", "Invalid config", {
@@ -2730,19 +3098,20 @@ validateErrorCode("INVALID"); // undefined
 
 ### Error Codes
 
-| Code          | Error Class       | Description                       |
-| ------------- | ----------------- | --------------------------------- |
-| `ENETWORK`    | `NetworkError`    | Server/endpoint unreachable       |
-| `ETIMEOUT`    | `TimeoutError`    | Request/connection timeout        |
-| `EABORT`      | `AbortError`      | Request cancelled by caller       |
-| `EHTTPSTATUS` | `HTTPStatusError` | Server returned 4xx/5xx           |
-| `ESIZELIMIT`  | `SizeLimitError`  | Response body exceeded size limit |
-| `EPARSE`      | —                 | Failed to parse response body     |
-| `EVALIDATION` | `ValidationError` | Invalid request configuration     |
-| `EAUTH`       | `AuthError`       | Authentication failed             |
-| `EPROXY`      | `ProxyError`      | Proxy configuration error         |
-| `EREDIRECT`   | `RedirectError`   | Redirect error                    |
-| `EUNKNOWN`    | `KinetexError`    | Unknown/unexpected                |
+| Code           | Error Class        | Description                         |
+| -------------- | ------------------ | ----------------------------------- |
+| `ENETWORK`     | `NetworkError`     | Server/endpoint unreachable         |
+| `ETIMEOUT`     | `TimeoutError`     | Request/connection timeout          |
+| `EABORT`       | `AbortError`       | Request cancelled by caller         |
+| `EHTTPSTATUS`  | `HTTPStatusError`  | Server returned 4xx/5xx             |
+| `ESIZELIMIT`   | `SizeLimitError`   | Response body exceeded size limit   |
+| `EPARSE`       | —                  | Failed to parse response body       |
+| `EVALIDATION`  | `ValidationError`  | Invalid request configuration       |
+| `EAUTH`        | `AuthError`        | Authentication failed               |
+| `EPROXY`       | `ProxyError`       | Proxy configuration error           |
+| `EREDIRECT`    | `RedirectError`    | Redirect error                      |
+| `ECIRCUITOPEN` | `CircuitOpenError` | Rejected by an open circuit breaker |
+| `EUNKNOWN`     | `KinetexError`     | Unknown/unexpected                  |
 
 ---
 
@@ -2752,54 +3121,145 @@ All sub-modules are tree-shakeable with deep import paths:
 
 ```ts
 // Core
-import { kinetex, Kinetex, FluentRequest, BatchQueue, createMethodCircuitBreakerKey } from "kinetex";
-import type { KinetexConfig, KinetexRequest, KinetexResponse, SendOptions, RetryConfig, RetryContext, AuthConfig, ProxyConfig, HTTPMethod, HTTPVersion, HeadersInit, QueryParams, QueryValue, BodyInit, Runtime, RequestId, Brand } from "kinetex";
+import {
+  kinetex,
+  Kinetex,
+  FluentRequest,
+  BatchQueue,
+  createMethodCircuitBreakerKey,
+} from "kinetex";
+import type {
+  KinetexConfig,
+  KinetexRequest,
+  KinetexResponse,
+  SendOptions,
+  RetryConfig,
+  RetryContext,
+  AuthConfig,
+  ProxyConfig,
+  HTTPMethod,
+  HTTPVersion,
+  HeadersInit,
+  QueryParams,
+  QueryValue,
+  BodyInit,
+  Runtime,
+  RequestId,
+  Brand,
+} from "kinetex";
 // Errors
-import { KinetexError, HTTPStatusError, TimeoutError, SizeLimitError, AbortError, NetworkError, ValidationError, AuthError, ProxyError, RedirectError } from "kinetex";
+import {
+  KinetexError,
+  HTTPStatusError,
+  TimeoutError,
+  SizeLimitError,
+  AbortError,
+  NetworkError,
+  ValidationError,
+  AuthError,
+  ProxyError,
+  RedirectError,
+} from "kinetex";
 // Types
-import type { InterceptorContext, HookContext, LifecycleHooks, RequestInterceptor, ResponseInterceptor, ErrorInterceptor, ProgressEvent, ProgressCallback, PipelineStep, PipelineStageName, CacheRequestConfig, HAREntry, HARLog } from "kinetex";
+import type {
+  InterceptorContext,
+  HookContext,
+  LifecycleHooks,
+  RequestInterceptor,
+  ResponseInterceptor,
+  ErrorInterceptor,
+  ProgressEvent,
+  ProgressCallback,
+  PipelineStep,
+  PipelineStageName,
+  CacheRequestConfig,
+  HAREntry,
+  HARLog,
+} from "kinetex";
 
 // Sub-modules (tree-shakeable):
-import { ... } from "kinetex/cache";
-import { ... } from "kinetex/sse";
-import { ... } from "kinetex/graphql";
-import { ... } from "kinetex/pagination";
-import { ... } from "kinetex/progress";
-import { ... } from "kinetex/logging";
-import { ... } from "kinetex/response";
-import { ... } from "kinetex/headers";
-import { ... } from "kinetex/url";
-import { ... } from "kinetex/aws-sigv4";
-import { ... } from "kinetex/socks5";
-import { ... } from "kinetex/cookiejar";
-import { ... } from "kinetex/circuit-breaker";
-import { ... } from "kinetex/dedup";
-import { ... } from "kinetex/digest";
-import { ... } from "kinetex/ws";
-import { ... } from "kinetex/lifecycle";
-import { ... } from "kinetex/interceptors";
-import { ... } from "kinetex/core";
-import { ... } from "kinetex/worker";
+import {} from /* ... */ "kinetex/cache";
+import {} from /* ... */ "kinetex/sse";
+import {} from /* ... */ "kinetex/graphql";
+import {} from /* ... */ "kinetex/pagination";
+import {} from /* ... */ "kinetex/progress";
+import {} from /* ... */ "kinetex/logging";
+import {} from /* ... */ "kinetex/response";
+import {} from /* ... */ "kinetex/headers";
+import {} from /* ... */ "kinetex/url";
+import {} from /* ... */ "kinetex/aws-sigv4";
+import {} from /* ... */ "kinetex/socks5";
+import {} from /* ... */ "kinetex/cookiejar";
+import {} from /* ... */ "kinetex/circuit-breaker";
+import {} from /* ... */ "kinetex/dedup";
+import {} from /* ... */ "kinetex/digest";
+import {} from /* ... */ "kinetex/ws";
+import {} from /* ... */ "kinetex/cookie-parser";
+import {} from /* ... */ "kinetex/lifecycle";
+import {} from /* ... */ "kinetex/interceptors";
+import {} from /* ... */ "kinetex/core";
+import {} from /* ... */ "kinetex/worker";
 
 // Types only from sub-modules:
 import type { CacheEntry, CacheStats, CacheConfig, CacheStorageAdapter } from "kinetex/cache";
 import type { SSEEvent, SSEClientConfig, JSONSSEEvent } from "kinetex/sse";
-import type { GraphQLRequest, GraphQLResponse, GraphQLError, GraphQLClientConfig, GraphQLLink, GraphQLLinkNext } from "kinetex/graphql";
+import type {
+  GraphQLRequest,
+  GraphQLResponse,
+  GraphQLError,
+  GraphQLClientConfig,
+  GraphQLLink,
+  GraphQLLinkNext,
+} from "kinetex/graphql";
 import type { Page, PaginationState } from "kinetex/pagination";
 import type { LogEntry, LogTransport, LoggerConfig } from "kinetex/logging";
 import type { ResponseParseOptions, SizeLimitConfig } from "kinetex/response";
 import type { Cookie, CookieJSON } from "kinetex/cookiejar";
-import type { CircuitState, CircuitBreakerConfig, CircuitBreakerState, FailureFilter } from "kinetex/circuit-breaker";
+import type {
+  CircuitState,
+  CircuitBreakerConfig,
+  CircuitBreakerState,
+  FailureFilter,
+} from "kinetex/circuit-breaker";
 import type { DedupOptions } from "kinetex/dedup";
 import type { DigestChallenge } from "kinetex/digest";
-import type { WSState, WSMessage, WSClientConfig, WSCloseEvent, WSBackpressureInfo, WSSubscribedRoom } from "kinetex/ws";
-import type { HookRequest, HookResponse, HookError, HookOptions, BeforeRequestHook, AfterRequestHook, BeforeResponseHook, AfterResponseHook, OnErrorHook, OnRetryHook, OnRedirectHook, OnUploadProgressHook, OnDownloadProgressHook, AroundHook } from "kinetex/lifecycle";
+import type {
+  WSState,
+  WSMessage,
+  WSClientConfig,
+  WSCloseEvent,
+  WSBackpressureInfo,
+  WSSubscribedRoom,
+} from "kinetex/ws";
+import type {
+  HookRequest,
+  HookResponse,
+  HookError,
+  HookOptions,
+  BeforeRequestHook,
+  AfterRequestHook,
+  BeforeResponseHook,
+  AfterResponseHook,
+  OnErrorHook,
+  OnRetryHook,
+  OnRedirectHook,
+  OnUploadProgressHook,
+  OnDownloadProgressHook,
+  AroundHook,
+} from "kinetex/lifecycle";
 import type { AWSCredentials, SigningConfig, CredentialProvider } from "kinetex/aws-sigv4";
 import type { Socks5ProxyConfig, Socks5Tunnel, Socks5Target, TcpConnector } from "kinetex/socks5";
 import type { FetchTransportOptions } from "kinetex/core";
 import type { OTelTracer, OTelSpan } from "kinetex";
 import type { SafeJSONParseOptions, SafeJSONParseResult, ErrorContext } from "kinetex";
-import type { ParsedURL, URLBuilderOptions, URLPattern, URLPatternMatch, URLDiff, DataURLParts } from "kinetex/url";
+import type {
+  ParsedURL,
+  URLBuilderOptions,
+  URLPattern,
+  URLPatternMatch,
+  URLDiff,
+  DataURLParts,
+} from "kinetex/url";
 ```
 
 ---
@@ -2809,7 +3269,13 @@ import type { ParsedURL, URLBuilderOptions, URLPattern, URLPatternMatch, URLDiff
 Cloudflare Workers / Vercel Edge / WinterCG safe entry point:
 
 ```ts
-import { kinetex, Kinetex, FluentRequest, BatchQueue, createMethodCircuitBreakerKey } from "kinetex/worker";
+import {
+  kinetex,
+  Kinetex,
+  FluentRequest,
+  BatchQueue,
+  createMethodCircuitBreakerKey,
+} from "kinetex/worker";
 // Only exports types and classes safe for edge environments.
 // No Node.js-specific imports, no HTTP/2 transport.
 // Also exports error classes: KinetexError, HTTPStatusError, TimeoutError, NetworkError, RedirectError
@@ -2817,6 +3283,8 @@ import { kinetex, Kinetex, FluentRequest, BatchQueue, createMethodCircuitBreaker
 const client = kinetex({ baseURL: "https://api.example.com" });
 // Uses FetchTransport (globalThis.fetch) automatically.
 // Defaults to HTTP/1.1 for maximum edge compatibility.
+// httpVersion: "HTTP/2" is ignored here — the HTTP/2 transport needs node:http2,
+// which this entry point deliberately excludes. Use the main entry on Node.js.
 ```
 
 ```ts
@@ -2862,24 +3330,24 @@ import { kinetex } from "kinetex/browser";
 
 ## Runtime Compatibility
 
-| Feature                     | Node 18+ | Node 22+ | Deno      | Bun | Browser      | CF Workers | Vercel Edge |
-| --------------------------- | -------- | -------- | --------- | --- | ------------ | ---------- | ----------- |
-| HTTP/1.1 fetch              | ✓        | ✓        | ✓         | ✓   | ✓            | ✓          | ✓           |
-| HTTP/2 (fetch, via Alt-Svc/runtime hints) | ✓* | ✓      | ✓         | ✓   | ✓            | ✓          | ✓           |
-| HTTP/2 (NodeHTTP2Transport) | ✗        | ✓        | ✗         | ✗   | ✗            | ✗          | ✗           |
-| HTTP/3 (detection via Alt-Svc) | ✓*   | ✓*       | ✓*        | ✓*  | experimental | ✓*         | ✓*          |
-| WebSocket (WSClient)        | ✗¹ (no native WebSocket) | ✓ | ✓ | ✓ | ✓ | partial² | ✗³          |
-| SOCKS5 proxy                | ✓        | ✓        | ✓         | ✓   | ✗            | ✗          | ✗           |
-| Blob                        | ✓        | ✓        | ✓         | ✓   | ✓            | guarded    | guarded     |
-| DOMException                | ✓        | ✓        | ✓         | ✓   | ✓            | guarded    | guarded     |
-| Buffer                      | ✓        | ✓        | ✓         | ✓   | ✗            | ✗          | ✗           |
-| crypto.subtle               | ✓        | ✓        | ✓         | ✓   | ✓            | ✓          | ✓           |
-| ReadableStream              | ✓        | ✓        | ✓         | ✓   | ✓            | ✓          | ✓           |
-| URL pattern matching        | ✓        | ✓        | ✓         | ✓   | ✓            | ✓          | ✓           |
-| Brotli decompression        | ✓        | ✓        | ✗ passthrough | ✗ passthrough | ✗ passthrough | ✗ passthrough | ✗ passthrough |
-| Gzip/deflate decompression  | ✓        | ✓        | ✓         | ✓   | ✓            | ✓          | ✓           |
+| Feature                                   | Node 18+                 | Node 22+ | Deno          | Bun           | Browser       | CF Workers    | Vercel Edge   |
+| ----------------------------------------- | ------------------------ | -------- | ------------- | ------------- | ------------- | ------------- | ------------- |
+| HTTP/1.1 fetch                            | ✓                        | ✓        | ✓             | ✓             | ✓             | ✓             | ✓             |
+| HTTP/2 (fetch, via Alt-Svc/runtime hints) | ✓*                       | ✓        | ✓             | ✓             | ✓             | ✓             | ✓             |
+| HTTP/2 (NodeHTTP2Transport)               | ✗                        | ✓        | ✗             | ✗             | ✗             | ✗             | ✗             |
+| HTTP/3 (detection via Alt-Svc)            | ✓*                       | ✓*       | ✓*            | ✓*            | experimental  | ✓*            | ✓*            |
+| WebSocket (WSClient)                      | ✗¹ (no native WebSocket) | ✓        | ✓             | ✓             | ✓             | partial²      | ✗³            |
+| SOCKS5 proxy                              | ✓                        | ✓        | ✓             | ✓             | ✗             | ✗             | ✗             |
+| Blob                                      | ✓                        | ✓        | ✓             | ✓             | ✓             | guarded       | guarded       |
+| DOMException                              | ✓                        | ✓        | ✓             | ✓             | ✓             | guarded       | guarded       |
+| Buffer                                    | ✓                        | ✓        | ✓             | ✓             | ✗             | ✗             | ✗             |
+| crypto.subtle                             | ✓                        | ✓        | ✓             | ✓             | ✓             | ✓             | ✓             |
+| ReadableStream                            | ✓                        | ✓        | ✓             | ✓             | ✓             | ✓             | ✓             |
+| URL pattern matching                      | ✓                        | ✓        | ✓             | ✓             | ✓             | ✓             | ✓             |
+| Brotli decompression                      | ✓                        | ✓        | ✗ passthrough | ✗ passthrough | ✗ passthrough | ✗ passthrough | ✗ passthrough |
+| Gzip/deflate decompression                | ✓                        | ✓        | ✓             | ✓             | ✓             | ✓             | ✓             |
 
-\* HTTP/2+ detection is best-effort: `detectHTTPVersion()` reports HTTP/2 only when the runtime exposes protocol evidence (response `httpVersion`/`protocol` properties, or an `Alt-Svc` header); otherwise it reports `HTTP/1.1`. This is accurate for Node 18's undici fetch, which does not negotiate h2 by default — use `NodeHTTP2Transport` (Node 22+) for guaranteed HTTP/2.
+\* HTTP/2+ detection is best-effort and internal. kinetex's own `detectHTTPVersion()` helper (not exported) reports HTTP/2 only when the runtime exposes protocol evidence — a response `httpVersion`/`protocol` property, or an `Alt-Svc` header — and otherwise reports `HTTP/1.1`. The version on every `KinetexResponse` comes from that heuristic, so it is not a guarantee. This is accurate for Node 18's undici fetch, which does not negotiate h2 by default; use `NodeHTTP2Transport` (Node 22+) when you need guaranteed HTTP/2.
 
 ¹ WSClient requires a native `WebSocket` constructor. Node added one in v22 — on Node 18 use a polyfill (`globalThis.WebSocket = require('undici').WebSocket`).
 
@@ -2896,14 +3364,20 @@ import { kinetex } from "kinetex/browser";
 ## Resource Cleanup
 
 ```ts
-client.destroy();
+await client.destroy();
 // Closes all HTTP/2 sessions (NodeHTTP2Transport.destroy())
 // Closes all tracked WebSocket connections
-// Clears cache
 // Clears dedup map
 // Clears circuit breakers
 // Clears all interceptors
 // Nullifies cookie jar and logger references
+```
+
+`destroy()` releases resources — it does **not** delete cached data. A user-supplied storage adapter (`localStorage`, Cloudflare KV, Redis, …) would otherwise lose every persisted entry on teardown. To empty the cache explicitly:
+
+```ts
+const cache = await client.getCache();
+await cache?.clear();
 ```
 
 ---
