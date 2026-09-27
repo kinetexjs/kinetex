@@ -35,6 +35,9 @@
  */
 
 import { execSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { rmSync, writeFileSync } from "node:fs";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const run = (cmd: string) => {
@@ -145,8 +148,42 @@ function banner(version: string, lines: string[]): void {
 }
 
 /** Phase 7 of the flow: watch checks → squash-merge → tag origin/main → push tag. */
+const sleepSync = (ms: number): void => {
+  execSync(`sleep ${Math.ceil(ms / 1000)}`, { stdio: "ignore" });
+};
+
+/**
+ * Wait until GitHub has registered checks for `branch`.
+ *
+ * A freshly opened PR has no checks for the first few seconds, and `gh pr
+ * checks` both exits non-zero and prints "no checks reported" in that window.
+ * Treating that as a failure aborted the very first release run with
+ * "Required checks failed" before a single check had started.
+ */
+function waitForChecks(branch: string, timeoutMs = 180_000): boolean {
+  const deadline = Date.now() + timeoutMs;
+  let announced = false;
+  while (Date.now() < deadline) {
+    const out = runSilentAllowFail(`gh pr checks ${branch}`);
+    if (out && !out.includes("no checks reported")) return true;
+    if (!announced) {
+      console.log("  … waiting for GitHub to register checks");
+      announced = true;
+    }
+    sleepSync(5_000);
+  }
+  return false;
+}
+
 function mergeAndTag(newVersion: string, branch: string): void {
   console.log("\n[merge] Waiting for required checks...");
+  if (!waitForChecks(branch)) {
+    console.error(
+      "❌ No checks were registered for this PR within 180s — not merging.\n" +
+        `   Inspect with: gh pr checks ${branch}`,
+    );
+    process.exit(1);
+  }
   // --watch blocks until every check finishes (--fail-fast bails on the first
   // failure). gh exits non-zero when a check fails — captured, then the
   // explicit status query below decides success/failure.
@@ -330,11 +367,21 @@ async function main() {
   console.log("\n[5/6] Pushing branch and opening the release PR...");
   run(`git push -u origin ${branch}`);
   const draftFlag = cli.draft ? "--draft " : "";
-  run(
-    `gh pr create --base main --head ${branch} ${draftFlag}` +
-      `--title "chore: release v${newVersion}" ` +
-      `--body ${JSON.stringify(releasePrBody(oldVersion, newVersion))}`,
-  );
+  // The body must not go through a shell: it is full of backticks, and
+  // execSync runs the command via /bin/sh, which would command-substitute
+  // them — silently truncating the body and splicing the executed commands'
+  // output into it. Write it to a file and use --body-file instead.
+  const bodyFile = join(tmpdir(), `kinetex-release-${newVersion}.md`);
+  writeFileSync(bodyFile, releasePrBody(oldVersion, newVersion));
+  try {
+    run(
+      `gh pr create --base main --head ${branch} ${draftFlag}` +
+        `--title "chore: release v${newVersion}" ` +
+        `--body-file ${JSON.stringify(bodyFile)}`,
+    );
+  } finally {
+    rmSync(bodyFile, { force: true });
+  }
   const prUrl = runSilent(`gh pr view ${branch} --json url --jq .url`);
   console.log(`  ✓ ${prUrl}`);
 
