@@ -731,16 +731,23 @@ await test("getCookiesForDomain does not return expired cookies", () => {
 
 await test("cookie with Max-Age and Expires both set uses Max-Age", () => {
   const jar = createCookieJar();
-  const future = new Date(Date.now() + 86400000).toUTCString();
-  jar.setCookie("x=1; Max-Age=3600; Expires=" + future, { url: "https://example.com/" });
-  const expires = jar.getCookies({ url: "https://example.com/" })[0].expires;
-  const expectedMaxAge = Date.now() + 3600000;
+  // Expires lands a full day out, so "used Expires" and "used Max-Age"
+  // are unambiguously distinct outcomes rather than near-identical numbers.
+  const expiresAttr = new Date(Date.now() + 86400000).toUTCString();
+  jar.setCookie("x=1; Max-Age=3600; Expires=" + expiresAttr, { url: "https://example.com/" });
+  const cookie = jar.getCookies({ url: "https://example.com/" })[0];
+  assert.notEqual(cookie.expires, null);
+
+  // Max-Age is relative to "now" and Expires is absolute, so the two differ by a
+  // whole day. Asserting an exact millisecond count races against the clock
+  // ticking between setCookie() and the read; precedence is what is under test,
+  // and that is decidable exactly: the expiry must be ~1h away, never ~24h.
+  const remaining = (cookie.expires as number) - Date.now();
   assert.equal(
-    Math.abs(expires - expectedMaxAge) < 5000,
+    remaining > 3500000 && remaining <= 3600000,
     true,
-    `expected ~1h, got ${expires - Date.now()}ms`,
+    `Max-Age=3600 should win over Expires, expected ~1h remaining, got ${remaining}ms`,
   );
-  assert.equal(expires - Date.now(), 3600000);
 });
 
 await test("update preserves createdAt across multiple updates", () => {

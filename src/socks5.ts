@@ -725,8 +725,6 @@ export const denoTcpConnector: TcpConnector = async (host, port, timeoutMs): Pro
     };
   };
 
-  let conn: Awaited<ReturnType<typeof denoGlobal.Deno.connect>>;
-
   // NOTE: every timeout below is created and cleared explicitly. The previous
   // Promise.race timers were never cleared, so each read left a pending timer
   // (holding a closure, and keeping the Deno event loop alive) for the full
@@ -749,12 +747,14 @@ export const denoTcpConnector: TcpConnector = async (host, port, timeoutMs): Pro
     }
   };
 
-  conn = await withTimeout(
+  const conn: Awaited<ReturnType<typeof denoGlobal.Deno.connect>> = await withTimeout(
     denoGlobal.Deno.connect({ hostname: host, port, transport: "tcp" }),
     "TCP connect to proxy timed out",
   );
 
-  const wrappedRead = async (buf: Uint8Array): Promise<number | null> => {
+  // Not `async`: it returns withTimeout()'s promise directly, so there is no
+  // await to make the function async.
+  const wrappedRead = (buf: Uint8Array): Promise<number | null> => {
     const read = conn.read(buf).catch(() => null);
     return withTimeout(read, "TCP read timed out");
   };

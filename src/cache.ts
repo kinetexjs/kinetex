@@ -536,7 +536,12 @@ function buildVaryKey(varyHeader: string, requestHeaders: Record<string, string>
 /**
  * Normalize a string for use in a cache key to prevent injection attacks.
  * Removes control characters and normalizes whitespace.
+ *
+ * The control characters are the entire point of the match: they are what has
+ * to be stripped out of a URL before it is used as a cache-key component, so
+ * `no-control-regex` is suppressed here deliberately.
  */
+// deno-lint-ignore no-control-regex
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 
 function normalizeCacheKeyPart(part: string): string {

@@ -3455,7 +3455,10 @@ export class Kinetex {
    * Call this when the client is no longer needed to prevent memory leaks.
    * @returns A promise that resolves when cleanup is complete.
    */
-  async destroy(): Promise<void> {
+  // Not `async`: nothing here awaits, so the returned promise is resolved
+  // explicitly instead. The signature stays Promise<void> — callers and the
+  // docs `await client.destroy()`.
+  destroy(): Promise<void> {
     // Close all tracked WebSocket connections
     for (const ws of this._wsClients) {
       try {
@@ -3479,6 +3482,8 @@ export class Kinetex {
     this._circuitBreakers?.clear?.();
     this._otelTracer = null;
     this.interceptors.clear();
+
+    return Promise.resolve();
   }
 }
 
