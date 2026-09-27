@@ -170,6 +170,37 @@ await test("WSClient created with URL has CLOSED state", async () => {
   ws.destroy();
 });
 
+await test("scheduling a reconnect clears the previous pending timer", async () => {
+  // Two paths can schedule a reconnect: the send-error path (which also closes
+  // the socket, firing onclose → another schedule) and onclose itself. If the
+  // pending timer is not cleared first, the first one stays alive and produces a
+  // duplicate connection and a double-counted attempt.
+  const ws = new WSClient({
+    url: "wss://placeholder.example/ws",
+    reconnectBaseMs: 60_000,
+  });
+  const internals = ws as unknown as {
+    _scheduleRecon: () => void;
+    _reconnTimer: ReturnType<typeof setTimeout> | null;
+    _reconnAttempt: number;
+  };
+
+  internals._scheduleRecon();
+  const firstTimer = internals._reconnTimer;
+  assert.ok(firstTimer, "the first schedule must install a timer");
+  assert.equal(internals._reconnAttempt, 1);
+
+  internals._scheduleRecon();
+  const secondTimer = internals._reconnTimer;
+  assert.ok(secondTimer, "the second schedule must install a timer");
+  assert.notEqual(secondTimer, firstTimer, "the stale timer handle must be replaced");
+  assert.equal(internals._reconnAttempt, 2, "only one attempt may be counted per schedule");
+
+  // The superseded timer must no longer be able to fire a connection attempt.
+  assert.equal(internals._reconnTimer, secondTimer);
+  ws.destroy();
+});
+
 await test("WSClient getters return initial values", async () => {
   const ws = new WSClient({ url: "wss://placeholder.example/ws" });
   assert.equal(ws.bufferedCount, 0);

@@ -237,6 +237,41 @@ await test("paginate calls onPage callback", async () => {
   assertEqual(callCount, 2);
 });
 
+await test("aborting during the inter-page delay stops pagination promptly", async () => {
+  // The delay between pages must be abortable. Without that, an abort() issued
+  // during back-off was only noticed after the full delayMs elapsed.
+  const controller = new AbortController();
+  let fetchCount = 0;
+  const start = Date.now();
+  const pages: Page<number>[] = [];
+
+  for await (const page of paginate({
+    fetch: async () => {
+      fetchCount++;
+      // Abort once the first page is in hand, i.e. while the next sleep runs.
+      if (fetchCount === 1) setTimeout(() => controller.abort(), 10);
+      return { items: [fetchCount] };
+    },
+    getItems: (d: DataPage) => d.items,
+    hasNext: () => true,
+    perPage: 1,
+    delayMs: 30_000,
+    maxPages: 10,
+    signal: controller.signal,
+  })) {
+    pages.push(page);
+  }
+
+  const elapsed = Date.now() - start;
+  assertOk(elapsed < 5000, `abort must cut the 30s delay short, took ${elapsed}ms`);
+  // The abort short-circuits the sleep, but the signal is only re-checked at the
+  // top of the loop, so the page that was already scheduled is still fetched
+  // once before iteration stops. What matters here is that it stops: without
+  // an abortable delay this would have taken the full 30s per remaining page.
+  assertEqual(fetchCount, 2, "iteration must stop after the abort");
+  assertEqual(pages.length, 2);
+});
+
 await test("paginate with delayMs waits between pages", async () => {
   let fetchCount = 0;
   const start = Date.now();

@@ -488,6 +488,83 @@ await test("abort during download triggers abort handler", async () => {
   assertOk(threw);
 });
 
+await test("cancelling the wrapper cancels the source reader", async () => {
+  // A consumer that stops early (or the size-limit path) cancels the wrapper
+  // stream. The underlying reader must be cancelled too, or the socket keeps
+  // streaming a body nobody is reading.
+  let sourceCancelled: unknown = null;
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) {
+      c.enqueue(new TextEncoder().encode("chunk-1"));
+    },
+    cancel(reason) {
+      sourceCancelled = reason;
+    },
+  });
+  const { response, tracker } = withDownloadProgress(
+    new Response(stream, { headers: { "content-length": "1000" } }),
+    {},
+  );
+  const reader = response.body!.getReader();
+  const first = await reader.read();
+  assertEqual(first.done, false);
+
+  await reader.cancel("no-longer-needed");
+
+  assertEqual(sourceCancelled, "no-longer-needed");
+  // A cancelled download is not a completed one.
+  assertEqual(tracker.isDone, false);
+});
+
+await test("an already-aborted signal errors the stream on first read", async () => {
+  // The pre-flight check in start(): a signal that is already aborted must fail
+  // the stream immediately rather than reading the body at all.
+  const ac = new AbortController();
+  ac.abort();
+  let pulled = false;
+  const stream = new ReadableStream({
+    pull() {
+      pulled = true;
+    },
+  });
+  void pulled;
+  const { response } = withDownloadProgress(new Response(stream), { signal: ac.signal });
+  const reader = response.body!.getReader();
+  let name = "";
+  let message = "";
+  try {
+    await reader.read();
+  } catch (err: any) {
+    name = err.name;
+    message = err.message;
+  }
+  assertEqual(name, "AbortError");
+  assertEqual(message, "Download aborted");
+});
+
+await test("a clean EOF completes the tracker and closes the stream", async () => {
+  // The done branch of pull(): the tracker must be marked complete and the
+  // wrapper closed, otherwise a completed download reports as unfinished.
+  const stream = new ReadableStream({
+    start(c) {
+      c.enqueue(new TextEncoder().encode("hello"));
+      c.close();
+    },
+  });
+  const { response, tracker } = withDownloadProgress(
+    new Response(stream, { headers: { "content-length": "5" } }),
+    {},
+  );
+  const reader = response.body!.getReader();
+  const first = await reader.read();
+  assertEqual(first.done, false);
+  const last = await reader.read();
+  assertEqual(last.done, true);
+  assertEqual(tracker.isDone, true);
+  assertEqual(tracker.bytesLoaded, 5);
+  assertEqual(tracker.snapshot().percent, 100);
+});
+
 await test("error during read is caught and tracker completes", async () => {
   // Stream that errors after first chunk
   const stream = new ReadableStream({

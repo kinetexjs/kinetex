@@ -447,6 +447,229 @@ await test("is exported as function", () => {
   assert.strictEqual(typeof denoTcpConnector, "function");
 });
 
+// denoTcpConnector reads globalThis.Deno at call time, so the whole body is
+// exercisable under Node by stubbing the global. Without these the Deno-only
+// connector shipped with no behavioural coverage at all.
+type FakeDenoConn = {
+  read: (buf: Uint8Array) => Promise<number | null>;
+  write: (data: Uint8Array) => Promise<number>;
+  close: () => void;
+};
+
+/**
+ * Install a stub `globalThis.Deno.connect` for the duration of `fn`.
+ * Restores the previous value (or deletes the key) afterwards.
+ */
+async function withFakeDeno<T>(
+  connect: (opts: { hostname: string; port: number; transport: string }) => Promise<FakeDenoConn>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const g = globalThis as Record<string, unknown>;
+  const had = "Deno" in g;
+  const prev = g.Deno;
+  g.Deno = { connect };
+  try {
+    return await fn();
+  } finally {
+    if (had) g.Deno = prev;
+    else delete g.Deno;
+  }
+}
+
+const never = <T,>(): Promise<T> => new Promise<T>(() => {});
+
+await test("passes hostname, port and tcp transport to Deno.connect", async () => {
+  let seen: { hostname: string; port: number; transport: string } | null = null;
+  await withFakeDeno(
+    async (opts) => {
+      seen = opts;
+      return { read: async () => null, write: async () => 0, close: () => {} };
+    },
+    async () => {
+      await denoTcpConnector("proxy.internal", 1080, 1000);
+    },
+  );
+  assert.deepStrictEqual(seen, { hostname: "proxy.internal", port: 1080, transport: "tcp" });
+});
+
+await test("read returns the byte count from the underlying conn", async () => {
+  const conn = await withFakeDeno(
+    async () => ({ read: async () => 7, write: async () => 0, close: () => {} }),
+    () => denoTcpConnector("h", 1, 1000),
+  );
+  assert.strictEqual(await conn.read(new Uint8Array(16)), 7);
+});
+
+await test("read yields null at EOF (underlying read resolves null)", async () => {
+  const conn = await withFakeDeno(
+    async () => ({ read: async () => null, write: async () => 0, close: () => {} }),
+    () => denoTcpConnector("h", 1, 1000),
+  );
+  assert.strictEqual(await conn.read(new Uint8Array(16)), null);
+});
+
+await test("a failing read resolves to null instead of rejecting", async () => {
+  // Deno's conn.read() rejects on a torn socket; the connector must degrade to
+  // EOF (null) so the SOCKS5 loop treats it as a closed tunnel.
+  const conn = await withFakeDeno(
+    async () => ({
+      read: async () => {
+        throw new Error("connection reset");
+      },
+      write: async () => 0,
+      close: () => {},
+    }),
+    () => denoTcpConnector("h", 1, 1000),
+  );
+  assert.strictEqual(await conn.read(new Uint8Array(16)), null);
+});
+
+await test("write delegates to the underlying conn and returns its count", async () => {
+  let written: Uint8Array | null = null;
+  const conn = await withFakeDeno(
+    async () => ({
+      read: async () => null,
+      write: async (d: Uint8Array) => {
+        written = d;
+        return d.length;
+      },
+      close: () => {},
+    }),
+    () => denoTcpConnector("h", 1, 1000),
+  );
+  const payload = new Uint8Array([5, 1, 0]);
+  assert.strictEqual(await conn.write(payload), 3);
+  assert.deepStrictEqual(written, payload);
+});
+
+await test("close delegates to the underlying conn", async () => {
+  let closed = 0;
+  const conn = await withFakeDeno(
+    async () => ({ read: async () => null, write: async () => 0, close: () => void closed++ }),
+    () => denoTcpConnector("h", 1, 1000),
+  );
+  conn.close();
+  assert.strictEqual(closed, 1);
+});
+
+await test("close swallows an error thrown by the underlying conn", async () => {
+  const conn = await withFakeDeno(
+    async () => ({
+      read: async () => null,
+      write: async () => 0,
+      close: () => {
+        throw new Error("already closed");
+      },
+    }),
+    () => denoTcpConnector("h", 1, 1000),
+  );
+  // Must not throw: close() is documented as idempotent and safe to call twice.
+  conn.close();
+  conn.close();
+});
+
+await test("a connect failure propagates the underlying error unchanged", async () => {
+  await withFakeDeno(
+    async () => {
+      throw new Error("ECONNREFUSED");
+    },
+    async () => {
+      await assert.rejects(
+        () => denoTcpConnector("h", 1, 1000),
+        (err: any) => err.message === "ECONNREFUSED" && !(err instanceof Socks5Error),
+      );
+    },
+  );
+});
+
+await test("connect timeout raises a retriable SOCKS5_TIMEOUT", async () => {
+  await withFakeDeno(
+    () => never<Promise<FakeDenoConn>>(),
+    async () => {
+      await assert.rejects(
+        () => denoTcpConnector("h", 1, 20),
+        (err: any) => {
+          assert.strictEqual(err instanceof Socks5Error, true);
+          assert.strictEqual(err.code, "SOCKS5_TIMEOUT");
+          assert.strictEqual(err.retriable, true);
+          assert.strictEqual(err.message, "TCP connect to proxy timed out");
+          return true;
+        },
+      );
+    },
+  );
+});
+
+await test("read timeout raises a retriable SOCKS5_TIMEOUT", async () => {
+  const conn = await withFakeDeno(
+    async () => ({ read: () => never<number | null>(), write: async () => 0, close: () => {} }),
+    () => denoTcpConnector("h", 1, 20),
+  );
+  await assert.rejects(
+    () => conn.read(new Uint8Array(8)),
+    (err: any) => {
+      assert.strictEqual(err instanceof Socks5Error, true);
+      assert.strictEqual(err.code, "SOCKS5_TIMEOUT");
+      assert.strictEqual(err.retriable, true);
+      assert.strictEqual(err.message, "TCP read timed out");
+      return true;
+    },
+  );
+});
+
+await test("timeoutMs of 0 disables the connect timeout", async () => {
+  // Proves the timeout really is skipped rather than merely generous: the
+  // connect resolves well after any plausible timeout, and still succeeds.
+  const started = Date.now();
+  const conn = await withFakeDeno(
+    async () => {
+      await new Promise((r) => setTimeout(r, 40));
+      return { read: async () => null, write: async () => 0, close: () => {} };
+    },
+    () => denoTcpConnector("h", 1, 0),
+  );
+  assert.ok(Date.now() - started >= 35, "connect must actually have waited");
+  assert.strictEqual(typeof conn.read, "function");
+});
+
+await test("timeoutMs of 0 disables the read timeout", async () => {
+  const conn = await withFakeDeno(
+    async () => ({
+      read: async () => {
+        await new Promise((r) => setTimeout(r, 40));
+        return 5;
+      },
+      write: async () => 0,
+      close: () => {},
+    }),
+    () => denoTcpConnector("h", 1, 0),
+  );
+  assert.strictEqual(await conn.read(new Uint8Array(8)), 5);
+});
+
+await test("a settled operation leaves no pending timeout timer", async () => {
+  // The timers used to be created per read and never cleared, which kept a
+  // closure (and the Deno event loop) alive for the full timeout window. If the
+  // clearTimeout were removed this read would still pass, so assert on the
+  // observable consequence: nothing must still be scheduled afterwards.
+  const conn = await withFakeDeno(
+    async () => ({ read: async () => 3, write: async () => 0, close: () => {} }),
+    () => denoTcpConnector("h", 1, 50_000),
+  );
+  await conn.read(new Uint8Array(8));
+  const handles = (
+    process as unknown as { _getActiveHandles?: () => unknown[] }
+  )._getActiveHandles?.();
+  if (Array.isArray(handles)) {
+    const longTimers = handles.filter((h: any) => h && h._idleTimeout === 50_000);
+    assert.deepStrictEqual(
+      longTimers,
+      [],
+      "the 50s timeout timer must be cleared once the read settles",
+    );
+  }
+});
+
 // ── Timeout behavior ────────────────────────────────────────────────────
 
 suite("Timeout behavior");
