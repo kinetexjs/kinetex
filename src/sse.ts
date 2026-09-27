@@ -603,9 +603,16 @@ export class SSEClient {
 
         if (!cfg.reconnect) throw err;
 
-        // Max reconnects reached
-        if (cfg.maxReconnects > 0 && reconnectAttempt >= cfg.maxReconnects) {
-          throw new SSEMaxReconnectsError(reconnectAttempt, cfg.url);
+        // Max reconnects reached.
+        //
+        // Checked against the number of reconnects actually performed, NOT
+        // `reconnectAttempt`. That counter is reset on every successful connect
+        // (so back-off restarts), which meant a server that accepted the
+        // connection and then dropped the stream reset the counter each time —
+        // the cap could never be reached and the client reconnected forever,
+        // regardless of maxReconnects. `attempts` is the real attempt count.
+        if (cfg.maxReconnects > 0 && this.health.totalReconnects >= cfg.maxReconnects) {
+          throw new SSEMaxReconnectsError(this.health.totalReconnects, cfg.url);
         }
 
         reconnectAttempt++;
@@ -637,14 +644,17 @@ export class SSEClient {
       this.health.connected = false;
       if (!cfg.reconnect) break;
 
-      // Max reconnects reached (also checked in catch for error path)
-      if (cfg.maxReconnects > 0 && reconnectAttempt >= cfg.maxReconnects) {
-        throw new SSEMaxReconnectsError(reconnectAttempt, cfg.url);
+      // Max reconnects reached. Same reasoning as the error path above: the
+      // cap bounds reconnects performed, and a successful connect zeroes
+      // `reconnectAttempt`, so that counter cannot be used here.
+      if (cfg.maxReconnects > 0 && this.health.totalReconnects >= cfg.maxReconnects) {
+        throw new SSEMaxReconnectsError(this.health.totalReconnects, cfg.url);
       }
 
       // Reconnect after stream closed by server
       reconnectAttempt++;
       this.health.totalReconnects++;
+      this.health.reconnectAttempt = reconnectAttempt;
 
       // Same jitter formula as the error path — a clean server close used to
       // reconnect with zero jitter, so every client in a fleet reconnected in
@@ -663,6 +673,9 @@ export class SSEClient {
       }
 
       await sleep(delay, cfg.signal);
+      // Same as the error path: without this, a close()/abort() during a
+      // clean-close back-off was not noticed until the full delay elapsed.
+      if (cfg.signal?.aborted) break;
     }
 
     this.health.connected = false;
