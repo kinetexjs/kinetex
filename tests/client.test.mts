@@ -559,7 +559,12 @@ await test("retry with already aborted signal throws", async () => {
     `Expected AbortError or DOMException but got: ${caughtErr instanceof Error ? caughtErr.constructor.name : typeof caughtErr}`,
   );
   assert.equal((caughtErr as Error).name, "AbortError");
-  assert.equal((caughtErr as Error).message, "Aborted");
+  // Assert the error code, not the message text. An already-aborted signal used
+  // to surface a bare DOMException ("Aborted"); the retry path now raises the
+  // library AbortError like every other abort path, so EABORT is the contract
+  // that has to hold and the human-readable message is free to change.
+  assert.equal((caughtErr as KinetexError).code, "EABORT");
+  assert.equal((caughtErr as KinetexError).isAbort, true);
 });
 
 await test("client.GET().proxy() fails fast (proxy is not wired into transports)", async () => {
@@ -651,9 +656,11 @@ await test("abort during retry delay", async () => {
   }
   // Aborting mid-retry must reject rather than resolving normally.
   assert.ok(caught, "aborting during the retry delay must reject");
-  // The contract is the EABORT code, not the exported AbortError class: the
-  // retry-sleep path raises a KinetexError. Assert on the stable contract so
-  // a change of error class is caught here rather than silently tolerated.
+  // Whether the signal lands while the request is in flight or while the retry
+  // back-off is sleeping is a timing race, so this asserts the contract that
+  // must hold on BOTH paths: an EABORT KinetexError. (The retry-sleep path used
+  // to raise a bare DOMException, which had no `code`; that made this assertion
+  // pass or fail depending on how fast httpbin answered.)
   assert.ok(caught instanceof KinetexError, `expected KinetexError, got ${String(caught)}`);
   assert.equal(caught.code, "EABORT");
   assert.equal(caught.isAbort, true);

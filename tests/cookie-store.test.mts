@@ -190,20 +190,47 @@ await test("Expires in past deletes cookie immediately", () => {
   assert.equal(jar.count, 0);
 });
 
+// The 400-day cap is expressed on the stored expiry, but that expiry is an
+// absolute timestamp captured inside setCookie(). Comparing it to a later
+// Date.now() therefore loses whatever elapsed in between, so an exact equality
+// against 400 days fails whenever a millisecond ticks over. Assert a bounded
+// window around the cap instead, measured from the timestamp taken *before* the
+// write.
+const CAP_400D = 400 * 86400000;
+
+function assertCappedAt400Days(label: string, expires: number, before: number): void {
+  // The cap is stamped from the "now" inside setCookie(), which is at or just
+  // after `before`, and Expires only has whole-second resolution, so the delta
+  // can sit a few milliseconds either side of exactly 400 days. 5s of slack is
+  // still six orders of magnitude below the 1-day granularity that would
+  // distinguish "capped" from "not capped".
+  const SLACK = 5000;
+  const delta = expires - before;
+  assert.equal(
+    delta <= CAP_400D + SLACK && delta > CAP_400D - SLACK,
+    true,
+    `${label}: expected expiry capped at 400 days from ${before}, got ${delta}ms`,
+  );
+}
+
 await test("Max-Age capped at 400 days", () => {
   const jar = createCookieJar();
+  const before = Date.now();
   jar.setCookie("x=1; Max-Age=99999999", { url: "https://example.com/" });
   const cookies = jar.getCookies({ url: "https://example.com/" });
-  const remaining = cookies[0].expires - Date.now();
-  assert.equal(remaining, 400 * 86400000);
+  assertCappedAt400Days("Max-Age", cookies[0].expires as number, before);
 });
 
 await test("Expires capped at 400 days from now", () => {
-  const farFuture = new Date(Date.now() + 999 * 86400000).toUTCString();
+  const before = Date.now();
+  const farFuture = new Date(before + 999 * 86400000).toUTCString();
   const jar = createCookieJar();
   jar.setCookie(`x=1; Expires=${farFuture}`, { url: "https://example.com/" });
-  const age = jar.getCookies({ url: "https://example.com/" })[0].expires - Date.now();
-  assert.equal(age, 400 * 86400000);
+  assertCappedAt400Days(
+    "Expires",
+    jar.getCookies({ url: "https://example.com/" })[0].expires as number,
+    before,
+  );
 });
 
 await test("cookie over 4096 bytes rejected", () => {

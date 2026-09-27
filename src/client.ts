@@ -41,7 +41,7 @@ import type {
   PipelineStageName,
 } from "./types.ts";
 
-import { KinetexError, HTTPStatusError, toRequestId } from "./types.ts";
+import { KinetexError, HTTPStatusError, AbortError, toRequestId } from "./types.ts";
 
 import {
   isValidHeaderName,
@@ -2129,7 +2129,7 @@ export class Kinetex {
 
       // If caller aborted between retries, stop immediately
       if (req.signal?.aborted) {
-        throw createAbortError();
+        throw createAbortError(req);
       }
 
       // A ReadableStream / Blob body is not replayable: the first attempt
@@ -3797,10 +3797,6 @@ export class FluentRequest {
 // ============================================================================
 
 /**
- * Create an AbortError that is compatible across runtimes.
- * Uses DOMException where available (browser/Deno), falls back to plain Error.
- */
-/**
  * Convert a KinetexResponse into the lifecycle HookResponse shape, or null
  * when the request never produced one (network error, timeout, abort).
  *
@@ -3821,13 +3817,23 @@ function toHookResponse(
   };
 }
 
-function createAbortError(): Error {
-  if (typeof DOMException !== "undefined") {
-    return new DOMException("Aborted", "AbortError");
-  }
-  const err = new Error("Aborted");
-  err.name = "AbortError";
-  return err;
+/**
+ * The abort error raised by the retry loop itself.
+ *
+ * This used to build a bare `DOMException`, which is a real `Error` but not a
+ * `KinetexError`: it carries no `code`, so `err.code === "EABORT"` and
+ * `err.isAbort` were both false here while every other abort path in the
+ * library (see core.ts) raised `EABORT`. Callers documented to see `AbortError`
+ * therefore got a structurally different error depending on whether the signal
+ * fired mid-request or mid-retry-delay. The library's own `AbortError` keeps
+ * `name === "AbortError"`, so name-based checks like `isAbortError` are
+ * unaffected.
+ *
+ * @param request - The request being retried, attached when available.
+ * @returns A KinetexError with code `EABORT`.
+ */
+function createAbortError(request?: KinetexRequest): AbortError {
+  return new AbortError(request);
 }
 
 /**

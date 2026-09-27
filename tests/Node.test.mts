@@ -3921,9 +3921,12 @@ await test("Abort during retry sleep cancels immediately", async () => {
 
   const elapsed = Date.now() - start;
   assert.ok(caught !== null, "Pre-aborted signal must throw immediately");
-  // createAbortError() is runtime-agnostic: a DOMException AbortError where available
+  // The retry loop's pre-flight abort check raises the library AbortError, so
+  // the caller sees the same EABORT contract as every other abort path. Assert
+  // the code rather than the message text, which is not a stable contract.
   assert.equal((caught as Error).name, "AbortError");
-  assert.equal((caught as Error).message, "Aborted");
+  assert.equal((caught as KinetexError).code, "EABORT");
+  assert.equal((caught as KinetexError).isAbort, true);
   assert.equal(elapsed < 500, true, `Pre-aborted request must throw in < 500ms, took ${elapsed}ms`);
 });
 
