@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { imdsCredentials } from "../src/aws-sigv4.ts";
 import { DedupMap } from "../src/dedup.ts";
 import { HTTPCache, MemoryStorageAdapter } from "../src/cache.ts";
+import { kinetex } from "../src/mod.ts";
 
 let passed = 0,
   failed = 0;
@@ -164,6 +165,180 @@ await test("a tag index reference is dropped even when storage has no entry", as
   // The regression this guards: the stale reference used to be left behind
   // forever, growing tagIndex on every eviction.
   assert.equal(tagIndex.get("user"), undefined, "the tag set must not outlive its entries");
+});
+
+// ============================================================================
+// Client: trace propagation and the retry debug log
+// ============================================================================
+
+suite("W3C trace context propagation");
+
+await test("a caller-supplied meta.traceId produces a traceparent header", async () => {
+  // With no OTel tracer set, a caller who already has a trace id should still
+  // get it propagated, otherwise the hop silently breaks the trace.
+  let traceparent: unknown = null;
+  const client = kinetex({
+    baseURL: "https://example.invalid",
+    fetch: (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch,
+    interceptors: {
+      request: [
+        (ctx) => {
+          traceparent = ctx.request.headers.traceparent;
+          return ctx;
+        },
+      ],
+    },
+  });
+
+  await client.get("/x", { meta: { traceId: "4bf92f3577b34da6a3ce929d0e0e4736" } });
+  client.destroy();
+
+  assert.match(
+    String(traceparent),
+    /^00-4bf92f3577b34da6a3ce929d0e0e4736-[0-9a-f]{16}-01$/,
+    `expected a version-00 traceparent carrying the caller's trace id, got ${String(traceparent)}`,
+  );
+});
+
+await test("an explicit traceparent header is not overwritten", async () => {
+  let traceparent: unknown = null;
+  const client = kinetex({
+    baseURL: "https://example.invalid",
+    fetch: (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch,
+    interceptors: {
+      request: [
+        (ctx) => {
+          traceparent = ctx.request.headers.traceparent;
+          return ctx;
+        },
+      ],
+    },
+  });
+
+  await client.get("/x", {
+    headers: { traceparent: "00-11111111111111111111111111111111-2222222222222222-01" },
+    meta: { traceId: "4bf92f3577b34da6a3ce929d0e0e4736" },
+  });
+  client.destroy();
+
+  assert.equal(traceparent, "00-11111111111111111111111111111111-2222222222222222-01");
+});
+
+// ============================================================================
+// Client: OTel span lifecycle on a pre-dispatch failure
+// ============================================================================
+
+suite("OpenTelemetry span lifecycle");
+
+/** Records what the client does to a span. */
+function recordingSpan() {
+  const events: string[] = [];
+  return {
+    events,
+    span: {
+      spanContext: () => ({
+        traceId: "4bf92f3577b34da6a3ce929d0e0e4736",
+        spanId: "00f067aa0ba902b7",
+        traceFlags: 1,
+      }),
+      setAttribute() {
+        return this;
+      },
+      setStatus(s: { code: number; message?: string }) {
+        events.push(`status:${s.code}`);
+        return this;
+      },
+      recordException() {
+        events.push("exception");
+        return this;
+      },
+      end() {
+        events.push("end");
+      },
+    },
+  };
+}
+
+await test("a span is ended and marked as errored when a pre-dispatch step throws", async () => {
+  // The span is created before the dispatch try/catch. If something between
+  // startSpan() and dispatch throws (here the SDK's own spanContext()), the
+  // span used to be abandoned: never exported, never reporting the error, and
+  // holding its attributes in the tracer's memory.
+  const { events, span } = recordingSpan();
+  const client = kinetex({
+    baseURL: "https://example.invalid",
+    fetch: (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch,
+  });
+  const broken = {
+    ...span,
+    spanContext: () => {
+      throw new Error("spanContext exploded");
+    },
+  };
+  client.setTracer({ startSpan: () => broken as never });
+
+  await assert.rejects(
+    () => client.get("/x"),
+    (err: Error) => err.message === "spanContext exploded",
+  );
+  client.destroy();
+
+  assert.ok(events.includes("end"), `the span must be ended, saw ${events.join(",")}`);
+  assert.ok(
+    events.includes("status:2"),
+    `the span must be marked as errored, saw ${events.join(",")}`,
+  );
+});
+
+await test("a successful request ends its span normally", async () => {
+  const { events, span } = recordingSpan();
+  const client = kinetex({
+    baseURL: "https://example.invalid",
+    fetch: (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch,
+  });
+  client.setTracer({ startSpan: () => span as never });
+
+  await client.get("/x");
+  client.destroy();
+
+  assert.ok(events.includes("end"), `the span must be ended, saw ${events.join(",")}`);
+  assert.ok(!events.includes("status:2"), "a successful request must not error the span");
+});
+
+// ============================================================================
+// Client: retry debug logging
+// ============================================================================
+
+suite("Retry diagnostics");
+
+await test("__KINETEX_DEBUG_RETRY logs the retry decision on failure", async () => {
+  // An opt-in diagnostic for debugging retry behaviour. It has to stay working:
+  // it is the only visibility into why a request is being retried.
+  const g = globalThis as Record<string, unknown>;
+  g.__KINETEX_DEBUG_RETRY = true;
+  const logged: unknown[] = [];
+  const realLog = console.log;
+  console.log = (...args: unknown[]) => {
+    if (String(args[0]).startsWith("DBG")) logged.push(args[0]);
+  };
+  try {
+    // The diagnostics live on the failure path, so the attempt has to throw —
+    // a plain 503 with throwOnError:false is a response, not an error.
+    const client = kinetex({
+      baseURL: "https://example.invalid",
+      fetch: (async () => {
+        throw new TypeError("fetch failed");
+      }) as unknown as typeof fetch,
+      retry: { maxRetries: 2, baseDelayMs: 1, jitter: 0 },
+    });
+    await client.get("/x", { throwOnError: false }).catch(() => {});
+    client.destroy();
+  } finally {
+    console.log = realLog;
+    delete g.__KINETEX_DEBUG_RETRY;
+  }
+
+  assert.ok(logged.includes("DBG catch"), "the retry catch path must log when debugging is on");
 });
 
 console.log(`\n────────────────────────────────────────`);
