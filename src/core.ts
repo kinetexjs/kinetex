@@ -989,8 +989,9 @@ export class NodeHTTP2Transport implements Transport {
       try {
         if (raw.body) {
           const drain = raw.body.getReader();
-          // eslint-disable-next-line no-constant-condition
-          while (true) {
+          // `for(;;)` rather than `while (true)`: same loop, no condition for a
+          // linter to have an opinion about.
+          for (;;) {
             const { done } = await drain.read();
             if (done) break;
           }

@@ -2144,9 +2144,16 @@ await test("regression: the HTTP/1.1 fallback path encodes a FormData body", asy
   const port = (server.address() as { port: number }).port;
 
   // Hide fetch so `_sendHTTP1` takes the legacy branch. Restored immediately.
+  // `Object.defineProperty` rather than `delete`: deleting a non-optional
+  // global is a type error, and silencing that needs a suppression comment.
+  // The transport tests `typeof globalThis.fetch === "function"`, so shadowing
+  // the property with `undefined` hides it just as completely as removing it.
   const realFetch = globalThis.fetch;
-  // @ts-expect-error -- deliberately removing the global for this block
-  delete globalThis.fetch;
+  Object.defineProperty(globalThis, "fetch", {
+    value: undefined,
+    configurable: true,
+    writable: true,
+  });
   const transport = new NodeHTTP2Transport({ ca: readFileSync(certPath) });
   const form = new FormData();
   form.append("k", "v");

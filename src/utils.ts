@@ -4,12 +4,9 @@
 
 // Dynamic imports for cross-runtime compatibility
 // Use globalThis to avoid static imports that fail in edge runtimes
-// deno-disable-next-line no-process-global
 type NodeProcess = typeof globalThis extends { process: infer P } ? P : never;
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 let _process: NodeProcess | undefined;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 let _Buffer: { isBuffer: (arg: unknown) => boolean } | undefined;
 
 // Check globalThis.process for Node.js runtime detection (no dynamic import needed)

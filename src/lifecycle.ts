@@ -274,14 +274,29 @@ type HookEventName = keyof HookEventMap;
 type HookEventListener<E extends HookEventName> = (event: HookEventMap[E]) => void | Promise<void>;
 
 /**
+ * A listener as stored, before its event name has been chosen.
+ *
+ * One map holds a listener per event name, so at rest no single payload type
+ * applies — `emit` picks it back out with a cast once the event is known. The
+ * payload is typed `never` rather than left as the bare `Function` type it
+ * replaced: `Function` is every function and every class, so it checked
+ * nothing, and deno lint rejects it under `ban-types`. `never` is the honest
+ * bottom type for "nothing may be handed to this without a cast", which is
+ * exactly the contract `emit` relies on.
+ */
+type StoredHookListener = {
+  fn: (event: never) => void | Promise<void>;
+  once: boolean;
+};
+
+/**
  * Lightweight typed event emitter for lifecycle events.
  *
  * Simpler than HookRegistry — no priority, conditions, or safe mode.
  * Use when you just need pub/sub notification.
  */
 export class HookEmitter {
-  // deno-lint-ignore ban-types
-  private listeners = new Map<string, Array<{ fn: Function; once: boolean }>>();
+  private listeners = new Map<string, StoredHookListener[]>();
 
   /** Register a persistent event listener. */
   on<E extends HookEventName>(event: E, listener: HookEventListener<E>): this {
