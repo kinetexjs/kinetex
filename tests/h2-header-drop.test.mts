@@ -39,6 +39,7 @@ import { fileURLToPath } from "node:url";
 import { FetchTransport, NodeHTTP2Transport } from "../src/core.ts";
 import { KinetexError } from "../src/types.ts";
 import type { KinetexRequest } from "../src/types.ts";
+import { requireCapability } from "./capability.ts";
 
 // ── Throwaway TLS material (generated per run; nothing committed) ────────────
 
@@ -50,7 +51,11 @@ try {
   // openssl not on PATH — tests below skip with a reason.
 }
 
-const SKIP_REASON = opensslAvailable ? false : "openssl is not available on this machine";
+const SKIP_REASON = opensslAvailable
+  ? false
+  : requireCapability("openssl", false, "these tests generate their own TLS material with it")
+    ? false
+    : "openssl is not available on this machine";
 
 /** Per-run temp dir (gitignored); the pid suffix keeps concurrent runs apart. */
 const REPO_TMP = fileURLToPath(new URL("../tmp/", import.meta.url));

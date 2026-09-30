@@ -26,6 +26,7 @@ import { decompressBodyStream } from "../src/core.ts";
 import { generateIdempotencyKey, isValidIdempotencyKey, HeaderName } from "../src/headers.ts";
 import { Kinetex } from "../src/client.ts";
 import type { OTelSpan } from "../src/client.ts";
+import { requireCapability } from "./capability.ts";
 
 let passed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
@@ -56,6 +57,15 @@ function zstdCompress(text: string): Uint8Array {
 
 const zstdAvailable = typeof zlib.zstdCompressSync === "function";
 
+// Throws in CI when the runtime has no zstd compressor, rather than skipping:
+// the round-trip is the only thing proving the decode path works, and a skip
+// would report success on a runtime that never exercised it.
+const HAVE_ZSTD = requireCapability(
+  "a zstd compressor (zlib.zstdCompressSync)",
+  zstdAvailable,
+  "the zstd round-trip cannot build its own fixture without one",
+);
+
 /** Wrap bytes in a one-chunk web stream. */
 function toStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
@@ -70,7 +80,7 @@ function toStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
 
 suite("zstd decompression");
 
-if (!zstdAvailable) {
+if (!HAVE_ZSTD) {
   console.log("  ⏭  skipped: this runtime has no zstd compressor");
 } else {
   await test("round-trips zstd through decompressStream", async () => {

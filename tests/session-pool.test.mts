@@ -42,6 +42,7 @@ import { fileURLToPath } from "node:url";
 import { createTransport, NodeHTTP2Transport, readRawBody } from "../src/core.ts";
 import { Kinetex } from "../src/client.ts";
 import type { KinetexRequest } from "../src/types.ts";
+import { requireCapability } from "./capability.ts";
 
 // ── Throwaway TLS material (generated per run; nothing committed) ────────────
 
@@ -52,6 +53,15 @@ try {
 } catch {
   /* openssl not on PATH — the TLS tests below skip with a reason. */
 }
+
+// In CI a missing openssl throws rather than skipping: a skipped block still
+// reports success, so the suite would vanish from every green build silently.
+// requireCapability returns false only on a developer machine that lacks it.
+const HAVE_OPENSSL = requireCapability(
+  "openssl",
+  opensslAvailable,
+  "these suites generate their own TLS material with it",
+);
 
 const REPO_TMP = fileURLToPath(new URL("../tmp/", import.meta.url));
 let tmpDir: string | null = null;
@@ -328,7 +338,7 @@ await test("http1KeepAlive defaults to on and is configurable", () => {
 
 suite("Legacy HTTP/1.1 keep-alive (node:https)");
 
-if (!opensslAvailable) {
+if (!HAVE_OPENSSL) {
   console.log("  ⏭  skipped: openssl is not available on this machine");
 } else {
   await test("reuses one TLS socket across sequential requests", async () => {
@@ -450,7 +460,7 @@ await test("createTransport forwards strict and onDroppedHeader to the fetch tra
 
 suite("HTTP/2 session pool — LRU cap");
 
-if (!opensslAvailable) {
+if (!HAVE_OPENSSL) {
   console.log("  ⏭  skipped: openssl is not available on this machine");
 } else {
   await test("evicts the least-recently-used session once maxSessions is reached", async () => {

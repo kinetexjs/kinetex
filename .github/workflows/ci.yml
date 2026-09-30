@@ -141,7 +141,31 @@ jobs:
           fail_ci_if_error: false
           verbose: true
 
-  # ── JOB 5 — Tests (Deno) ──────────────────────────────────────
+  # ── JOB 5 — Performance / load benchmarks ──────────────────────────
+  # Excluded from `test:all` because its timing assertions would make the main
+  # suite flaky — but that left it with no runner at all, so the correctness
+  # assertions in it (most of the file) ran nowhere. Its own job keeps a
+  # benchmark failure from also cancelling the coverage upload in unit-node.
+
+  perf:
+    name: Perf / load benchmarks
+    runs-on: ubuntu-latest
+    needs: [typecheck, lint]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run performance benchmarks
+        run: npm run perf
+        timeout-minutes: 10
+
+  # ── JOB 6 — Tests (Deno) ──────────────────────────────────────
 
   unit-deno:
     name: Tests / Deno
