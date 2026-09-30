@@ -616,6 +616,11 @@ await run("redirect manual returns 3xx", async () => {
     httpVersion: "HTTP/2",
     redirect: "manual",
   });
+  // The remaining assertions all read `raw.status`, and a range check is not a
+  // status comparison, so it was the one assertion here an httpbin outage
+  // could fail. `skipOnUpstreamDrift` is asked first, exactly as the status
+  // assertions elsewhere in this file do it.
+  if (skipOnUpstreamDrift("redirect manual returns 3xx", raw.status, 302)) return;
   assert.ok(raw.status >= 300 && raw.status < 400);
   // `assert.ok(raw.headers["location"])` is true of any non-empty string, and
   // of a boolean, and of a number. The status is pinned to the two a single-hop
