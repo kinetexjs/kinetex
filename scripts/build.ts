@@ -43,6 +43,15 @@ const distDir = join(ROOT, "dist");
 if (existsSync(distDir)) rmSync(distDir, { recursive: true });
 ["esm", "cjs", "types", "browser"].forEach((d) => mkdirSync(join(distDir, d), { recursive: true }));
 
+// Every `node:` builtin that `src/` references must appear here. The browser
+// bundles run with `--platform=browser`, where esbuild refuses to bundle a
+// Node builtin at all — it errors rather than stubbing — so a builtin that is
+// missing from this list fails `npm run build` the moment a module imports it.
+// `node:tls` arrived with the CONNECT-tunnel work in `src/proxy.ts` and
+// `node:url` with the IDNA fallback in `src/cookie-parser.ts`; neither was
+// added, and the release script runs `npm run build`, so the omission stopped
+// a release outright. `tests/build-externals.test.mts` asserts the two sets
+// agree so a third cannot be added silently.
 const NODE_EXT = [
   "node:http2",
   "node:https",
@@ -52,6 +61,8 @@ const NODE_EXT = [
   "node:process",
   "node:buffer",
   "node:crypto",
+  "node:tls",
+  "node:url",
   "node:zlib",
 ]
   .map((m) => `--external:${m}`)
