@@ -187,7 +187,12 @@ jobs:
     name: Nightly regression
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
-    timeout-minutes: 20
+    # Must exceed the sum of the per-step budgets below (15 + 5 + 5 + 15 + 5 +
+    # 5 + 5 = 55). At 20 the job was cancelled partway through its own schedule,
+    # so the steps after the first slow one could never report — the per-step
+    # timeouts were unreachable and the nightly's coverage depended on which
+    # test happened to be quick.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v7
 
@@ -203,11 +208,11 @@ jobs:
         timeout-minutes: 15
 
       - name: Run Node battle tests
-        run: tsx tests/Node.test.mts
+        run: npx tsx tests/Node.test.mts
         timeout-minutes: 5
 
       - name: Run Node cross-runtime tests
-        run: tsx tests/cross-runtime-node.test.mts
+        run: npx tsx tests/cross-runtime-node.test.mts
         timeout-minutes: 5
 
       - uses: denoland/setup-deno@v2
