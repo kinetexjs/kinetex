@@ -174,7 +174,7 @@ const sleepSync = (ms: number): void => {
  * Treating that as a failure aborted the very first release run with
  * "Required checks failed" before a single check had started.
  */
-function waitForChecks(branch: string, timeoutMs = 180_000): boolean {
+function waitForChecks(branch: string, timeoutMs = 600_000): boolean {
   const deadline = Date.now() + timeoutMs;
   let announced = false;
   while (Date.now() < deadline) {
@@ -193,7 +193,7 @@ function mergeAndTag(newVersion: string, branch: string): void {
   console.log("\n[merge] Waiting for required checks...");
   if (!waitForChecks(branch)) {
     console.error(
-      "❌ No checks were registered for this PR within 180s — not merging.\n" +
+      "❌ No checks were registered for this PR within 600s — not merging.\n" +
         `   Inspect with: gh pr checks ${branch}`,
     );
     process.exit(1);

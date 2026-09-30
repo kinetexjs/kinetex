@@ -323,7 +323,10 @@ export class HookEmitter {
     // its removal undone: the trailing write-back rebuilt the list from the
     // snapshot taken before the emit, re-adding whatever it had just removed.
     const snapshot = [...list];
-    const invokedOnce = new Set<{ fn: Function; once: boolean }>();
+    // The same element type as `list`, inferred rather than restated: the
+    // bare `Function` type this used to name provides no type safety at all,
+    // since it is every function and every class.
+    const invokedOnce = new Set<(typeof list)[number]>();
 
     for (const listener of snapshot) {
       try {

@@ -883,6 +883,10 @@ export class SSERouter {
  * removed rather than escaped, because there is nothing to escape them with.
  */
 function asFieldValue(value: string): string {
+  // The control characters are the point: CR, LF and NUL are exactly the
+  // bytes that would terminate the SSE field line and let the rest of the
+  // value be read as fields of its own.
+  // deno-lint-ignore no-control-regex
   return value.replace(/[\r\n\u0000]/g, "");
 }
 
