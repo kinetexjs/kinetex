@@ -266,7 +266,16 @@ async function main() {
     process.exit(1);
   }
   // gh auth only matters when a PR will actually be opened or merged.
-  if (hasGh && !cli.noPr) runSilent("gh auth status"); // throws with gh's own message if unauthenticated
+  // Probe with a real API call rather than `gh auth status`: the latter asks
+  // about the *account* behind the credential, which a repository-scoped
+  // GitHub App installation token has none of. It answers "not logged into
+  // any GitHub hosts" for a token that is perfectly able to open a PR on this
+  // repository, so it is a false negative that aborts the release before it
+  // starts. Asking the repo whether it can see us is the question that
+  // actually matters.
+  if (hasGh && !cli.noPr) {
+    runSilent("gh api repos/{owner}/{repo} --jq .name");
+  }
   if (!hasDeno) {
     console.log(
       "  ℹ deno CLI not found — skipping local deno check/lint (CI runs both on the release PR).",
