@@ -39,6 +39,17 @@ function skipOnUpstreamDrift(name: string, status: number, expected: number): bo
 }
 
 /**
+ * Assert an upstream 200 without failing the run when httpbin answered with a
+ * transient error instead. The status has to be inspected before the assert,
+ * exactly as `skipOnUpstreamDrift` does — a `502 !== 200` from the third
+ * party says nothing about the transport under test.
+ */
+function assertOkStatus(status: number, label = "httpbin answered 200"): void {
+  if (skipOnUpstreamDrift(label, status, 200)) return;
+  assert.equal(status, 200);
+}
+
+/**
  * True only for errors that mean "the third party misbehaved", not "our code is
  * wrong". Deliberately conservative: anything unrecognised counts as a defect.
  */
@@ -212,7 +223,7 @@ await run("createTransport with custom fetch (HTTP/1.1)", async () => {
     meta: {},
     httpVersion: "HTTP/1.1",
   });
-  assert.equal(raw.status, 200);
+  assertOkStatus(raw.status);
   assert.equal(called, 1, "the supplied fetch must be the one that runs");
   assert.equal(seenUrl, "https://httpbin.org/get", "and it must receive the resolved URL");
 });
@@ -234,7 +245,7 @@ await run("GET returns 200", async () => {
     meta: {},
     httpVersion: "HTTP/1.1",
   });
-  assert.equal(raw.status, 200);
+  assertOkStatus(raw.status);
   // A RawResponse with the right status and nothing else — no statusText, no
   // headers, a null body, a wrong protocol — satisfied a status check alone.
   assert.equal(typeof raw.statusText, "string");
@@ -301,7 +312,7 @@ await run("POST with JSON body returns 200", async () => {
     meta: {},
     httpVersion: "HTTP/1.1",
   });
-  assert.equal(raw.status, 200);
+  assertOkStatus(raw.status);
   // A GET returns 200 too. This is the *POST* test and nothing here looked at
   // the body, so a transport that dropped it, sent it as a query parameter or
   // double-encoded it answered 200 and passed.
@@ -326,7 +337,7 @@ await run("accept-encoding header default value is removed by FetchTransport", a
     meta: {},
     httpVersion: "HTTP/1.1",
   });
-  assert.equal(raw.status, 200);
+  assertOkStatus(raw.status);
   const body = (await new Response(raw.body!).json()) as { headers: Record<string, string> };
   const ae = (body.headers["Accept-Encoding"] ?? "").toLowerCase();
   // Our default "gzip, deflate, br" value should be stripped so fetch()
@@ -348,7 +359,7 @@ await run("explicit accept-encoding value is preserved by FetchTransport", async
     meta: {},
     httpVersion: "HTTP/1.1",
   });
-  assert.equal(raw.status, 200);
+  assertOkStatus(raw.status);
   const body = (await new Response(raw.body!).json()) as { headers: Record<string, string> };
   const ae = (body.headers["Accept-Encoding"] ?? "").toLowerCase();
   // Explicit "identity" should be preserved by FetchTransport
@@ -374,7 +385,7 @@ await run(
       meta: {},
       httpVersion: "HTTP/1.1",
     });
-    assert.equal(raw.status, 200);
+    assertOkStatus(raw.status, "redirect follow reports redirected");
     assert.equal(raw.redirected, true, "the hop happened");
     assert.ok(
       !raw.url.includes("/redirect/"),
@@ -467,9 +478,7 @@ await run("GET via HTTP/2 returns 200", async () => {
     meta: {},
     httpVersion: "HTTP/2",
   });
-  if (skipOnUpstreamDrift("GET via HTTP/2 returns 200", raw.status, 200)) return;
-  if (skipOnUpstreamDrift("GET via HTTP/2 returns 200", raw.status, 200)) return;
-  assert.equal(raw.status, 200);
+  assertOkStatus(raw.status, "GET via HTTP/2 returns 200");
   assert.equal(raw.httpVersion, "HTTP/2");
 });
 
@@ -484,9 +493,7 @@ await run("POST with JSON body via HTTP/2", async () => {
     meta: {},
     httpVersion: "HTTP/2",
   });
-  if (skipOnUpstreamDrift("POST with JSON body via HTTP/2", raw.status, 200)) return;
-  if (skipOnUpstreamDrift("POST with JSON body via HTTP/2", raw.status, 200)) return;
-  assert.equal(raw.status, 200);
+  assertOkStatus(raw.status, "POST with JSON body via HTTP/2");
   // Same gap as the FetchTransport POST above: only the status was checked, so
   // the HTTP/2 body-attachment path — the one with its own serializer, because
   // it bypasses fetch — was never observed actually sending anything.
@@ -569,7 +576,7 @@ await run("HTTP/1.1 fallback", async () => {
     meta: {},
     httpVersion: "HTTP/1.1",
   });
-  assert.equal(raw.status, 200);
+  assertOkStatus(raw.status);
   assert.equal(raw.httpVersion, "HTTP/1.1");
 });
 
@@ -585,7 +592,7 @@ await run("follows redirect", async () => {
     httpVersion: "HTTP/2",
     redirect: "follow",
   });
-  assert.equal(raw.status, 200);
+  assertOkStatus(raw.status);
   // Was a bare truthiness check on the flag, which is false by default and so
   // only ever proved the constructor set it. Pin the flag and the hop itself.
   assert.equal(raw.redirected, true);
@@ -709,7 +716,7 @@ await run("timeout=0 passes through", async () => {
     },
     0,
   );
-  assert.equal(raw.status, 200);
+  assertOkStatus(raw.status);
 });
 
 await run("normal request completes", async () => {
@@ -726,7 +733,7 @@ await run("normal request completes", async () => {
     },
     10000,
   );
-  assert.equal(raw.status, 200);
+  assertOkStatus(raw.status);
 });
 
 await run("throws TimeoutError on timeout", async () => {
@@ -1214,7 +1221,7 @@ await run(
       const raw = await lenient.send(
         kreq({ headers: JSON.parse('{"X Bad":"1","X-Kept":"1"}'), httpVersion: "HTTP/2" }),
       );
-      assert.equal(raw.status, 200, "the request must still go through");
+      assertOkStatus(raw.status, "lenient headers request still goes through");
       const echoed = (await new Response(raw.body).json()) as { headers: Record<string, string> };
       assert.equal(echoed.headers["X-Bad"], undefined, "the invalid name is dropped");
       assert.equal(echoed.headers["X-Kept"], "1", "and the valid one is not");

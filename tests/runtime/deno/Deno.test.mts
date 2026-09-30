@@ -38,6 +38,33 @@ function suite(name: string): void {
   console.log(`\n── ${name}`);
 }
 
+/**
+ * Await a promise that must reject, then inspect the error it rejected with.
+ *
+ * Two obvious alternatives are both traps here. `node:assert`'s
+ * `assert.rejects` does not exist on `@std/assert` — its `assert` is a bare
+ * assertion function — so `assert.rejects` throws "not a function". And
+ * `assertRejects` honours only an error *class*: handed a predicate function
+ * it ignores it entirely and asserts only that something threw, so a
+ * predicate that would have failed the test never runs.
+ */
+async function rejects(
+  fn: () => PromiseLike<unknown>,
+  check: (err: unknown) => void,
+  msg: string,
+): Promise<void> {
+  let error: unknown;
+  let rejected = false;
+  try {
+    await fn();
+  } catch (err) {
+    rejected = true;
+    error = err;
+  }
+  assert(rejected, msg);
+  check(error);
+}
+
 const T = 30_000; // timeout per test request
 
 // ── Base clients ──────────────────────────────────────────────────────────────
@@ -674,12 +701,15 @@ await test("Error interceptor fires on 4xx when throwOnError:true", async () => 
   client.useError((ctx) => {
     interceptedCode = (ctx.error as KinetexError)?.code ?? "";
   });
-  await assert.rejects(
+  await rejects(
     () => client.get("/status/404"),
     (err: unknown) => {
-      assert.ok(err instanceof Error);
-      assert.equal((err as { response?: { status?: number } }).response?.status, 404);
-      return true;
+      assert(err instanceof Error, "a 404 must reject with an Error");
+      assertEquals(
+        (err as { response?: { status?: number } }).response?.status,
+        404,
+        "the rejection must carry the 404",
+      );
     },
     "a 404 must reject",
   );
@@ -1698,13 +1728,21 @@ await test("assertOk resolves for 2xx, throws HTTPResponseError for 4xx/5xx", as
   // assertOk with 2xx should not throw
   await assertOk(new Response("ok", { status: 200 }));
   await assertOk(new Response("created", { status: 201 }));
-  await assertRejects(
+  await rejects(
     () => assertOk(new Response("not found", { status: 404, statusText: "Not Found" })),
-    (e: unknown) => e instanceof HTTPResponseError && (e as HTTPResponseError).status === 404,
+    (e: unknown) => {
+      assert(e instanceof HTTPResponseError, "a 404 must reject with HTTPResponseError");
+      assertEquals((e as HTTPResponseError).status, 404, "the 404 must be carried through");
+    },
+    "assertOk must reject on 404",
   );
-  await assertRejects(
+  await rejects(
     () => assertOk(new Response("error", { status: 500 })),
-    (e: unknown) => e instanceof HTTPResponseError && (e as HTTPResponseError).status === 500,
+    (e: unknown) => {
+      assert(e instanceof HTTPResponseError, "a 500 must reject with HTTPResponseError");
+      assertEquals((e as HTTPResponseError).status, 500, "the 500 must be carried through");
+    },
+    "assertOk must reject on 500",
   );
 });
 
@@ -2740,16 +2778,15 @@ await test("CLOSED → OPEN after threshold HTTP 503 failures", async () => {
   });
 
   for (let i = 0; i < 3; i++) {
-    await assert.rejects(
+    await rejects(
       () => client.get("/status/503", { retry: false }),
       (err: unknown) => {
-        assert.ok(err instanceof Error, `attempt ${i + 1} must reject`);
-        assert.equal(
+        assert(err instanceof Error, `attempt ${i + 1} must reject`);
+        assertEquals(
           (err as { response?: { status?: number } }).response?.status,
           503,
           `attempt ${i + 1} must be a 503`,
         );
-        return true;
       },
       `attempt ${i + 1} of 3 must reject with 503`,
     );
@@ -2772,16 +2809,15 @@ await test("CircuitOpenError thrown when circuit is OPEN — no network call mad
 
   // Trip the circuit
   for (let i = 0; i < 2; i++) {
-    await assert.rejects(
+    await rejects(
       () => client.get("/status/500", { retry: false }),
       (err: unknown) => {
-        assert.ok(err instanceof Error, `attempt ${i + 1} must reject`);
-        assert.equal(
+        assert(err instanceof Error, `attempt ${i + 1} must reject`);
+        assertEquals(
           (err as { response?: { status?: number } }).response?.status,
           500,
           `attempt ${i + 1} must be a 500`,
         );
-        return true;
       },
       `attempt ${i + 1} of 2 must reject with 500`,
     );
@@ -2844,16 +2880,15 @@ await test("Circuit OPEN → HALF_OPEN probe after resetTimeoutMs elapses", asyn
 
   // Trip it open
   for (let i = 0; i < 2; i++) {
-    await assert.rejects(
+    await rejects(
       () => client.get("/status/500", { retry: false }),
       (err: unknown) => {
-        assert.ok(err instanceof Error, `attempt ${i + 1} must reject`);
-        assert.equal(
+        assert(err instanceof Error, `attempt ${i + 1} must reject`);
+        assertEquals(
           (err as { response?: { status?: number } }).response?.status,
           500,
           `attempt ${i + 1} must be a 500`,
         );
-        return true;
       },
       `attempt ${i + 1} of 2 must reject with 500`,
     );
@@ -2895,16 +2930,15 @@ await test("Per-origin isolation: one origin's circuit does not affect another",
 
   // Trip clientA's circuit
   for (let i = 0; i < 2; i++) {
-    await assert.rejects(
+    await rejects(
       () => clientA.get("/status/500", { retry: false }),
       (err: unknown) => {
-        assert.ok(err instanceof Error, `attempt ${i + 1} must reject`);
-        assert.equal(
+        assert(err instanceof Error, `attempt ${i + 1} must reject`);
+        assertEquals(
           (err as { response?: { status?: number } }).response?.status,
           500,
           `attempt ${i + 1} must be a 500`,
         );
-        return true;
       },
       `clientA attempt ${i + 1} of 2 must reject with 500`,
     );
@@ -3571,16 +3605,15 @@ await test("OTel span is ended with ERROR status on TimeoutError", async () => {
 
   // Asserted, not discarded: if the request stopped timing out, this would
   // have passed while reporting span status ERROR for a successful call.
-  await assert.rejects(
+  await rejects(
     () => client.get("/delay/10", { retry: false }),
     (err: unknown) => {
-      assert.ok(err instanceof Error, "a 500ms timeout must reject");
-      assert.equal(
+      assert(err instanceof Error, "a 500ms timeout must reject");
+      assertEquals(
         (err as { code?: string }).code,
         "ETIMEOUT",
         "the failure must be a TimeoutError, not some other rejection",
       );
-      return true;
     },
     "/delay/10 against a 500ms timeout must reject",
   );

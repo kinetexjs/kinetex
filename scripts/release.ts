@@ -63,9 +63,17 @@ const runSilent = (cmd: string): string => {
 
 const runSilentAllowFail = (cmd: string): string => {
   try {
-    return runSilent(cmd);
-  } catch {
-    return "";
+    return execSync(cmd, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  } catch (err) {
+    // A non-zero exit is a normal answer here — `gh pr checks` exits 8 as
+    // soon as one check has failed, and its report is still on stdout.
+    // Discarding it made every caller read a *failing* run as one that had
+    // not started yet, which is how a release sat waiting for checks that
+    // were already reporting a failure.
+    return (err as { stdout?: Buffer }).stdout?.toString().trim() ?? "";
   }
 };
 
