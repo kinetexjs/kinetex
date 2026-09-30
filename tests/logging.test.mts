@@ -240,6 +240,78 @@ await test("Redactor redacts deeply nested JSON fields", async () => {
   assertEqual(p.a.b.c, "***");
 });
 
+await test("regression: Redactor redacts fields inside a JSON array body", async () => {
+  // A bulk payload is an array, and the configured field used to be applied
+  // only to the top-level object, so every element logged in clear.
+  const r = new Redactor({ bodyFields: ["password"], logRequestBody: true });
+  const res = r.redactBody(
+    JSON.stringify([
+      { user: "a", password: "p1" },
+      { user: "b", password: "p2" },
+    ]),
+    "application/json",
+    false,
+  );
+  const parsed = JSON.parse(res.body!);
+  assertEqual(parsed.length, 2);
+  assertEqual(parsed[0].password, "***");
+  assertEqual(parsed[1].password, "***");
+  // The non-sensitive fields must survive — a redactor that blanks the whole
+  // body would also pass the assertions above.
+  assertEqual(parsed[0].user, "a");
+  assertEqual(parsed[1].user, "b");
+  assert.ok(!res.body!.includes("p1"), "the secret must not survive anywhere in the body");
+  assert.ok(!res.body!.includes("p2"));
+});
+
+await test("regression: Redactor redacts nested fields inside an array body", async () => {
+  const r = new Redactor({ bodyFields: ["user.token"], logRequestBody: true });
+  const res = r.redactBody(
+    JSON.stringify([{ user: { token: "t1", id: 7 } }]),
+    "application/json",
+    false,
+  );
+  const parsed = JSON.parse(res.body!);
+  assertEqual(parsed[0].user.token, "***");
+  assertEqual(parsed[0].user.id, 7);
+});
+
+await test("regression: Redactor redacts array elements behind a wrapper key", async () => {
+  // `bodyFields` is a dot-path from the root, so the documented path for this
+  // shape is "items.password" — which previously stopped at the array.
+  const r = new Redactor({ bodyFields: ["items.password"], logRequestBody: true });
+  const res = r.redactBody(
+    JSON.stringify({ items: [{ password: "p", id: 1 }, { password: "q" }] }),
+    "application/json",
+    false,
+  );
+  const items = JSON.parse(res.body!).items;
+  assertEqual(items[0].password, "***");
+  assertEqual(items[1].password, "***");
+  assertEqual(items[0].id, 1);
+});
+
+await test("regression: Redactor leaves an empty array intact", async () => {
+  const r = new Redactor({ bodyFields: ["password"], logRequestBody: true });
+  const res = r.redactBody(JSON.stringify([]), "application/json", false);
+  assertEqual(res.body, "[]");
+});
+
+await test("regression: Redactor redacts every element of a mixed array", async () => {
+  const r = new Redactor({ bodyFields: ["password"], logRequestBody: true });
+  const res = r.redactBody(
+    JSON.stringify([{ keep: 1 }, { password: "x" }, null, 5, "s"]),
+    "application/json",
+    false,
+  );
+  const parsed = JSON.parse(res.body!);
+  assertEqual(parsed[0].keep, 1);
+  assertEqual(parsed[1].password, "***");
+  assertEqual(parsed[2], null);
+  assertEqual(parsed[3], 5);
+  assertEqual(parsed[4], "s");
+});
+
 await test("Redactor handles JSON parse error gracefully", async () => {
   const r = new Redactor({ bodyFields: ["password"], logRequestBody: true });
   const res = r.redactBody("not json", "application/json", false);
@@ -313,8 +385,14 @@ await test("JSONTransport serializes entry", async () => {
 });
 
 await test("JSONTransport default constructor does not throw", async () => {
-  const t = new JSONTransport();
-  t.write(makeReq());
+  let t: JSONTransport | undefined;
+  assert.doesNotThrow(() => {
+    t = new JSONTransport();
+  });
+  assert.ok(t !== undefined);
+  // write() on the default sink must also not throw, and must be callable twice.
+  assert.doesNotThrow(() => t!.write(makeReq()));
+  assert.doesNotThrow(() => t!.write(makeReq()));
 });
 
 // ── BatchingTransport ─────────────────────────────────────────────────────
@@ -353,14 +431,19 @@ await test("BatchingTransport flushes at batch size", async () => {
 
 await test("BatchingTransport flush on empty buffer no-ops", async () => {
   let flushed = false;
+  let writes = 0;
   const inner: LogTransport = {
-    write: () => {},
+    write: () => {
+      writes++;
+    },
     flush: async () => {
       flushed = true;
     },
   };
   const b = new BatchingTransport(inner);
   await b.flush();
+  // The test was named "no-ops" but only asserted that the inner flush ran.
+  assert.equal(writes, 0, "an empty flush must not write anything");
   assert.equal(flushed, true);
 });
 
@@ -744,6 +827,10 @@ await test("status filter excludes non-matching on logResponse", async () => {
   logger.logRequest("r1", "GET", "/", {}, null, 1);
   logger.logResponse("r1", 200, "OK", {}, null, 1, false);
   assertEqual(responseWrites, 0);
+  // Nothing written is only half the contract: a filtered response also has to
+  // release its active ID, or every filtered request leaks one entry.
+  const ids = (logger as any).activeIds as Map<string, unknown>;
+  assert.equal(ids.has("r1"), false, "a filtered response must still release its active id");
 });
 
 await test("level filter suppresses below-threshold entries via _write", async () => {
@@ -778,8 +865,22 @@ await test("toOTelSpan error entry", async () => {
   assertEqual(ot["http.status_code"], 500);
 });
 
-await test("toOTelSpan error with code and stack", async () => {
-  const ot = toOTelSpan(makeErr({ error: { name: "E", message: "m", code: "C", stack: "s" } }));
+await test("toOTelSpan error entry maps exactly the documented fields", async () => {
+  // The old test built an error carrying a `code` and a `stack` and then only
+  // asserted the two fields the mapping already produced, so it could not
+  // notice a field going missing. Pin the documented set exactly — and the
+  // fact that `error.code` is *not* mapped is now stated here rather than left
+  // to be assumed, since `SerializedError.code` is otherwise dropped.
+  const ot = toOTelSpan(makeErr({ error: { name: "E", message: "m", code: "C" } }));
+  assert.deepEqual(Object.keys(ot).sort(), [
+    "error",
+    "error.message",
+    "error.type",
+    "http.request.id",
+    "http.request.method",
+    "http.status_code",
+    "url.full",
+  ]);
   assertEqual(ot["error.type"], "E");
   assertEqual(ot["error.message"], "m");
 });
@@ -821,11 +922,37 @@ await test("activeIds deleted after logError", async () => {
 suite("Cross-runtime");
 
 await test("perfNow fallback without performance", async () => {
+  // The transport was a no-op sink, so the entry it should have received was
+  // never checked. Capture it.
+  const written: unknown[] = [];
   const orig = (globalThis as any).performance;
   (globalThis as any).performance = undefined;
   try {
-    const logger = createLogger({ transports: [{ write: () => {}, flush: async () => {} }] });
+    const logger = createLogger({
+      transports: [
+        {
+          write: (e: unknown) => {
+            written.push(e);
+          },
+          flush: async () => {},
+        },
+      ],
+    });
     logger.logRequest("r1", "GET", "/", {}, null, 1);
+    assert.equal(written.length, 1, "the Date-less runtime must still produce an entry");
+    const entry = written[0] as {
+      type: string;
+      requestId: string;
+      timestamp: string;
+      timestampMs: number;
+    };
+    assert.equal(entry.type, "request");
+    assert.equal(entry.requestId, "r1");
+    // perfNow falls back to Date.now(), so a real timestamp must still exist.
+    assert.equal(typeof entry.timestampMs, "number");
+    assert.ok(Number.isFinite(entry.timestampMs), "timestampMs must be a real number");
+    assert.ok(Math.abs(Date.now() - entry.timestampMs) < 60_000, "timestampMs must be ~now");
+    assert.ok(!Number.isNaN(Date.parse(entry.timestamp)), "timestamp must be a parseable date");
   } finally {
     (globalThis as any).performance = orig;
   }
@@ -859,6 +986,325 @@ await test("GET /uuid returns ID", async () => {
   const r = await bin.get<{ uuid: string }>("/uuid");
   assertEqual(r.status, 200);
   assertOk(r.data.uuid.length > 0);
+});
+
+// ── Regression: defects found by the strictest-assertion audit ──────────
+suite("Regression: audit fixes");
+
+await test("regression: ConsoleTransport works with partial options", async () => {
+  // `onWrite` was a required field of the options type but the constructor's
+  // default parameter only supplied it when the whole object was omitted, so
+  // `new ConsoleTransport({})` — which any caller building options at runtime
+  // reaches — threw "this.onWrite is not a function" on the first write.
+  const origLog = console.log;
+  const seen: string[] = [];
+  console.log = (s: string) => seen.push(s);
+  try {
+    const t = new ConsoleTransport({});
+    assert.doesNotThrow(() => t.write(makeReq()), "a bare options object must not throw");
+    assert.equal(seen.length, 1, "and it must still emit the entry");
+    // `{}` resolves `pretty` from NODE_ENV exactly like every other form, so
+    // which of the two renderings appears is environment-dependent — the point
+    // here is that something is written at all.
+    assert.ok(
+      seen[0]!.includes("test-123"),
+      `the entry must reach the default sink, got ${JSON.stringify(seen[0]!.slice(0, 40))}`,
+    );
+
+    // An explicit sink still wins over the default.
+    let captured = "";
+    new ConsoleTransport({ onWrite: (s) => (captured = s) }).write(makeRes());
+    assert.ok(captured.length > 0, "an explicit onWrite must be used");
+  } finally {
+    console.log = origLog;
+  }
+});
+
+await test("regression: ConsoleTransport pretty default does not depend on the call form", async () => {
+  // The no-argument form hard-coded `pretty: false` while any other form
+  // resolved it against NODE_ENV, so the two ways of constructing the same
+  // transport produced different output — the opposite of the documented
+  // "Defaults to true in non-production".
+  const origLog = console.log;
+  const seen: string[] = [];
+  console.log = (s: string) => seen.push(s);
+  try {
+    new ConsoleTransport().write(makeReq());
+  } finally {
+    console.log = origLog;
+  }
+  const noArg = seen[0]!;
+  assert.ok(
+    noArg.startsWith("[") && noArg.includes("←"),
+    `a no-arg ConsoleTransport must use the same pretty default as every other form, got ${JSON.stringify(noArg.slice(0, 30))}`,
+  );
+
+  // ...and the explicit forms are unaffected.
+  let json = "";
+  new ConsoleTransport({ pretty: false, onWrite: (s) => (json = s) }).write(makeReq());
+  assert.equal(JSON.parse(json).type, "request", "pretty:false must still produce JSON");
+});
+
+await test("regression: redactBody measures and truncates in UTF-8 bytes", async () => {
+  // Both the reported size and the truncation used `String.length`, which is
+  // UTF-16 code units, while `maxBodyLength` is documented in bytes and the
+  // truncation message labelled the count "bytes". An emoji body was reported
+  // at half its size and truncated at half the requested budget.
+  const r = new Redactor({ logRequestBody: true });
+  assertEqual(r.redactBody("😀".repeat(10), "application/json", false).size, 40);
+  assertEqual(r.redactBody("日本語", "application/json", false).size, 9);
+  assertEqual(r.redactBody("héllo", "application/json", false).size, 6);
+
+  const capped = new Redactor({ logRequestBody: true, maxBodyLength: 10 });
+  const emoji = capped.redactBody("😀".repeat(10), "application/json", false);
+  // 10 bytes of budget fits two 4-byte emoji, and the message must count the
+  // 32 bytes actually dropped — not 10 characters.
+  assert.ok(emoji.body!.startsWith("😀😀"), `got ${JSON.stringify(emoji.body)}`);
+  assert.ok(emoji.body!.includes("truncated 32 bytes"), `got ${JSON.stringify(emoji.body)}`);
+  // Never split a character in half.
+  assert.ok(!emoji.body!.includes("\ufffd"), "truncation must not split a multi-byte character");
+
+  // ASCII is unchanged by the unit fix.
+  const ascii = capped.redactBody("a".repeat(20), "application/json", false);
+  assert.ok(ascii.body!.startsWith("a".repeat(10)), `got ${JSON.stringify(ascii.body)}`);
+  assert.ok(ascii.body!.includes("truncated 10 bytes"));
+
+  // A body already inside the budget is not marked truncated.
+  const small = capped.redactBody("abc", "application/json", false);
+  assertEqual(small.body, "abc");
+
+  // The two units disagree here: 12 characters but 14 bytes, against a 12-byte
+  // budget. Reading the budget as a character count concludes the body already
+  // fits and emits all 14 bytes; reading it as bytes drops the emoji. The
+  // budget has to sit strictly between the two readings, which is why this
+  // case needs its own Redactor rather than the 10-byte one above.
+  const tight = new Redactor({ logRequestBody: true, maxBodyLength: 12 });
+  const nearMiss = tight.redactBody("a".repeat(10) + "😀", "application/json", false);
+  assert.equal(nearMiss.size, 14, "the size is the body as received");
+  assert.ok(
+    nearMiss.body!.startsWith("a".repeat(10)) && !nearMiss.body!.includes("😀"),
+    `the over-budget emoji must be dropped, got ${JSON.stringify(nearMiss.body)}`,
+  );
+  // 14 bytes in, 10 kept, 4 removed.
+  assert.ok(nearMiss.body!.includes("truncated 4 bytes"), JSON.stringify(nearMiss.body));
+
+  // A body inside the budget under both readings is returned untouched.
+  assertEqual(tight.redactBody("a".repeat(12), "application/json", false).body, "a".repeat(12));
+});
+
+await test("regression: redactBody size is the body as received, not the re-encoding", async () => {
+  // Two invalid UTF-8 bytes decode to two U+FFFD characters that re-encode to
+  // 6 bytes. Reporting 6 for a 2-byte body describes nothing the caller sent.
+  const r = new Redactor({ logRequestBody: true });
+  const res = r.redactBody(new Uint8Array([0xfe, 0xff]), "application/json", false);
+  assert.equal(res.body, "\uFFFD\uFFFD");
+  assertEqual(res.size, 2);
+  assertEqual(r.redactBody(new Uint8Array([104, 105]), "application/json", false).size, 2);
+});
+
+await test("regression: a filtered response and error still release their active id", async () => {
+  // The delete sat after the filter's early return, so any entry dropped by
+  // `statuses`, `methods`, `level`, `excludeURLs` or sampling left its record
+  // in `activeIds` forever. The only cleanup is a size-triggered sweep inside
+  // `logRequest`, so a service logging with a narrow filter accumulated one
+  // dead entry per request until it hit the 10000 cap and began evicting live
+  // ones.
+  const activeIdsOf = (logger: HTTPLogger): Map<string, unknown> =>
+    (logger as any).activeIds as Map<string, unknown>;
+
+  for (const cfg of [
+    { name: "statuses", opts: { statuses: [200] } },
+    { name: "methods", opts: { methods: ["POST"] } },
+    { name: "level", opts: { level: "SILENT" as const } },
+    { name: "excludeURLs", opts: { excludeURLs: [/health/] } },
+  ]) {
+    const logger = new HTTPLogger({
+      ...(cfg.opts as any),
+      transports: [{ write: () => {}, flush: async () => {} }],
+    });
+    for (let i = 0; i < 25; i++) {
+      // Two tracked requests per iteration: one resolved through logResponse
+      // and one through logError. Both must be registered first, or the release
+      // being tested is a delete of an id that was never there.
+      logger.logRequest(`res-${i}`, "GET", "https://x.test/health", {}, null, 1);
+      logger.logResponse(`res-${i}`, 404, "Not Found", {}, null, 1, false);
+      logger.logRequest(`err-${i}`, "GET", "https://x.test/health", {}, null, 1);
+      logger.logError(`err-${i}`, new Error("x"), null, 1);
+    }
+    assertEqual(activeIdsOf(logger).size, 0, `the ${cfg.name} filter must not leak active ids`);
+  }
+
+  // Control: an unfiltered logger still holds the id of a request with no
+  // response yet, so the assertions above are not vacuously true.
+  const open = new HTTPLogger({ transports: [{ write: () => {}, flush: async () => {} }] });
+  open.logRequest("pending", "GET", "https://x.test/a", {}, null, 1);
+  assertEqual(activeIdsOf(open).size, 1, "an in-flight request must still be tracked");
+
+  // Every filter above drops the *logRequest* as well, so for `methods`,
+  // `level` and `excludeURLs` the ids were never registered and the releases
+  // being checked are deletes of absent keys. Only `statuses` reaches
+  // `logResponse` with a live id, because `logError` passes no status and so
+  // is never subject to that filter — which is why a status filter is the one
+  // case that had to move the delete ahead of the early return.
+  const statusOnly = new HTTPLogger({
+    statuses: [200],
+    transports: [{ write: () => {}, flush: async () => {} }],
+  });
+  statusOnly.logRequest("r", "GET", "https://x.test/a", {}, null, 1);
+  assert.equal(activeIdsOf(statusOnly).has("r"), true, "a 200-eligible request is tracked");
+  statusOnly.logError("r", new Error("x"), null, 1);
+  assert.equal(
+    activeIdsOf(statusOnly).has("r"),
+    false,
+    "logError releases its id even though the status filter does not apply to it",
+  );
+});
+
+await test("regression: a size-triggered flush disarms the batching timer", async () => {
+  // The flush triggered from write() left the interval armed, so write()'s
+  // `if (!this.timer)` guard stayed false and the next entry got no timer of
+  // its own — it waited out the remainder of the previous batch's interval.
+  const written: string[] = [];
+  const inner: LogTransport = {
+    write: (e) => {
+      written.push((e as any).requestId);
+    },
+    flush: async () => {},
+  };
+  const b = new BatchingTransport(inner, { maxBatch: 2, flushMs: 10_000 });
+  b.write(makeReq({ requestId: "a" }));
+  assert.equal((b as any).timer !== null, true, "the first entry arms the timer");
+  b.write(makeReq({ requestId: "b" }));
+  assert.equal(written.length, 2, "reaching maxBatch flushes immediately");
+  assert.equal((b as any).timer, null, "a size-triggered flush must disarm the timer");
+
+  b.write(makeReq({ requestId: "c" }));
+  assert.equal((b as any).buffer.length, 1, "the third entry is buffered");
+  assert.equal((b as any).timer !== null, true, "and must get a timer of its own");
+  await b.flush();
+  assert.deepEqual(written, ["a", "b", "c"]);
+  assert.equal((b as any).timer, null, "an explicit flush disarms it too");
+
+  // The same defect existed in RemoteTransport, which shares the shape.
+  const posted: number[] = [];
+  const remote = new RemoteTransport("https://example.com/log", {
+    batchSize: 2,
+    flushMs: 10_000,
+    fetch: async () => {
+      posted.push(1);
+      return new Response("ok");
+    },
+    onError: () => {},
+  });
+  remote.write(makeReq({ requestId: "r1" }));
+  remote.write(makeReq({ requestId: "r2" }));
+  assert.equal((remote as any).timer, null, "RemoteTransport must also disarm on a size flush");
+  remote.write(makeReq({ requestId: "r3" }));
+  assert.equal((remote as any).timer !== null, true, "and re-arm for the next entry");
+  await remote.flush();
+  assert.equal((remote as any).buffer.length, 0);
+  assert.ok(posted.length >= 1, "the buffered entry still ships");
+});
+
+await test("regression: redactURL redacts a relative URL's query", async () => {
+  // Anything the URL constructor rejects was returned untouched, so
+  // `logRequest(id, "GET", "/users?token=abc", ...)` — the shape used by
+  // HTTPLogger.child's own doc example — wrote the token in clear while the
+  // absolute spelling of the same request redacted it.
+  const r = new Redactor();
+  assertEqual(r.redactURL("/users?token=SECRET&ok=1"), "/users?token=***&ok=1");
+  assertEqual(r.redactURL("a/b?api_key=SECRET"), "a/b?api_key=***");
+  assertEqual(r.redactURL("?password=hunter2"), "?password=***");
+  assertEqual(
+    r.redactURL("/users?token=***#frag"),
+    "/users?token=***#frag",
+    "the fragment is kept",
+  );
+  assertEqual(r.redactURL("/users?token=***&x=1#f"), "/users?token=***&x=1#f");
+  assertEqual(r.redactURL("/users"), "/users", "no query, nothing to do");
+  assertEqual(r.redactURL("/users?ok=1"), "/users?ok=1", "a safe query is untouched");
+  assertEqual(
+    r.redactURL("/users?token"),
+    "/users?token=***",
+    "a valueless secret is still masked",
+  );
+
+  for (const u of ["/users?token=SECRET&ok=1", "a/b?api_key=SECRET", "?password=hunter2"]) {
+    assert.ok(!r.redactURL(u).includes("SECRET"), `${u} must not leak`);
+    assert.ok(!r.redactURL(u).includes("hunter2"), `${u} must not leak`);
+  }
+
+  // A percent-encoded name is still recognised.
+  assertEqual(r.redactURL("/u?%74oken=SECRET"), "/u?%74oken=***");
+  // A malformed escape must not throw.
+  assertEqual(r.redactURL("/u?%zz=1&token=SECRET"), "/u?%zz=1&token=***");
+
+  // The absolute path is unchanged, including its normalisation.
+  assertEqual(
+    r.redactURL("https://example.com/data?token=abc&q=1"),
+    "https://example.com/data?token=***&q=1",
+  );
+});
+
+await test("regression: a structured rejection keeps its message and code", async () => {
+  // Anything that was not an Error went through String(err), so a rejected
+  // object — what a custom fetch, a GraphQL client or a worker throws — logged
+  // the message "[object Object]" and dropped its code entirely.
+  const { written, logger } = await captureWrite();
+  logger.logRequest("r1", "GET", "/", {}, null, 1);
+  logger.logError(
+    "r1",
+    { name: "FetchError", message: "connection refused", code: "ENETWORK" },
+    null,
+    1,
+  );
+  const entry = written[1] as ErrorLogEntry;
+  assert.equal(entry.error.name, "FetchError");
+  assert.equal(entry.error.message, "connection refused");
+  assert.equal(entry.error.code, "ENETWORK");
+
+  // A plain object with no message is stringified structurally, not "[object Object]".
+  const { written: w2, logger: l2 } = await captureWrite();
+  l2.logRequest("r2", "GET", "/", {}, null, 1);
+  l2.logError("r2", { status: 503, detail: "upstream down" }, 503, 1);
+  const e2 = w2[1] as ErrorLogEntry;
+  assert.equal(e2.error.name, "Error");
+  assert.ok(
+    e2.error.message.includes("upstream down") && e2.error.message !== "[object Object]",
+    `got ${JSON.stringify(e2.error.message)}`,
+  );
+
+  // A circular object must not throw out of the logger. The fixture carries no
+  // `message`, so serialization has to fall through to the structural
+  // stringifier — a circular one carrying a message takes the message branch
+  // and never reaches it.
+  const circular: any = { detail: "loop" };
+  circular.self = circular;
+  const { written: w3, logger: l3 } = await captureWrite();
+  l3.logRequest("r3", "GET", "/", {}, null, 1);
+  assert.doesNotThrow(() => l3.logError("r3", circular, null, 1));
+  const circ = (w3[1] as ErrorLogEntry).error.message;
+  assert.ok(circ.length > 0, "a circular rejection must still produce a message");
+  assert.ok(circ.includes("loop"), `got ${JSON.stringify(circ)}`);
+  assert.ok(circ.includes("[circular]"), `the cycle must be marked, got ${JSON.stringify(circ)}`);
+
+  // A circular object that also has a message keeps it, unchanged.
+  const circularWithMessage: any = { message: "loop" };
+  circularWithMessage.self = circularWithMessage;
+  l3.logError("r3", circularWithMessage, null, 1);
+  assert.equal((w3[2] as ErrorLogEntry).error.message, "loop", "its message still wins");
+
+  // Primitives and real Errors are unchanged.
+  const { written: w4, logger: l4 } = await captureWrite();
+  l4.logRequest("r4", "GET", "/", {}, null, 1);
+  l4.logError("r4", "plain string failure", null, 1);
+  assert.equal((w4[1] as ErrorLogEntry).error.message, "plain string failure");
+
+  l4.logError("r4", new TypeError("typed"), 500, 1);
+  const e5 = w4[2] as ErrorLogEntry;
+  assert.equal(e5.error.name, "TypeError");
+  assert.equal(e5.error.message, "typed");
+  assertOk(e5.error.stack !== undefined, "a real Error still carries its stack");
 });
 
 // ── Summary ──────────────────────────────────────────────────────────────

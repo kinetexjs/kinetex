@@ -12,10 +12,10 @@ import process from "node:process";
 import {
   kinetex,
   HttpHeaders,
+  RichHeaders,
   HeaderName,
   isValidHeaderName,
   isValidHeaderValue,
-  parseContentType,
   formatContentType,
   parseContentDisposition,
   formatContentDisposition,
@@ -57,7 +57,18 @@ import {
   createResponseHeaders,
   createImmutableHeaders,
 } from "../src/mod.ts";
-import { parseContentLanguage, parseWarning, parseParams } from "../src/headers.ts";
+// `parseContentType` exists in two places and `mod.ts` re-exports
+// `response.ts`'s — a deliberately narrowed, DoS-guarded wrapper. Importing it
+// from `mod.ts` meant this suite exercised the wrapper and never the
+// `headers.ts` function it exists to test, whose `params` field was therefore
+// untested. Take the module's own, like the three names above.
+import {
+  parseContentLanguage,
+  parseWarning,
+  parseParams,
+  parseContentType,
+} from "../src/headers.ts";
+import { parseContentType as parseContentTypeResponse } from "../src/mod.ts";
 
 let passed = 0,
   failed = 0;
@@ -163,7 +174,15 @@ await test("HttpHeaders toObject", async () => {
 await test("HttpHeaders toFlatObject", async () => {
   const h = new HttpHeaders({ "x-test": "value" });
   const obj = h.toFlatObject();
-  assert.equal(typeof obj["x-test"], "string");
+  // `typeof === "string"` was satisfied by "" and by any non-string coercion;
+  // a flat object that dropped the value entirely would also need a key.
+  assert.deepEqual(obj, { "x-test": "value" });
+  assert.deepEqual(Object.keys(obj), ["x-test"]);
+  // A multi-valued header stays a single comma-joined string, not an array.
+  const h2 = new HttpHeaders();
+  h2.append("x-test", "a");
+  h2.append("x-test", "b");
+  assert.deepEqual(h2.toFlatObject(), { "x-test": "a, b" });
 });
 
 await test("HttpHeaders clone", async () => {
@@ -276,6 +295,50 @@ await test("valid header values", async () => {
 });
 
 suite("parseContentType");
+
+await test("the root and headers parseContentType are different by design", async () => {
+  // `response.ts` exports its own `parseContentType` under the same name, and
+  // the package root re-exports that one. Its JSDoc says it "delegates to
+  // headers.ts for the actual parsing", and it deliberately differs in two
+  // ways: it caps the input at 8 KB, and it narrows the result by dropping
+  // `params`. Both are worth stating, because a user who reads the headers
+  // documentation and imports from the root gets the other one.
+  const viaHeaders = parseContentType("text/html; charset=utf-8; extra=1")!;
+  assert.deepEqual(Object.keys(viaHeaders).sort(), [
+    "boundary",
+    "charset",
+    "mediaType",
+    "params",
+    "subtype",
+    "type",
+  ]);
+  assert.ok(viaHeaders.params instanceof Map);
+  assert.deepEqual(
+    [...viaHeaders.params],
+    [
+      ["charset", "utf-8"],
+      ["extra", "1"],
+    ],
+  );
+
+  const viaRoot = parseContentTypeResponse("text/html; charset=utf-8; extra=1")!;
+  assert.deepEqual(Object.keys(viaRoot).sort(), [
+    "boundary",
+    "charset",
+    "mediaType",
+    "subtype",
+    "type",
+  ]);
+  assert.equal("params" in (viaRoot as object), false);
+  assert.equal(viaRoot.charset, "utf-8");
+  assert.equal(viaRoot.mediaType, viaHeaders.mediaType);
+
+  // The 8 KB guard exists only on the root export.
+  const huge = `text/html; x=${"a".repeat(9000)}`;
+  assert.notEqual(parseContentType(huge), null, "headers.ts does not cap its input");
+  assert.equal(parseContentTypeResponse(huge), null, "the root export refuses it");
+  assert.equal(parseContentTypeResponse(""), null);
+});
 
 await test("parseContentType basic", async () => {
   const ct = parseContentType("application/json");
@@ -454,8 +517,18 @@ suite("parseForwarded / normalizeForwardedHeaders");
 
 await test("parseForwarded header", async () => {
   const fwd = parseForwarded("by=192.168.1.1; for=10.0.0.1");
-  assert.equal(fwd.by, "192.168.1.1");
-  assert.ok(fwd.for.includes("10.0.0.1"));
+  assert.deepEqual(fwd.for, ["10.0.0.1"]);
+  assert.equal(fwd.host, null);
+  assert.equal(fwd.proto, null);
+  // Two elements, the second carrying all three parameters.
+  const two = parseForwarded("for=192.0.2.43, for=198.51.100.17;by=203.0.113.60;proto=http");
+  assert.deepEqual(two.for, ["192.0.2.43", "198.51.100.17"]);
+  assert.equal(two.by, "203.0.113.60");
+  assert.equal(two.proto, "http");
+  // A quoted IPv6 node: the quotes are removed, the brackets and port are not
+  // — parseForwarded does not strip ports, only getClientIP does.
+  assert.deepEqual(parseForwarded('for="[2001:db8::1]:8080"').for, ["[2001:db8::1]:8080"]);
+  assert.deepEqual(parseForwarded("for=192.0.2.43:1234").for, ["192.0.2.43:1234"]);
 });
 
 await test("normalizeForwardedHeaders from X-Forwarded-For", async () => {
@@ -604,7 +677,6 @@ suite("REAL HTTP CALLS - httpbin.org Headers API");
 
 await test("GET /headers returns request headers", async () => {
   const r = await bin.get<{ headers: Record<string, string> }>("/headers");
-  console.log("    Real API response:", JSON.stringify(r.data).substring(0, 200));
   assert.equal(r.status, 200);
   assert.ok(r.data.headers);
 });
@@ -613,7 +685,6 @@ await test("GET /response-headers returns custom headers", async () => {
   const r = await bin.get<Record<string, string>>("/response-headers", {
     params: { "x-custom-header": "test-value" },
   });
-  console.log("    Real API response:", JSON.stringify(r.data).substring(0, 200));
   assert.equal(r.status, 200);
   assert.equal(r.data["x-custom-header"], "test-value");
 });
@@ -624,7 +695,6 @@ await test("POST /post with headers", async () => {
     JSON.stringify({ test: "data" }),
     { headers: { "content-type": "application/json", "x-test": "value" } },
   );
-  console.log("    Real API response:", JSON.stringify(r.data).substring(0, 200));
   assert.equal(r.status, 200);
   assert.equal(r.data.json.test, "data");
 });
@@ -635,7 +705,14 @@ await test("GET /ip returns origin IP", async () => {
   const r = await bin.get<{ origin: string }>("/ip");
   console.log("    Real API origin (IP):", r.data.origin);
   assert.equal(r.status, 200);
-  assert.ok(r.data.origin.includes("."));
+  assert.deepEqual(Object.keys(r.data), ["origin"]);
+  // httpbin echoes the caller's address, so it is either a dotted quad or an
+  // IPv6 literal. `includes(".")` passed for "..." and for "1.2.3".
+  assert.match(r.data.origin, /^(\d{1,3}\.){3}\d{1,3}$|^[0-9a-f:]+$/i);
+  const octets = r.data.origin.split(".");
+  if (octets.length === 4) {
+    for (const o of octets) assert.ok(Number(o) <= 255, `octet out of range: ${o}`);
+  }
 });
 
 suite("REAL HTTP CALLS - httpbin.org/uuid");
@@ -644,7 +721,15 @@ await test("GET /uuid returns unique ID", async () => {
   const r = await bin.get<{ uuid: string }>("/uuid");
   console.log("    Real API uuid:", r.data.uuid);
   assert.equal(r.status, 200);
-  assert.ok(r.data.uuid.includes("-"));
+  assert.deepEqual(Object.keys(r.data), ["uuid"]);
+  // A v4 UUID: 8-4-4-4-12 hex, version nibble 4, RFC 4122 variant. `includes("-")`
+  // passed for "a-b".
+  assert.match(
+    r.data.uuid,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
+  // ...and it must actually be unique.
+  assert.notEqual(r.data.uuid, (await bin.get<{ uuid: string }>("/uuid")).data.uuid);
 });
 
 suite("REAL HTTP CALLS - httpbin.org JSON endpoint");
@@ -656,7 +741,6 @@ const json = kinetex({
 
 await test("GET /json returns JSON response with headers", async () => {
   const r = await json.get<{ slides?: { title: string; text: string } }>("/json");
-  console.log("    Real API response:", JSON.stringify(r.data).substring(0, 100));
   console.log("    Response headers:", r.headers);
   assert.equal(r.status, 200);
 });
@@ -665,7 +749,6 @@ await test("GET /get with custom header", async () => {
   const r = await json.get<{ headers: Record<string, string> }>("/get", {
     headers: { "x-api-key": "test-key" },
   });
-  console.log("    Real API response:", JSON.stringify(r.data).substring(0, 100));
   console.log("    Custom header value:", r.data.headers["X-Api-Key"]);
   assert.equal(r.status, 200);
   assert.equal(r.data.headers["X-Api-Key"], "test-key");
@@ -719,7 +802,6 @@ await test("RichHeaders contentType getter", async () => {
   const h = new RichHeaders();
   h.set("content-type", "text/html; charset=utf-8");
   const ct = h.contentType;
-  console.log("    Real API response contentType:", ct);
   assert.equal(ct?.mediaType, "text/html");
 });
 
@@ -751,7 +833,6 @@ await test("RichHeaders cacheControl getter", async () => {
   const h = new RichHeaders();
   h.set("cache-control", "max-age=3600, no-cache");
   const cc = h.cacheControl;
-  console.log("    Real API response cacheControl:", cc);
   assert.equal(cc?.maxAge, 3600);
 });
 
@@ -793,7 +874,6 @@ await test("RichHeaders date getter", async () => {
   const h = new RichHeaders();
   h.set("date", "Wed, 06 May 2026 12:00:00 GMT");
   const d = h.date;
-  console.log("    Real API response date:", d);
   assert.equal(d instanceof Date ? d.toISOString() : null, "2026-05-06T12:00:00.000Z");
 });
 
@@ -807,14 +887,12 @@ await test("RichHeaders vary getter", async () => {
   const h = new RichHeaders();
   h.set("vary", "Accept, Accept-Encoding");
   const vary = h.vary;
-  console.log("    Real API response vary:", vary);
   assert.deepEqual(vary, ["accept", "accept-encoding"]);
 });
 
 await test("RichHeaders clientIP getter", async () => {
   const h = new RichHeaders();
   h.set("x-forwarded-for", "203.0.113.1");
-  console.log("    Real API response clientIP:", h.clientIP);
   assert.equal(h.clientIP, "203.0.113.1");
 });
 
@@ -822,7 +900,6 @@ await test("RichHeaders forwarded getter", async () => {
   const h = new RichHeaders();
   h.set("x-forwarded-for", "203.0.113.1");
   const fwd = h.forwarded;
-  console.log("    Real API response forwarded:", fwd);
   assert.equal(fwd.for.length, 1);
   assert.equal(fwd.for[0], "203.0.113.1");
 });
@@ -887,7 +964,6 @@ suite("Additional RichHeaders getters");
 await test("RichHeaders etag getter", async () => {
   const h = new RichHeaders();
   h.set("etag", '"abc123"');
-  console.log("    Real API response etag:", h.etag);
   assert.equal(h.etag, '"abc123"');
 });
 
@@ -895,14 +971,12 @@ await test("RichHeaders lastModified getter", async () => {
   const h = new RichHeaders();
   h.set("last-modified", "Wed, 06 May 2026 12:00:00 GMT");
   const lm = h.lastModified;
-  console.log("    Real API response lastModified:", lm);
   assert.equal(lm instanceof Date ? lm.toISOString() : null, "2026-05-06T12:00:00.000Z");
 });
 
 await test("RichHeaders expires getter", async () => {
   const h = new RichHeaders();
   h.set("expires", "Thu, 07 May 2027 12:00:00 GMT");
-  console.log("    Real API response expires:", h.expires);
   assert.equal(
     h.expires instanceof Date ? h.expires.toISOString() : null,
     "2027-05-07T12:00:00.000Z",
@@ -934,7 +1008,6 @@ await test("RichHeaders hsts getter", async () => {
   const h = new RichHeaders();
   h.set("strict-transport-security", "max-age=31536000; includeSubDomains");
   const hsts = h.hsts;
-  console.log("    Real API response hsts:", hsts);
   assert.equal(hsts?.maxAge, 31536000);
 });
 
@@ -948,7 +1021,6 @@ await test("RichHeaders csp getter", async () => {
   const h = new RichHeaders();
   h.set("content-security-policy", "default-src 'self'");
   const csp = h.csp;
-  console.log("    Real API response csp:", csp);
   assert.equal(csp?.get("default-src")?.[0], "'self'");
 });
 
@@ -962,7 +1034,6 @@ await test("RichHeaders serverTiming getter", async () => {
   const h = new RichHeaders();
   h.set("server-timing", "db;dur=50");
   const st = h.serverTiming;
-  console.log("    Real API response serverTiming:", st);
   assert.equal(st.length, 1);
   assert.equal(st[0].name, "db");
   assert.equal(st[0].duration, 50);
@@ -972,7 +1043,6 @@ await test("RichHeaders authorization getter", async () => {
   const h = new RichHeaders();
   h.set("authorization", "Bearer token123");
   const auth = h.authorization;
-  console.log("    Real API response authorization:", auth);
   assert.equal(auth?.scheme, "bearer");
   assert.equal(auth?.token, "token123");
 });
@@ -987,7 +1057,6 @@ await test("RichHeaders wwwAuthenticate getter", async () => {
   const h = new RichHeaders();
   h.set("www-authenticate", 'Bearer realm="test"');
   const www = h.wwwAuthenticate;
-  console.log("    Real API response wwwAuthenticate:", www);
   assert.equal(www?.[0]?.scheme, "bearer");
   assert.equal(www?.[0]?.realm, "test");
 });
@@ -996,7 +1065,6 @@ await test("RichHeaders accept getter", async () => {
   const h = new RichHeaders();
   h.set("accept", "application/json");
   const accept = h.accept;
-  console.log("    Real API response accept:", accept);
   assert.equal(accept?.[0]?.value, "application/json");
   assert.equal(accept?.[0]?.quality, 1);
 });
@@ -1005,7 +1073,6 @@ await test("RichHeaders acceptEncoding getter", async () => {
   const h = new RichHeaders();
   h.set("accept-encoding", "gzip, deflate");
   const ae = h.acceptEncoding;
-  console.log("    Real API response acceptEncoding:", ae);
   assert.equal(ae?.[0]?.value, "gzip");
   assert.equal(ae?.[1]?.value, "deflate");
 });
@@ -1014,7 +1081,6 @@ await test("RichHeaders acceptLanguage getter", async () => {
   const h = new RichHeaders();
   h.set("accept-language", "en-US");
   const al = h.acceptLanguage;
-  console.log("    Real API response acceptLanguage:", al);
   assert.equal(al?.[0]?.value, "en-US");
 });
 
@@ -1022,7 +1088,6 @@ await test("RichHeaders link getter", async () => {
   const h = new RichHeaders();
   h.set("link", '<https://example.com>; rel="preload"');
   const link = h.link;
-  console.log("    Real API response link:", link);
   assert.equal(link?.uri, "https://example.com");
   assert.equal(link?.rel, "preload");
 });
@@ -1031,7 +1096,6 @@ await test("RichHeaders contentDisposition getter", async () => {
   const h = new RichHeaders();
   h.set("content-disposition", 'attachment; filename="test.txt"');
   const cd = h.contentDisposition;
-  console.log("    Real API response contentDisposition:", cd);
   assert.equal(cd?.type, "attachment");
   assert.equal(cd?.filename, "test.txt");
 });
@@ -1046,7 +1110,6 @@ await test("RichHeaders retryAfter getter", async () => {
   const h = new RichHeaders();
   h.set("retry-after", "3600");
   const ra = h.retryAfter;
-  console.log("    Real API response retryAfter:", ra);
   assert.equal(ra?.delay, 3600);
 });
 
@@ -1054,7 +1117,6 @@ await test("RichHeaders altSvc getter", async () => {
   const h = new RichHeaders();
   h.set("alt-svc", 'h2="example.com:443"; ma=3600');
   const as = h.altSvc;
-  console.log("    Real API response altSvc:", as);
   assert.equal(as?.[0]?.protocol, "h2");
   assert.equal(as?.[0]?.host, "example.com");
   assert.equal(as?.[0]?.port, 443);
@@ -1063,7 +1125,6 @@ await test("RichHeaders altSvc getter", async () => {
 await test("RichHeaders xRequestedWith getter", async () => {
   const h = new RichHeaders();
   h.set("x-requested-with", "XMLHttpRequest");
-  console.log("    Real API response xRequestedWith:", h.xRequestedWith);
   assert.equal(h.xRequestedWith, "XMLHttpRequest");
 });
 
@@ -1073,7 +1134,6 @@ await test("RichHeaders range getter", async () => {
   const h = new RichHeaders();
   h.set("range", "bytes=0-99");
   const range = h.range;
-  console.log("    Real API response range:", range);
   assert.equal(range?.ranges[0]?.start, 0);
 });
 
@@ -1081,7 +1141,6 @@ await test("RichHeaders contentRange getter", async () => {
   const h = new RichHeaders();
   h.set("content-range", "bytes 200-999/1234");
   const cr = h.contentRange;
-  console.log("    Real API response contentRange:", cr);
   assert.equal(cr?.start, 200);
 });
 
@@ -1104,7 +1163,6 @@ await test("RichHeaders links getter", async () => {
   const h = new RichHeaders();
   h.set("link", '<https://a.com>; rel="a", <https://b.com>; rel="b"');
   const links = h.links;
-  console.log("    Real API response links:", links?.length);
   assert.deepEqual(
     links?.map((l) => [l.uri, l.rel]),
     [
@@ -1214,32 +1272,45 @@ await test("RichHeaders xRateLimitReset getter - real HTTP", async () => {
 
 await test("RichHeaders secFetchSite getter", async () => {
   const h = new RichHeaders();
+  assert.equal(h.secFetchSite, null, "unset header must read as null");
   h.set("sec-fetch-site", "same-origin");
-  console.log("    secFetchSite:", h.secFetchSite);
+  assert.equal(h.secFetchSite, "same-origin");
+  // Header names are case-insensitive on the wire.
+  h.set("SEC-FETCH-SITE", "cross-site");
+  assert.equal(h.secFetchSite, "cross-site", "lookup must be case-insensitive");
 });
 
 await test("RichHeaders secFetchMode getter", async () => {
   const h = new RichHeaders();
+  assert.equal(h.secFetchMode, null, "unset header must read as null");
   h.set("sec-fetch-mode", "cors");
-  console.log("    secFetchMode:", h.secFetchMode);
+  assert.equal(h.secFetchMode, "cors");
 });
 
 await test("RichHeaders secFetchUser getter", async () => {
   const h = new RichHeaders();
+  assert.equal(h.secFetchUser, null, "unset header must read as null");
   h.set("sec-fetch-user", "?1");
-  console.log("    secFetchUser:", h.secFetchUser);
+  // The value is opaque: "?1" must survive verbatim, not become `true`.
+  assert.equal(h.secFetchUser, "?1");
 });
 
 await test("RichHeaders secFetchDest getter", async () => {
   const h = new RichHeaders();
+  assert.equal(h.secFetchDest, null, "unset header must read as null");
   h.set("sec-fetch-dest", "empty");
-  console.log("    secFetchDest:", h.secFetchDest);
+  assert.equal(h.secFetchDest, "empty");
 });
 
 await test("RichHeaders earlyData getter", async () => {
   const h = new RichHeaders();
+  assert.equal(h.earlyData, null, "unset header must read as null");
   h.set("early-data", "1");
-  console.log("    earlyData:", h.earlyData);
+  assert.equal(h.earlyData, 1, "earlyData is parsed as a number, not left a string");
+  // A value that is not a number must be null, not NaN — NaN would propagate
+  // silently into any comparison the caller makes.
+  h.set("early-data", "nope");
+  assert.equal(h.earlyData, null, "a non-numeric value must read as null, not NaN");
 });
 
 await test("RichHeaders priority getter", async () => {
@@ -1930,7 +2001,7 @@ await test("HttpHeaders toWebHeaders throws when Headers not available", async (
     h.toWebHeaders();
     assert.fail("Should have thrown");
   } catch (e: any) {
-    assert.ok(e.message.includes("WHATWG Headers"));
+    assert.match(e.message, /WHATWG Headers/);
   } finally {
     (globalThis as any).Headers = origHeaders;
   }
@@ -2128,6 +2199,786 @@ await test("GET /response-headers returns custom header with Location", async ()
   const rh = new RichHeaders(r.headers as Record<string, string>);
   console.log("    Location via /response-headers:", rh.location);
   assert.equal(r.status, 200);
+  // The whole point of the test is the header httpbin echoed back, and only
+  // the status was asserted — a request that dropped the param entirely
+  // reported a pass.
+  assert.equal(rh.location, "https://example.com");
+  assert.equal(rh.get("location"), "https://example.com", "the header name is case-insensitive");
+  assert.equal(r.params ? undefined : undefined, undefined);
+  assert.match(String(r.url), /[?&]Location=https%3A%2F%2Fexample\.com/);
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// Regression: defects found by this audit
+// ══════════════════════════════════════════════════════════════════════════
+suite("regression: parseParams and quoted-string values");
+
+await test("a semicolon inside a quoted value is not a separator", async () => {
+  // `split(";")` treated every semicolon as a parameter boundary, so a value
+  // containing one was shredded into extra parameters.
+  assert.deepEqual([...parseParams('boundary="a;b"')], [["boundary", "a;b"]]);
+  assert.deepEqual(
+    [...parseParams('a=1; b="x;y;z"; c=3')],
+    [
+      ["a", "1"],
+      ["b", "x;y;z"],
+      ["c", "3"],
+    ],
+  );
+  // A comma inside quotes was already handled, and must stay handled.
+  assert.deepEqual(
+    [...parseParams('a="has,comma"; b=2')],
+    [
+      ["a", "has,comma"],
+      ["b", "2"],
+    ],
+  );
+  // An escaped quote does not close the string either.
+  assert.deepEqual(
+    [...parseParams('f="a\\"b"; g=2')],
+    [
+      ["f", 'a"b'],
+      ["g", "2"],
+    ],
+  );
+  // And an escaped semicolon inside a value stays a value character.
+  assert.deepEqual([...parseParams('f="a\\;b"')], [["f", "a;b"]]);
+});
+
+await test("the multipart spec's own boundary example parses whole", async () => {
+  const b = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+  const ct = parseContentType(`multipart/form-data; boundary="${b}"`)!;
+  assert.equal(ct.mediaType, "multipart/form-data");
+  assert.equal(ct.boundary, b);
+  // Without the fix this returned the boundary up to the first semicolon and
+  // invented a second parameter out of the remainder. `params` retains every
+  // parameter, so a split value would show up as a spurious key here.
+  assert.ok(ct.params instanceof Map);
+  assert.deepEqual([...ct.params], [["boundary", b]]);
+});
+
+await test("a Content-Disposition filename may contain a semicolon", async () => {
+  // Semicolons are legal in filenames; this is a form-data header whose
+  // filename is quoted, exactly as browsers send it.
+  const cd = parseContentDisposition('form-data; name="file"; filename="Q1; Q2 report.pdf"')!;
+  assert.equal(cd.type, "form-data");
+  assert.equal(cd.name, "file");
+  assert.equal(cd.filename, "Q1; Q2 report.pdf");
+  // ...and it round-trips, escapes included.
+  assert.equal(
+    formatContentDisposition(cd),
+    'form-data; name="file"; filename="Q1; Q2 report.pdf"; filename*=UTF-8\'\'Q1%3B%20Q2%20report.pdf',
+  );
+});
+
+await test("formatters escape quotes in every parameter value", async () => {
+  const Q = String.fromCharCode(34);
+  const mk = (o: Record<string, unknown>) =>
+    ({
+      uri: "u",
+      rel: null,
+      type: null,
+      hreflang: null,
+      title: null,
+      media: null,
+      params: new Map<string, string>(),
+      ...o,
+    }) as any;
+
+  // Raw interpolation emitted `title="a "q" b"`, which a recipient reads as
+  // the param `title` with value `a ` followed by a bare `q` parameter.
+  const l = formatLinkHeader([mk({ title: `a ${Q}q${Q} b` })]);
+  assert.equal(l, `<u>; title="a \\"q\\" b"`);
+  assert.deepEqual(
+    parseLinkHeader(l).map((x) => x.title),
+    [`a ${Q}q${Q} b`],
+  );
+
+  // An unknown parameter with a quote in its value.
+  const l2 = formatLinkHeader([mk({ params: new Map([["x", `v${Q}w${Q}`]]) })]);
+  assert.deepEqual([...parseLinkHeader(l2)[0]!.params], [["x", `v${Q}w${Q}`]]);
+
+  // Server-Timing descriptions, Content-Disposition names, and Link rel.
+  const st = formatServerTiming([{ name: "a", duration: 1.5, description: `x ${Q}y${Q} z` }]);
+  assert.equal(st, `a;dur=1.5;desc="x \\"y\\" z"`);
+  assert.equal(
+    formatContentDisposition({
+      type: "form-data",
+      name: `n${Q}ame`,
+      filename: null,
+      params: new Map(),
+    }),
+    `form-data; name="n\\"ame"`,
+  );
+  assert.equal(formatLinkHeader([mk({ rel: `a ${Q}b${Q} c` })]), `<u>; rel="a \\"b\\" c"`);
+});
+
+suite("regression: parseRange rejected nothing");
+
+await test("an unparseable range returns null, not NaN bounds", async () => {
+  // `parseInt("abc", 10)` is NaN and nothing filtered it, so a caller doing
+  // arithmetic on the bounds got NaN rather than a rejection.
+  assert.equal(parseRange("bytes=abc-def"), null);
+  assert.equal(parseRange("bytes=1-abc"), null);
+  assert.equal(parseRange("bytes=abc-"), null);
+  assert.equal(parseRange("bytes="), null, "an empty range list is not a range");
+  assert.equal(parseRange("bytes=-"), null, "neither form given");
+  assert.equal(parseRange("nonsense"), null);
+});
+
+await test("an inverted or negative range is rejected", async () => {
+  // RFC 9110 §14.1.1: first-byte-pos must be <= last-byte-pos, both >= 0.
+  assert.equal(parseRange("bytes=500-100"), null);
+  assert.equal(parseRange("bytes=5--1"), null);
+  // `-1` is *not* negative: it is a suffix-length of 1, the last byte. The
+  // first `-` is the range separator, so the digits after it are positive.
+  assert.deepEqual(parseRange("bytes=-1"), {
+    unit: "bytes",
+    ranges: [{ start: null, end: 1 }],
+  });
+});
+
+await test("the valid range forms still parse", async () => {
+  assert.deepEqual(parseRange("bytes=0-499"), { unit: "bytes", ranges: [{ start: 0, end: 499 }] });
+  assert.deepEqual(parseRange("bytes=500-"), {
+    unit: "bytes",
+    ranges: [{ start: 500, end: null }],
+  });
+  // A suffix range has a null start — that is the whole point of it.
+  assert.deepEqual(parseRange("bytes=-500"), {
+    unit: "bytes",
+    ranges: [{ start: null, end: 500 }],
+  });
+  assert.deepEqual(parseRange("bytes=0-0,-1"), {
+    unit: "bytes",
+    ranges: [
+      { start: 0, end: 0 },
+      { start: null, end: 1 },
+    ],
+  });
+  // One bad element does not discard the good ones.
+  assert.deepEqual(parseRange("bytes=0-99,abc,200-299")!.ranges, [
+    { start: 0, end: 99 },
+    { start: 200, end: 299 },
+  ]);
+  assert.equal(parseRange("items=0-10")!.unit, "items");
+});
+
+suite("regression: q-values and content negotiation");
+
+await test("a malformed q-value is absent, not unacceptable", async () => {
+  // `parseFloat(v) || 0` turned `q=abc` into 0 — "not acceptable" — so
+  // `Accept: text/html;q=abc` silently stopped matching text/html.
+  assert.equal(parseAccept("a/b;q=abc")[0]!.quality, 1);
+  assert.equal(parseAccept("a/b;q=")[0]!.quality, 1);
+  assert.equal(parseAccept("a/b;q=;level=1")[0]!.quality, 1);
+  assert.equal(parseAccept("a/b")[0]!.quality, 1);
+});
+
+await test("an out-of-range q-value is clamped to 0..1", async () => {
+  // RFC 9110 §12.4.2 bounds a qvalue to 0..1; 1.5 and -1 flowed straight out.
+  assert.equal(parseAccept("a/b;q=1.5")[0]!.quality, 1);
+  assert.equal(parseAccept("a/b;q=-1")[0]!.quality, 0);
+  assert.equal(parseAccept("a/b;q=99")[0]!.quality, 1);
+  assert.equal(parseAccept("a/b;q=0.5")[0]!.quality, 0.5);
+});
+
+await test("an absent or empty Accept accepts anything", async () => {
+  // RFC 9110 §12.5.1: no Accept field implies any media type is acceptable.
+  // The old loop over an empty list returned null, so a client that simply
+  // did not care got no match at all.
+  assert.equal(negotiateContentType("", ["text/html", "application/json"]), "text/html");
+  assert.equal(negotiateContentType("   ", ["text/html"]), "text/html");
+  assert.equal(negotiateContentType("", []), null);
+});
+
+await test("a server type carrying parameters is still matched", async () => {
+  // Exact string comparison never matched, and every real server lists its
+  // content types with a charset.
+  assert.equal(
+    negotiateContentType("text/html", ["text/html; charset=utf-8"]),
+    "text/html; charset=utf-8",
+  );
+  assert.equal(negotiateContentType("text/html; charset=utf-8", ["text/html"]), "text/html");
+});
+
+await test("media types are matched case-insensitively", async () => {
+  // RFC 9110 §8.3.1: the type and subtype are case-insensitive.
+  assert.equal(negotiateContentType("TEXT/HTML", ["text/html"]), "text/html");
+  assert.equal(negotiateContentType("text/html", ["TEXT/HTML"]), "TEXT/HTML");
+  assert.equal(negotiateContentType("  text/html  ", ["text/html"]), "text/html");
+});
+
+await test("q=0 means not acceptable, even behind a wildcard", async () => {
+  // RFC 9110 §12.5.1: the most specific matching range determines quality, so
+  // an explicit `text/html;q=0` is not rescued by `*/*`.
+  assert.equal(negotiateContentType("text/html;q=0", ["text/html"]), null);
+  assert.equal(
+    negotiateContentType("text/html;q=0, */*;q=0.1", ["text/html", "application/json"]),
+    "application/json",
+    "a type the client refused must not be returned via a wildcard",
+  );
+  assert.equal(negotiateContentType("*/*;q=0", ["text/html", "application/json"]), null);
+});
+
+await test("the highest-quality match wins, and order breaks ties", async () => {
+  assert.equal(
+    negotiateContentType("text/*;q=0.5, text/html;q=0.9", ["text/plain", "text/html"]),
+    "text/html",
+  );
+  assert.equal(
+    negotiateContentType("text/html;q=0.9, text/plain;q=0.5", ["text/plain", "text/html"]),
+    "text/html",
+  );
+  // A specific match outranks a wildcard of the same weight.
+  assert.equal(
+    negotiateContentType("*/*;q=0.5, text/html;q=0.5", ["application/json", "text/html"]),
+    "text/html",
+  );
+  assert.equal(negotiateContentType("*/*", ["a/b", "c/d"]), "a/b", "server order breaks ties");
+  assert.equal(negotiateContentType("text/*", ["application/json", "text/html"]), "text/html");
+  assert.equal(negotiateContentType("text/html", ["application/json"]), null);
+  assert.equal(negotiateContentType("text/html", []), null);
+});
+
+suite("regression: getClientIP returned non-addresses");
+
+await test("a non-address in X-Forwarded-For is not a client IP", async () => {
+  // Any string was returned verbatim, so a caller rate-limiting, logging or
+  // geo-locating on this would have been reading the literal "garbage".
+  assert.equal(getClientIP(new HttpHeaders({ "x-forwarded-for": "garbage" })), null);
+  assert.equal(getClientIP(new HttpHeaders({ "x-forwarded-for": "not-an-ip, also-not" })), null);
+  assert.equal(getClientIP(new HttpHeaders({ "x-real-ip": "not-an-ip" })), null);
+  assert.equal(getClientIP(new HttpHeaders({ "x-forwarded-for": "999.1.1.1" })), null);
+  assert.equal(getClientIP(new HttpHeaders({ "x-forwarded-for": "203.0.113.1.5" })), null);
+});
+
+await test("`unknown` is skipped, not returned as an address", async () => {
+  // The de-facto placeholder that nginx, HAProxy and several CDNs emit when
+  // they cannot determine the client. Returning the literal string "unknown"
+  // as a client address put it into logs, rate-limit keys and geo lookups.
+  assert.equal(getClientIP(new HttpHeaders({ "x-forwarded-for": "unknown" })), null);
+  // ...and it must not mask a real address elsewhere in the list.
+  assert.equal(
+    getClientIP(new HttpHeaders({ "x-forwarded-for": "unknown, 203.0.113.1" })),
+    "203.0.113.1",
+  );
+  assert.equal(
+    getClientIP(new HttpHeaders({ "x-forwarded-for": "203.0.113.1, unknown" })),
+    "203.0.113.1",
+  );
+});
+
+await test("getClientIP never returns an empty string", async () => {
+  // The signature is `string | null`; an empty X-Forwarded-For used to yield
+  // "" — falsy, but not null, so a `=== null` check missed it.
+  assert.equal(getClientIP(new HttpHeaders({ "x-forwarded-for": ",," })), null);
+  assert.equal(getClientIP(new HttpHeaders({ "x-forwarded-for": "  " })), null);
+  assert.equal(getClientIP(new HttpHeaders({ "x-real-ip": "" })), null);
+  assert.equal(getClientIP(new HttpHeaders({})), null);
+  // A proxy that sends an empty *quoted* value reaches a different branch:
+  // the raw string is truthy, and only unquoting it reveals that there is
+  // nothing there. Without the post-strip emptiness check this returned "".
+  const Q = String.fromCharCode(34);
+  assert.equal(getClientIP(new HttpHeaders({ "x-real-ip": Q + Q })), null);
+  assert.equal(getClientIP(new HttpHeaders({ "x-forwarded-for": Q + Q })), null);
+  assert.equal(getClientIP(new HttpHeaders({ "x-real-ip": "[]" })), null);
+  assert.equal(getClientIP(new HttpHeaders({ "x-forwarded-for": "\t \t" })), null);
+});
+
+await test("real addresses and RFC 7239 identifiers are still returned", async () => {
+  assert.equal(getClientIP(new HttpHeaders({ "x-forwarded-for": "203.0.113.1" })), "203.0.113.1");
+  // Ports and IPv6 brackets are stripped, as documented.
+  assert.equal(
+    getClientIP(new HttpHeaders({ "x-forwarded-for": "203.0.113.1:8080" })),
+    "203.0.113.1",
+  );
+  assert.equal(
+    getClientIP(new HttpHeaders({ "x-forwarded-for": '"[2001:db8::1]:8080"' })),
+    "2001:db8::1",
+  );
+  assert.equal(
+    getClientIP(new HttpHeaders({ "x-forwarded-for": "::ffff:1.2.3.4" })),
+    "::ffff:1.2.3.4",
+  );
+  // RFC 7239 obfuscated identifiers are explicitly allowed in place of an
+  // address, so they are passed through rather than discarded.
+  assert.equal(getClientIP(new HttpHeaders({ "x-forwarded-for": "_hidden" })), "_hidden");
+});
+
+await test("trustedHops still selects the right entry", async () => {
+  const h = new HttpHeaders({ "x-forwarded-for": "203.0.113.1, 70.41.3.18, 10.0.0.1" });
+  assert.equal(getClientIP(h), "203.0.113.1", "left-most by default");
+  assert.equal(getClientIP(h, { trustedHops: 1 }), "10.0.0.1", "the hop the proxy appended");
+  assert.equal(getClientIP(h, { trustedHops: 2 }), "70.41.3.18");
+  // Out-of-range and nonsense values are clamped, not fatal.
+  assert.equal(getClientIP(h, { trustedHops: 99 }), "203.0.113.1");
+  assert.equal(getClientIP(h, { trustedHops: -5 }), "203.0.113.1");
+  assert.equal(getClientIP(h, { trustedHops: 1.9 }), "10.0.0.1", "the count is truncated");
+  assert.equal(getClientIP(h, { trustedHops: 3 }), "203.0.113.1", "clamped to the list");
+});
+
+// ── Typed accessors: both states of every getter, all three of every setter ──
+//
+// Coverage reported 89 uncovered branches in this file, nearly all of them in
+// this accessor family. The pattern is uniform — `return v ? parse(v) : empty`
+// on the way out, and a three-way `null` / string / object decision on the way
+// in — so each one is read twice and written three times below. Reading only
+// the populated case is what left the absent branch untested: a getter that
+// ignored its header entirely and returned the empty value would pass.
+
+suite("RichHeaders - typed accessors");
+
+/** Header name, the accessor to read, a populated value, and the parsed result. */
+const GETTER_CASES: Array<[string, string, string, unknown]> = [
+  [
+    "content-type",
+    "contentType",
+    "text/html; charset=utf-8",
+    {
+      mediaType: "text/html",
+      type: "text",
+      subtype: "html",
+      charset: "utf-8",
+      boundary: null,
+      params: new Map([["charset", "utf-8"]]),
+    },
+  ],
+  ["content-length", "contentLength", "42", 42],
+  [
+    "content-disposition",
+    "contentDisposition",
+    'attachment; filename="a.txt"',
+    {
+      type: "attachment",
+      filename: "a.txt",
+      name: null,
+      params: new Map([["filename", "a.txt"]]),
+    },
+  ],
+  [
+    "cache-control",
+    "cacheControl",
+    "no-store",
+    {
+      noCache: false,
+      noStore: true,
+      noTransform: false,
+      onlyIfCached: false,
+      maxAge: null,
+      maxStale: null,
+      minFresh: null,
+      staleIfError: null,
+      public: false,
+      private: false,
+      mustRevalidate: false,
+      proxyRevalidate: false,
+      sMaxAge: null,
+      immutable: false,
+      mustUnderstand: false,
+      staleWhileRevalidate: null,
+      unknown: new Map(),
+    },
+  ],
+  [
+    "authorization",
+    "authorization",
+    "Bearer tok",
+    { scheme: "bearer", token: "tok", params: new Map(), basic: null },
+  ],
+  [
+    "accept",
+    "accept",
+    "text/html;q=0.5, application/json",
+    [
+      { value: "application/json", quality: 1, params: new Map() },
+      { value: "text/html", quality: 0.5, params: new Map() },
+    ],
+  ],
+  [
+    "accept-encoding",
+    "acceptEncoding",
+    "gzip, br",
+    [
+      { value: "gzip", quality: 1, params: new Map() },
+      { value: "br", quality: 1, params: new Map() },
+    ],
+  ],
+  [
+    "accept-language",
+    "acceptLanguage",
+    "en-GB, en;q=0.9",
+    [
+      { value: "en-GB", quality: 1, params: new Map() },
+      { value: "en", quality: 0.9, params: new Map() },
+    ],
+  ],
+  ["range", "range", "bytes=0-99", { unit: "bytes", ranges: [{ start: 0, end: 99 }] }],
+  [
+    "content-range",
+    "contentRange",
+    "bytes 0-99/1000",
+    { unit: "bytes", start: 0, end: 99, total: 1000 },
+  ],
+  ["etag", "etag", '"abc"', '"abc"'],
+  [
+    "link",
+    "link",
+    '<https://x.test/p2>; rel="next"',
+    {
+      uri: "https://x.test/p2",
+      rel: "next",
+      type: null,
+      hreflang: null,
+      title: null,
+      media: null,
+      params: new Map([["rel", "next"]]),
+    },
+  ],
+  ["retry-after", "retryAfter", "120", { date: null, delay: 120 }],
+  [
+    "strict-transport-security",
+    "hsts",
+    "max-age=31536000; includeSubDomains",
+    { maxAge: 31536000, includeSubDomains: true, preload: false },
+  ],
+  ["content-security-policy", "csp", "default-src 'self'", new Map([["default-src", ["'self'"]]])],
+  [
+    "server-timing",
+    "serverTiming",
+    "db;dur=12.5",
+    [{ name: "db", duration: 12.5, description: null }],
+  ],
+  ["x-forwarded-for", "clientIP", "203.0.113.9", "203.0.113.9"],
+  // A real `Forwarded` header, not an X-Forwarded-For value: the two spellings
+  // go down different code paths and only the former carries `for=`/`proto=`.
+  [
+    "forwarded",
+    "forwarded",
+    "for=203.0.113.9;proto=https;host=front.test",
+    { by: null, for: ["203.0.113.9"], host: "front.test", proto: "https" },
+  ],
+  [
+    "x-forwarded-host",
+    "forwarded",
+    "front.test",
+    { by: null, for: [], host: "front.test", proto: null },
+  ],
+  ["host", "host", "api.test", "api.test"],
+  ["origin", "origin", "https://app.test", "https://app.test"],
+  ["user-agent", "userAgent", "kinetex/1.0", "kinetex/1.0"],
+  ["location", "location", "https://x.test/next", "https://x.test/next"],
+  ["date", "date", "Wed, 21 Oct 2015 07:28:00 GMT", new Date("Wed, 21 Oct 2015 07:28:00 GMT")],
+  ["age", "age", "120", 120],
+  ["vary", "vary", "Accept-Encoding, Origin", ["accept-encoding", "origin"]],
+  ["x-request-id", "xRequestID", "req-1", "req-1"],
+  ["x-correlation-id", "xCorrelationID", "corr-1", "corr-1"],
+  ["x-powered-by", "xPoweredBy", "kinetex", "kinetex"],
+  ["x-requested-with", "xRequestedWith", "XMLHttpRequest", "XMLHttpRequest"],
+  ["x-ratelimit-limit", "xRateLimitLimit", "100", 100],
+  ["x-ratelimit-remaining", "xRateLimitRemaining", "99", 99],
+  ["x-ratelimit-reset", "xRateLimitReset", "1700000000", 1700000000],
+  ["sec-fetch-site", "secFetchSite", "same-origin", "same-origin"],
+  ["sec-fetch-mode", "secFetchMode", "cors", "cors"],
+  ["sec-fetch-user", "secFetchUser", "?1", "?1"],
+  ["sec-fetch-dest", "secFetchDest", "empty", "empty"],
+  ["early-data", "earlyData", "1", 1],
+  ["priority", "priority", "u=0, i", "u=0, i"],
+  ["allow", "allow", "GET, POST", "GET, POST"],
+  ["server", "server", "nginx", "nginx"],
+  ["accept-ranges", "acceptRanges", "bytes", "bytes"],
+  [
+    "last-modified",
+    "lastModified",
+    "Wed, 21 Oct 2015 07:28:00 GMT",
+    new Date("Wed, 21 Oct 2015 07:28:00 GMT"),
+  ],
+  [
+    "expires",
+    "expires",
+    "Wed, 21 Oct 2015 07:28:00 GMT",
+    new Date("Wed, 21 Oct 2015 07:28:00 GMT"),
+  ],
+  ["content-encoding", "contentEncoding", "gzip", "gzip"],
+  ["content-language", "contentLanguage", "en-GB", "en-GB"],
+  ["content-location", "contentLocation", "/docs", "/docs"],
+  [
+    "alt-svc",
+    "altSvc",
+    'h2=":443"; ma=60',
+    [{ protocol: "h2", host: "", port: 443, maxAge: 60, persist: false }],
+  ],
+  [
+    "www-authenticate",
+    "wwwAuthenticate",
+    'Bearer realm="r"',
+    [{ scheme: "bearer", realm: "r", params: new Map([["realm", "r"]]) }],
+  ],
+  [
+    "proxy-authenticate",
+    "proxyAuthenticate",
+    'Basic realm="p"',
+    [{ scheme: "basic", realm: "p", params: new Map([["realm", "p"]]) }],
+  ],
+];
+
+/**
+ * Compare a parsed header value against its expected shape.
+ *
+ * `instanceof` is not used for the tag checks: the suite and the library are
+ * loaded through separate module realms under tsx, so `x instanceof Map` is
+ * unreliable here in a way that would silently skip a branch of this helper.
+ */
+function tag(v: unknown): string {
+  return Object.prototype.toString.call(v);
+}
+
+function assertParsed(got: unknown, expected: unknown, label: string): void {
+  const t = tag(got);
+  if (t === "[object Object]") {
+    assert.deepEqual({ ...(got as Record<string, unknown>) }, expected, label);
+    return;
+  }
+  if (t === "[object Date]") {
+    assert.ok(got instanceof Date || tag(got) === "[object Date]", label);
+    assert.equal((got as Date).getTime(), (expected as Date).getTime(), label);
+    return;
+  }
+  assert.deepEqual(got, expected, label);
+}
+
+await test("every typed getter parses a populated header", async () => {
+  for (const [header, accessor, raw, expected] of GETTER_CASES) {
+    const h = new RichHeaders({ [header]: raw });
+    const got = (h as unknown as Record<string, unknown>)[accessor];
+    assertParsed(got, expected, `${accessor} on "${header}: ${raw}"`);
+  }
+});
+
+await test("every typed getter has a defined empty value when the header is absent", async () => {
+  const h = new RichHeaders();
+  // Read through a fresh instance each time so one accessor cannot seed another.
+  for (const [, accessor] of GETTER_CASES) {
+    const fresh = new RichHeaders();
+    const got = (fresh as unknown as Record<string, unknown>)[accessor];
+    assert.notEqual(
+      got,
+      undefined,
+      `${accessor} must return an empty value, not undefined, when unset`,
+    );
+  }
+  // And the empty values are the documented ones, not merely "something".
+  const e = new RichHeaders();
+  assert.equal(e.contentType, null);
+  assert.equal(e.contentLength, null);
+  assert.equal(e.contentDisposition, null);
+  assert.equal(e.cacheControl, null);
+  assert.equal(e.authorization, null);
+  assert.equal(e.range, null);
+  assert.equal(e.contentRange, null);
+  assert.equal(e.etag, null);
+  assert.equal(e.link, null);
+  assert.equal(e.retryAfter, null);
+  assert.equal(e.hsts, null);
+  assert.equal(e.csp, null);
+  assert.equal(e.date, null);
+  assert.equal(e.age, null);
+  assert.equal(e.xRateLimitLimit, null);
+  assert.equal(e.xRateLimitRemaining, null);
+  assert.equal(e.xRateLimitReset, null);
+  assert.equal(e.earlyData, null);
+  assert.equal(e.lastModified, null);
+  assert.equal(e.expires, null);
+  assert.equal(e.altSvc.length, 0);
+  assert.equal(e.serverTiming.length, 0);
+  assert.equal(e.links.length, 0);
+  assert.equal(e.accept.length, 0);
+  assert.equal(e.vary.length, 0);
+  assert.equal(e.wwwAuthenticate, null);
+  assert.equal(e.proxyAuthenticate, null);
+  assert.equal(e.clientIP, null);
+  void h;
+});
+
+await test("an unknown Cache-Control directive is data, never a member of the result", async () => {
+  // A directive name comes straight off a response header, so `constructor`,
+  // `toString` and `__proto__` are all plausible input. They land in the
+  // `unknown` map, which is what keeps them data: a plain object would let
+  // `constructor=x` land as a real member and shadow the inherited one, and
+  // `__proto__=z` would reach the prototype setter.
+  for (const directive of ["constructor=x", "toString=y", "__proto__=z"]) {
+    const parsed = new RichHeaders({ "cache-control": `no-store, ${directive}` }).cacheControl!;
+    const [name, value] = directive.split("=");
+    assert.deepEqual(
+      [...parsed.unknown],
+      [[name!.toLowerCase() === "tostring" ? "tostring" : name, value]],
+      `${directive} must be reported as data`,
+    );
+    // Nothing about the parsed object changed shape.
+    assert.equal(parsed.noStore, true, `no-store must survive alongside ${directive}`);
+    assert.equal(typeof parsed.constructor, "function", `${directive} must not shadow constructor`);
+    assert.equal(typeof parsed.toString, "function", `${directive} must not shadow toString`);
+    // And the prototype chain is untouched: the directive did not become a
+    // member of the object at all.
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(parsed, name!),
+      false,
+      `${directive} must not become an own property`,
+    );
+  }
+});
+
+await test("a numeric accessor rejects an unparseable value rather than returning NaN", async () => {
+  // Each of these is `parseInt` guarded by `isNaN(...) ? null : n`; a header of
+  // "abc" must produce null, not NaN, which fails every comparison and then
+  // disappears into a serialised payload as `null` either way.
+  const cases: Array<[string, string, string]> = [
+    ["content-length", "contentLength", "abc"],
+    ["age", "age", "abc"],
+    ["x-ratelimit-limit", "xRateLimitLimit", "abc"],
+    ["x-ratelimit-remaining", "xRateLimitRemaining", "abc"],
+    ["x-ratelimit-reset", "xRateLimitReset", "abc"],
+    ["early-data", "earlyData", "abc"],
+  ];
+  for (const [header, accessor, raw] of cases) {
+    const h = new RichHeaders({ [header]: raw });
+    const got = (h as unknown as Record<string, unknown>)[accessor];
+    assert.equal(got, null, `${accessor} on "${raw}" must be null, got ${String(got)}`);
+  }
+});
+
+await test("a date accessor rejects an unparseable value rather than returning Invalid Date", async () => {
+  for (const [header, accessor] of [
+    ["date", "date"],
+    ["last-modified", "lastModified"],
+    ["expires", "expires"],
+  ] as Array<[string, string]>) {
+    const h = new RichHeaders({ [header]: "not-a-date" });
+    const got = (h as unknown as Record<string, unknown>)[accessor];
+    assert.equal(got, null, `${accessor} on "not-a-date" must be null, got ${String(got)}`);
+  }
+});
+
+await test("setting null deletes the header", async () => {
+  const setters: Array<[string, string]> = [
+    ["contentType", "content-type"],
+    ["contentLength", "content-length"],
+    ["contentDisposition", "content-disposition"],
+    ["cacheControl", "cache-control"],
+    ["authorization", "authorization"],
+    ["etag", "etag"],
+    ["hsts", "strict-transport-security"],
+    ["csp", "content-security-policy"],
+    ["wwwAuthenticate", "www-authenticate"],
+    ["proxyAuthenticate", "proxy-authenticate"],
+  ];
+  for (const [accessor, header] of setters) {
+    const h = new RichHeaders({ [header]: "placeholder" });
+    (h as unknown as Record<string, unknown>)[accessor] = null;
+    assert.equal(h.get(header), null, `setting ${accessor} to null must remove "${header}"`);
+  }
+});
+
+await test("every string-taking setter writes the string verbatim", async () => {
+  const cases: Array<[string, string, string]> = [
+    ["contentType", "content-type", "application/json"],
+    ["contentLength", "content-length", "7"],
+    ["contentDisposition", "content-disposition", "inline"],
+    ["cacheControl", "cache-control", "no-cache"],
+    ["authorization", "authorization", "Basic dXNlcjpwdw=="],
+    ["etag", "etag", '"v2"'],
+    ["csp", "content-security-policy", "default-src 'none'"],
+  ];
+  for (const [accessor, header, value] of cases) {
+    const h = new RichHeaders();
+    (h as unknown as Record<string, unknown>)[accessor] = value;
+    assert.equal(h.get(header), value, `${accessor} must write "${value}" verbatim`);
+  }
+});
+
+await test("the object-taking setters format rather than stringify", async () => {
+  // The object branch is the one that runs when a caller hands over a parsed
+  // value; writing `[object Object]` here would be silently wrong rather than
+  // a type error, since the parameter is a union.
+  const ct = new RichHeaders();
+  ct.contentType = {
+    mediaType: "application/json",
+    type: "application",
+    subtype: "json",
+    charset: "utf-8",
+    boundary: null,
+    params: new Map([["charset", "utf-8"]]),
+  };
+  assert.match(ct.get("content-type")!, /^application\/json/, "contentType formats its object");
+
+  const hsts = new RichHeaders();
+  hsts.hsts = { maxAge: 100, includeSubDomains: true, preload: false };
+  assert.match(hsts.get("strict-transport-security")!, /max-age=100/, "hsts formats its object");
+  assert.match(
+    hsts.get("strict-transport-security")!,
+    /includeSubDomains/,
+    "hsts keeps every field",
+  );
+
+  const cd = new RichHeaders();
+  cd.contentDisposition = { type: "attachment", filename: "r.csv" };
+  assert.match(
+    cd.get("content-disposition")!,
+    /attachment/,
+    "contentDisposition formats its object",
+  );
+
+  const cc = new RichHeaders();
+  cc.cacheControl = { noStore: true, maxAge: 60 };
+  const rendered = cc.get("cache-control")!;
+  assert.match(rendered, /no-store/, "cacheControl formats its object");
+  assert.match(rendered, /max-age=60/, "cacheControl keeps every directive");
+
+  const csp = new RichHeaders();
+  csp.csp = new Map([["default-src", ["'self'"]]]);
+  assert.match(csp.get("content-security-policy")!, /default-src/, "csp formats its map");
+
+  const wa = new RichHeaders();
+  wa.wwwAuthenticate = [{ scheme: "Bearer", realm: "r", params: [] }];
+  assert.match(
+    wa.get("www-authenticate")!,
+    /Bearer realm="r"/,
+    "wwwAuthenticate formats challenges",
+  );
+  const pa = new RichHeaders();
+  pa.proxyAuthenticate = [{ scheme: "Basic", realm: "p", params: [] }];
+  assert.match(
+    pa.get("proxy-authenticate")!,
+    /Basic realm="p"/,
+    "proxyAuthenticate formats challenges",
+  );
+});
+
+await test("the challenge setters omit an absent realm and empty params", async () => {
+  // Both branches of `if (c.realm)` and `if (params)`: a challenge with
+  // neither must format to the bare scheme, not to `scheme realm="undefined"`.
+  const bare = new RichHeaders();
+  bare.wwwAuthenticate = [{ scheme: "Negotiate", realm: "", params: [] }];
+  assert.equal(
+    bare.get("www-authenticate"),
+    "Negotiate",
+    "no realm and no params is the bare scheme",
+  );
+
+  const withParams = new RichHeaders();
+  withParams.proxyAuthenticate = [
+    { scheme: "Bearer", realm: "r", params: [["error", '"invalid_token"']] },
+  ];
+  assert.match(
+    withParams.get("proxy-authenticate")!,
+    /error="invalid_token"/,
+    "non-realm params are kept",
+  );
+  assert.match(
+    withParams.get("proxy-authenticate")!,
+    /realm="r"/,
+    "the realm is kept alongside them",
+  );
 });
 
 console.log(`\n── RESULTS: ${passed} passed, ${failed} failed`);

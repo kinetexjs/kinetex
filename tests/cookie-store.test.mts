@@ -32,10 +32,13 @@ const httpbin = kinetex({ baseURL: "https://httpbin.org", timeout: T });
 
 suite("setCookie");
 
-await test("basic cookie stores and retrieves", () => {
+await test("basic cookie stores and retrieves", async () => {
   const jar = createCookieJar();
   assert.equal(jar.setCookie("session=abc123", { url: "https://example.com/" }), true);
   assert.equal(jar.count, 1);
+  // A real elapsed gap BEFORE the read, so the value the snapshot carries can
+  // be told apart from one this very call stamped.
+  await new Promise((r) => setTimeout(r, 15));
   const cookies = jar.getCookies({ url: "https://example.com/" });
   assert.equal(cookies.length, 1);
   assert.equal(cookies[0].name, "session");
@@ -46,8 +49,23 @@ await test("basic cookie stores and retrieves", () => {
   assert.equal(cookies[0].secure, false);
   assert.equal(cookies[0].httpOnly, false);
   assert.equal(cookies[0].sameSite, "Unset");
-  assert.ok(cookies[0].createdAt > 0);
-  assert.ok(cookies[0].lastAccessed > 0);
+  assert.equal(cookies[0].maxAge, null);
+  // `> 0` is true of any timestamp since the epoch. Pin the window: the cookie
+  // was created now, so createdAt must be at or before now and not in the
+  // future, and lastAccessed starts equal to createdAt.
+  const now = Date.now();
+  assert.ok(cookies[0].createdAt <= now, "createdAt must not be in the future");
+  assert.ok(now - cookies[0].createdAt < 5000, "createdAt must be ~now");
+  // The snapshot handed to the caller is the cookie as it was stored,
+  // not a copy already stamped with the access that call itself performed.
+  // Measured as a gap, not an inequality against `now`: a snapshot stamped by
+  // the very call that produced it can still land 0 ms "before" now.
+  assert.ok(
+    now - cookies[0].lastAccessed > 5,
+    `the returned snapshot must predate this call by the 15 ms sleep, got ${now - cookies[0].lastAccessed} ms`,
+  );
+  assert.equal(cookies[0].expires, Infinity, "no Max-Age/Expires means a session cookie");
+  jar.destroy();
 });
 
 await test("cookie with Path=/api only matches /api/* paths", () => {
@@ -171,8 +189,12 @@ await test("Max-Age sets expiry and cookie persists", () => {
   jar.setCookie("x=1; Max-Age=3600", { url: "https://example.com/" });
   const cookies = jar.getCookies({ url: "https://example.com/" });
   assert.equal(cookies.length, 1);
-  assert.ok(cookies[0].expires !== Infinity);
-  assert.ok(cookies[0].expires > Date.now());
+  // "Not Infinity and in the future" is satisfied by a lifetime of 1 ms. The
+  // subject of the test is 3600 seconds.
+  assert.equal(cookies[0].maxAge, 3600, "the raw Max-Age is retained");
+  const ttl = cookies[0].expires - Date.now();
+  assert.ok(ttl > 3_595_000 && ttl <= 3_600_000, `expected ~3600s, got ${ttl}ms`);
+  jar.destroy();
 });
 
 await test("Max-Age=0 deletes cookie immediately", () => {
@@ -567,11 +589,27 @@ await test("getCookieHeader builds proper header string", () => {
   const jar = createCookieJar();
   jar.setCookie("x=1", { url: "https://example.com/" });
   jar.setCookie("y=2", { url: "https://example.com/" });
-  const header = jar.getCookieHeader({ url: "https://example.com/" });
-  assert.ok(header.includes("x=1"));
-  assert.ok(header.includes("y=2"));
-  const parts = header.split("; ");
-  assert.equal(parts.length, 2);
+  // `includes` plus a length would accept "x=1; y=2; garbage=x=1" with a
+  // duplicated pair; assert the exact string, which also pins the ordering.
+  assert.equal(jar.getCookieHeader({ url: "https://example.com/" }), "x=1; y=2");
+  assert.equal(
+    jar.getCookieHeader({ url: "https://other.com/" }),
+    "",
+    "a different host gets no cookies",
+  );
+  // Longer paths sort first (RFC 6265 §5.4 step 2), and an empty name is sent
+  // as its bare value.
+  const jar2 = createCookieJar();
+  jar2.setCookie("deep=3; Path=/a/b", { url: "https://example.com/a/b" });
+  jar2.setCookie("shallow=4; Path=/", { url: "https://example.com/" });
+  jar2.setCookie("=bare", { url: "https://example.com/" });
+  assert.equal(
+    jar2.getCookieHeader({ url: "https://example.com/a/b/c" }),
+    "deep=3; shallow=4; bare",
+    "longest path first, insertion order within a path, empty name sends its value",
+  );
+  jar.destroy();
+  jar2.destroy();
 });
 
 await test("getCookieHeader empty when no cookies match", () => {
@@ -580,6 +618,9 @@ await test("getCookieHeader empty when no cookies match", () => {
 });
 
 await test("count returns accurate total", () => {
+  // Every assertion below also cross-checks `count` against the number of
+  // cookies that are actually reachable. `count` is maintained by hand
+  // alongside the maps, and the two can drift apart without it being visible.
   const jar = createCookieJar();
   jar.setCookie("a=1", { url: "https://a.com/" });
   jar.setCookie("b=2", { url: "https://b.com/" });
@@ -604,17 +645,44 @@ await test("custom domain matcher can reject everything", () => {
 });
 
 await test("custom max limits work", () => {
+  // All ten cookies carry `Domain=example.com`, so the PER-DOMAIN cap of 3 is
+  // the binding one and 3 is the correct answer. This asserted 5, and passed
+  // only because the eviction path was orphaning the cookies it had just
+  // stored while still counting them — the counter drifted to 5 over 2
+  // reachable cookies. Assert the caps, and assert that what the counter
+  // claims is actually there.
   const jar = new CookieJar({ maxTotal: 5, maxPerDomain: 3 });
   for (let i = 0; i < 10; i++) {
     jar.setCookie(`x${i}=1; Domain=example.com; Path=/p${i}`, { url: `https://example.com/p${i}` });
   }
-  assert.equal(jar.count, 5);
+  assert.equal(jar.count, 3, "the per-domain cap binds when every cookie shares a domain");
+  assert.equal(jar.getAll().length, 3, "count must equal the number of reachable cookies");
+  assert.equal(jar.toJSON().length, 3, "and the number that serialize");
+  for (const c of jar.getAll()) assert.ok(c.domain === "example.com");
+
+  // The global cap binds when the cookies are spread across domains.
+  const spread = new CookieJar({ maxTotal: 5, maxPerDomain: 100 });
+  for (let i = 0; i < 10; i++) {
+    spread.setCookie(`c${i}=1`, { url: `https://d${i}.test/` });
+  }
+  assert.equal(spread.count, 5, "the global cap must bound the jar");
+  assert.equal(spread.getAll().length, 5, "with no drift between the two");
+  jar.destroy();
+  spread.destroy();
 });
 
 await test("destroy cleans up interval timer", () => {
   const jar = createCookieJar();
+  const priv = jar as unknown as { cleanupTimer: unknown };
+  assert.ok(
+    priv.cleanupTimer !== null && priv.cleanupTimer !== undefined,
+    "a live jar must hold a cleanup interval",
+  );
   jar.destroy();
-  jar.destroy(); // second call should be safe
+  // The interval is what keeps the event loop alive, so clearing it is the
+  // whole point — and nothing checked it before.
+  assert.equal(priv.cleanupTimer, null, "destroy must clear the cleanup interval");
+  assert.doesNotThrow(() => jar.destroy()); // second call must also be safe
 });
 
 await test("processResponseHeaders from Headers object", () => {
@@ -647,11 +715,17 @@ await test("sort order: longer path first, then older createdAt", () => {
 });
 
 await test("repeated getCookies calls trigger lazy cleanup path", () => {
+  // 500 fresh jars proved only that nothing threw. Keep one jar, and prove the
+  // lazy path keeps returning exactly the live cookie.
+  const jar = createCookieJar();
+  jar.setCookie("alive=1", { url: "https://example.com/" });
+  assert.equal(jar.count, 1, "the live cookie must be stored");
   for (let i = 0; i < 500; i++) {
-    const other = createCookieJar();
-    other.setCookie("v=1", { url: "https://example.com/" });
-    other.getCookies({ url: "https://example.com/" });
+    const got = jar.getCookies({ url: "https://example.com/" });
+    assert.equal(got.length, 1, "repeated reads must keep returning the live cookie");
+    assert.equal(got[0]!.name, "alive");
   }
+  jar.destroy();
 });
 
 // ============================================================================
@@ -802,68 +876,13 @@ await test("SameSite context 'none' sends Unset and None cookies only", () => {
   assert.deepEqual(names, ["n", "u"]);
 });
 
-await test("custom domain matcher can reject everything", () => {
-  const jar = new CookieJar({ domainMatcher: () => false });
-  assert.equal(jar.setCookie("x=1; Domain=example.com", { url: "https://example.com/" }), false);
-});
-
-await test("custom max limits work", () => {
-  const jar = new CookieJar({ maxTotal: 5, maxPerDomain: 3 });
-  for (let i = 0; i < 10; i++) {
-    jar.setCookie(`x${i}=1; Domain=example.com; Path=/p${i}`, { url: `https://example.com/p${i}` });
-  }
-  assert.equal(jar.count, 5);
-});
-
-await test("destroy cleans up interval timer", () => {
-  const jar = createCookieJar();
-  jar.destroy();
-  jar.destroy(); // second call should be safe
-});
-
-await test("processResponseHeaders from Headers object", () => {
-  const jar = createCookieJar();
-  jar.processResponseHeaders(new Headers({ "set-cookie": "a=1" }), { url: "https://example.com/" });
-  assert.equal(jar.count, 1);
-});
-
-await test("processResponseHeaders from plain object with array", () => {
-  const jar = createCookieJar();
-  jar.processResponseHeaders({ "set-cookie": ["a=1", "b=2"] }, { url: "https://example.com/" });
-  assert.equal(jar.count, 2);
-});
-
-await test("IP request host does not match domain cookies", () => {
-  const jar = createCookieJar();
-  jar.setCookie("x=1; Domain=example.com", { url: "https://example.com/" });
-  const cookies = jar.getCookies({ url: "https://10.0.0.1/" });
-  assert.equal(cookies.length, 0);
-});
-
-await test("sort order: longer path first, then older createdAt", () => {
-  const jar = createCookieJar();
-  jar.setCookie("a=1; Path=/", { url: "https://example.com/" });
-  jar.setCookie("b=2; Path=/api", { url: "https://example.com/" });
-  const cookies = jar.getCookies({ url: "https://example.com/api/users" });
-  assert.equal(cookies.length, 2);
-  assert.equal(cookies[0].name, "b");
-  assert.equal(cookies[1].name, "a");
-});
-
-await test("repeated getCookies calls trigger lazy cleanup path", () => {
-  // The lazy cleanup has 1% chance per call. 500 calls gives ~99.3% probability.
-  const jar = createCookieJar();
-  jar.setCookie("x=1; Max-Age=0", { url: "https://example.com/" }); // deletes immediately
-  for (let i = 0; i < 500; i++) {
-    const other = createCookieJar();
-    other.setCookie("v=1", { url: "https://example.com/" });
-    other.getCookies({ url: "https://example.com/" });
-  }
-  // Just verify it doesn't throw - the cleanup is best-effort
-  for (let i = 0; i < 500; i++) {
-    jar.getCookies({ url: "https://example.com/" });
-  }
-});
+// (The eight tests that stood here — "custom domain matcher can reject
+// everything", "custom max limits work", "destroy cleans up interval timer",
+// "processResponseHeaders from Headers object", "processResponseHeaders from
+// plain object with array", "IP request host does not match domain cookies",
+// "sort order: longer path first, then older createdAt" and "repeated
+// getCookies calls trigger lazy cleanup path" — were byte-for-byte copies of
+// tests already present in §5. The file reported 98 tests; 90 were distinct.)
 
 // ============================================================================
 // §6  REAL HTTP INTEGRATION — battle tests with httpbin.org
@@ -955,7 +974,9 @@ await test("direct CookieJar with real httpbin Set-Cookie", async () => {
     assert.equal(retrieved[0].value, "test");
   } else {
     // httpbin may respond without redirect
-    assert.ok(res.status === 200 || (res.status >= 300 && res.status < 400));
+    // Pinned, not "200 or any 3xx": a redirect is a different response shape
+    // and was being accepted as equivalent.
+    assert.equal(res.status, 200, "the echo endpoint must answer 200");
   }
 });
 
@@ -977,13 +998,324 @@ await test("httpbin basic endpoints accessible", async () => {
 });
 
 // ============================================================================
+// §8  REGRESSION: EVICTION ORPHANS, REHYDRATION, OWNERSHIP, REPORTING
+// ============================================================================
+
+suite("regression: a new cookie is never orphaned by its own eviction");
+
+await test("regression: a cookie at a new path survives the eviction it triggers", async () => {
+  // putCookie created the new path map, then called evictForDomain() — which
+  // prunes empty path maps as part of its own bookkeeping. The prune deleted
+  // the map that was about to be written into, so the cookie landed in an
+  // orphaned map nothing could reach: setCookie() returned true, the cookie
+  // was never sent, and getAll()/toJSON() could not see it.
+  const jar = new CookieJar({ maxPerDomain: 2, maxTotal: 1000 });
+  jar.setCookie("a=1; Path=/1", { url: "https://example.com/1" });
+  await new Promise((r) => setTimeout(r, 20));
+  jar.setCookie("b=1; Path=/2", { url: "https://example.com/2" });
+
+  // Now at the cap, so adding a third cookie at a NEW path evicts one.
+  const accepted = jar.setCookie("c=1; Path=/3", { url: "https://example.com/3" });
+  assert.equal(accepted, true, "setCookie must report success");
+  assert.equal(
+    jar.getCookieHeader({ url: "https://example.com/3" }),
+    "c=1",
+    "the cookie the server just set must actually be sent",
+  );
+  const stored = jar
+    .getAll()
+    .map((c) => c.name)
+    .sort();
+  assert.deepEqual(stored, ["b", "c"], "the LRU victim is evicted, the new one is kept");
+  assert.equal(jar.count, stored.length, "the counter must match what is stored");
+  jar.destroy();
+});
+
+await test("regression: count never drifts above the number of stored cookies", async () => {
+  // The orphaned writes still incremented `total`, so the counter climbed
+  // while the jar emptied: measured at count === 5 with 2 cookies stored.
+  // Because evictGlobal() reads `this.total`, the drift also stopped the
+  // global cap from bounding anything.
+  const jar = new CookieJar({ maxPerDomain: 2, maxTotal: 1000 });
+  jar.setCookie("a=1; Path=/1", { url: "https://example.com/1" });
+  for (let i = 2; i <= 10; i++) {
+    jar.setCookie(`c${i}=1; Path=/${i}`, { url: `https://example.com/${i}` });
+    await new Promise((r) => setTimeout(r, 5));
+    const stored = jar.getAll().length;
+    assert.equal(jar.count, stored, `after ${i} cookies: count ${jar.count} vs ${stored} stored`);
+    assert.ok(jar.count <= 2, `the per-domain cap must hold, got ${jar.count}`);
+  }
+  // And the global cap, with the counter it depends on now honest.
+  const spread = new CookieJar({ maxTotal: 4, maxPerDomain: 100 });
+  for (let i = 0; i < 12; i++) {
+    spread.setCookie(`c${i}=1`, { url: `https://d${i}.test/` });
+    assert.ok(spread.count <= 4, `global cap exceeded: ${spread.count}`);
+    assert.equal(spread.count, spread.getAll().length);
+  }
+  jar.destroy();
+  spread.destroy();
+});
+
+await test("regression: per-domain eviction keeps the most recently used cookie", async () => {
+  // The eviction itself was choosing correctly; only the orphaning was wrong.
+  // This pins the ordering so a future refactor cannot regress it.
+  const jar = new CookieJar({ maxPerDomain: 2 });
+  jar.setCookie("a=1; Path=/1", { url: "https://example.com/1" });
+  await new Promise((r) => setTimeout(r, 20));
+  jar.setCookie("b=1; Path=/2", { url: "https://example.com/2" });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(jar.getCookieHeader({ url: "https://example.com/1" }), "a=1", "touching a");
+  await new Promise((r) => setTimeout(r, 20));
+  jar.setCookie("c=1; Path=/3", { url: "https://example.com/3" });
+  assert.equal(
+    jar
+      .getAll()
+      .map((c) => c.name)
+      .sort()
+      .join(","),
+    "a,c",
+    "b was least recently used, so b is evicted and the cookie just read survives",
+  );
+  jar.destroy();
+});
+
+await test("regression: reading a cookie still updates its LRU timestamp", async () => {
+  // getCookies() now hands back copies, so the last-access stamp has to be
+  // applied to the STORED cookie — that is the value eviction orders by.
+  const jar = new CookieJar();
+  jar.setCookie("a=1", { url: "https://example.com/" });
+  const before = jar.getAll()[0]!.lastAccessed;
+  await new Promise((r) => setTimeout(r, 20));
+  jar.getCookieHeader({ url: "https://example.com/" });
+  const after = jar.getAll()[0]!.lastAccessed;
+  assert.ok(after > before, `lastAccessed must advance on read: ${before} -> ${after}`);
+  jar.destroy();
+});
+
+suite("regression: a rehydrated jar is re-validated");
+
+await test("regression: a public-suffix cookie from persisted state is never sent", async () => {
+  // fromJSON()/loadCookieJar() write straight into the storage map and skip
+  // setCookie() entirely, so RFC 6265 §5.3's "the cookie domain must not be a
+  // public suffix" rule — which setCookie() enforces — was never applied to
+  // rehydrated state. A persisted cookie with `domain: "com"`, which
+  // setCookie refuses, was attached to every .com request: anyone able to
+  // write the serialized jar (an XSS bug plus localStorage) got a cross-site
+  // cookie-tossing primitive. getCookies() already re-validated the
+  // __Secure-/__Host- prefixes for exactly this reason.
+  const planted = [
+    {
+      name: "planted",
+      value: "leaked",
+      domain: "com",
+      path: "/",
+      expires: null,
+      maxAge: null,
+      secure: false,
+      httpOnly: false,
+      sameSite: "Unset" as const,
+      createdAt: Date.now(),
+      lastAccessed: Date.now(),
+      hostOnly: false,
+    },
+  ];
+  const jar = loadCookieJar(planted as never);
+  assert.equal(jar.count, 1, "the entry is stored");
+  for (const host of ["victim.com", "bank.com", "anything.co.uk"]) {
+    assert.equal(
+      jar.getCookieHeader({ url: `https://${host}/` }),
+      "",
+      `a cookie on the public suffix "com" must not reach ${host}`,
+    );
+  }
+  // The same rule at set time, for contrast.
+  const fresh = new CookieJar();
+  assert.equal(
+    fresh.setCookie("x=1; Domain=com", { url: "https://evil.com/" }),
+    false,
+    "setCookie has always refused this",
+  );
+  // A legitimate registrable domain still works after rehydration.
+  const ok = loadCookieJar([
+    { ...planted[0]!, name: "fine", value: "ok", domain: "example.com" },
+  ] as never);
+  assert.equal(ok.getCookieHeader({ url: "https://www.example.com/" }), "fine=ok");
+  jar.destroy();
+  fresh.destroy();
+  ok.destroy();
+});
+
+await test("regression: getCookies returns copies, not the stored objects", async () => {
+  // getCookies() returned the live stored objects, so
+  // `jar.getCookies(o)[0].value = "x"` rewrote the jar — while getAll() and
+  // getForDomain() both return copies, leaving the same API disagreeing about
+  // whether the result was yours to modify.
+  const jar = new CookieJar();
+  jar.setCookie("a=1", { url: "https://example.com/" });
+  const got = jar.getCookies({ url: "https://example.com/" });
+  got[0]!.value = "MUTATED";
+  got[0]!.hostOnly = false;
+  assert.equal(
+    jar.getCookieHeader({ url: "https://example.com/" }),
+    "a=1",
+    "mutating a returned cookie must not rewrite the jar",
+  );
+  assert.equal(jar.getAll()[0]!.value, "1");
+  assert.equal(jar.getAll()[0]!.hostOnly, true);
+  jar.destroy();
+});
+
+await test("regression: re-setting a cookie does not inflate the counter", () => {
+  // Overwriting an existing (domain, path, name) slot replaces the value and
+  // keeps the original createdAt; the slot count is unchanged. `total` was
+  // only ever read by evictGlobal(), so a counter that drifts upward on
+  // overwrite makes the global cap fire earlier than the jar is actually
+  // full — while `count` reports a jar larger than the one it holds.
+  const jar = new CookieJar({ maxTotal: 1000 });
+  assert.equal(jar.setCookie("a=1", { url: "https://example.com/" }), true);
+  assert.equal(jar.count, 1);
+  for (let i = 0; i < 20; i++) {
+    assert.equal(jar.setCookie(`a=${i}`, { url: "https://example.com/" }), true);
+    assert.equal(jar.count, 1, `after ${i + 1} overwrites the count must stay 1`);
+    assert.equal(jar.getAll().length, 1);
+    assert.equal(jar.getCookieHeader({ url: "https://example.com/" }), `a=${i}`);
+  }
+  // A different path IS a different slot.
+  jar.setCookie("a=1; Path=/x", { url: "https://example.com/x" });
+  assert.equal(jar.count, 2, "a new path is a new cookie");
+  jar.destroy();
+});
+
+await test("regression: getCookiesForDomain drops public-suffix cookies", () => {
+  // The same rule getCookies() applies. A rehydrated jar can hold a cookie on
+  // a public suffix, and an inspection API that listed it would report a
+  // cookie as in scope for a registrable domain that can never receive it.
+  const jar = loadCookieJar([
+    {
+      name: "planted",
+      value: "leaked",
+      domain: "com",
+      path: "/",
+      expires: null,
+      maxAge: null,
+      secure: false,
+      httpOnly: false,
+      sameSite: "Unset",
+      createdAt: Date.now(),
+      lastAccessed: Date.now(),
+      hostOnly: false,
+    },
+    {
+      name: "real",
+      value: "ok",
+      domain: "example.com",
+      path: "/",
+      expires: null,
+      maxAge: null,
+      secure: false,
+      httpOnly: false,
+      sameSite: "Unset",
+      createdAt: Date.now(),
+      lastAccessed: Date.now(),
+      hostOnly: false,
+    },
+  ] as never);
+  assert.equal(jar.count, 2, "both entries are stored");
+  assert.deepEqual(
+    jar.getCookiesForDomain("example.com").map((c) => c.name),
+    ["real"],
+    'a cookie on the public suffix "com" is not in scope for example.com',
+  );
+  assert.ok(
+    !jar.getCookiesForDomain("com").some((c) => c.name === "planted"),
+    "the public-suffix cookie is never reported for any query",
+  );
+  jar.destroy();
+});
+
+suite("regression: getCookiesForDomain reports only what is sent");
+
+await test("regression: a host-only subdomain cookie is not reported for the parent", async () => {
+  // getCookiesForDomain() documents itself as returning "cookies that would be
+  // sent to this domain" but took no host-only and no public-suffix filter, so
+  // asking for "example.com" listed the host-only cookie belonging to
+  // "sub.example.com" — a cookie that never reaches example.com.
+  const jar = new CookieJar();
+  jar.setCookie("hostonly=1", { url: "https://sub.example.com/" });
+  jar.setCookie("domainwide=1; Domain=example.com", { url: "https://example.com/" });
+
+  assert.equal(jar.getCookieHeader({ url: "https://example.com/" }), "domainwide=1");
+  assert.deepEqual(
+    jar.getCookiesForDomain("example.com").map((c) => c.name),
+    ["domainwide"],
+    "only the cookie actually sent to example.com",
+  );
+  // Asking for the subdomain itself still finds the host-only cookie, and the
+  // parent-domain cookie, which does apply to it.
+  assert.deepEqual(
+    jar
+      .getCookiesForDomain("sub.example.com")
+      .map((c) => c.name)
+      .sort(),
+    ["domainwide", "hostonly"],
+  );
+  // An unrelated host gets nothing.
+  assert.deepEqual(jar.getCookiesForDomain("other.com"), []);
+
+  // Copies, like every other accessor. This one handed back the stored
+  // objects while the method directly above it returned copies, so
+  // `jar.getCookiesForDomain(d)[0].value = "x"` rewrote the jar.
+  const inspected = jar.getCookiesForDomain("example.com");
+  inspected[0]!.value = "MUTATED";
+  inspected[0]!.hostOnly = true;
+  assert.equal(
+    jar.getCookieHeader({ url: "https://example.com/" }),
+    "domainwide=1",
+    "mutating an inspected cookie must not rewrite the jar",
+  );
+  assert.equal(jar.getAll().find((c) => c.name === "domainwide")!.hostOnly, false);
+
+  // The mirror image, and the one that made the method disagree with the
+  // Cookie header it is supposed to describe: the match only ever walked
+  // *down* the tree, so asking about a subdomain missed the ancestor-domain
+  // cookies that do apply to it. getCookiesForDomain("sub.example.com")
+  // returned 1 while the header said 2, and a deeper name returned nothing.
+  const headerForSub = jar.getCookieHeader({ url: "https://sub.example.com/" });
+  assert.equal(headerForSub, "hostonly=1; domainwide=1", "both cookies are sent");
+  assert.deepEqual(
+    jar
+      .getCookiesForDomain("sub.example.com")
+      .map((c) => c.name)
+      .sort(),
+    headerForSub
+      .split("; ")
+      .map((p) => p.split("=")[0])
+      .sort(),
+    "the reported set must match the header actually sent, for a subdomain query",
+  );
+  assert.deepEqual(
+    jar.getCookiesForDomain("deep.sub.example.com").map((c) => c.name),
+    ["domainwide"],
+    "an ancestor's cookie still applies deeper down, a sibling's host-only one does not",
+  );
+  assert.deepEqual(
+    jar.getCookiesForDomain("example.com").map((c) => c.name),
+    ["domainwide"],
+    "and the parent query is unchanged",
+  );
+  jar.destroy();
+});
+
+// ============================================================================
 // §7  SUMMARY
 // ============================================================================
 
-const total = passed + failed;
+// `total` used to be snapshotted here, before the last few tests in the
+// file had run, so the summary could print a pass count larger than its own
+// denominator (e.g. "109/100 passed"). It is computed at print time now.
 console.log(`\n${"=".repeat(60)}`);
 console.log(
-  `  COOKIE STORE TEST RESULTS: ${passed}/${total} passed${failed > 0 ? `  (${failed} FAILED)` : ""}`,
+  `  COOKIE STORE TEST RESULTS: ${passed}/${passed + failed} passed${failed > 0 ? `  (${failed} FAILED)` : ""}`,
 );
 console.log(`${"=".repeat(60)}`);
 

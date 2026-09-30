@@ -111,8 +111,18 @@ await test("HEAD: returns headers, no body", async () => {
   const r = await bin.head("/get");
   assert.equal(r.status, 200);
   assert.ok(r.headers["content-type"]);
-  // HEAD has no body
-  assert.ok(r.data === null || r.data === undefined || (r.data as unknown) === "");
+  // HEAD returns the headers of the equivalent GET but no body. The old guard
+  // accepted null, undefined AND "", so any of three wrong shapes passed and an
+  // empty-string body — the actual regression this guards — went unnoticed.
+  // The parsed body is deterministically null, while Content-Length still
+  // reports the length the body *would* have had.
+  assert.equal(r.data, null, "HEAD must yield a null body, not an empty string");
+  const clen = Number(r.headers["content-length"]);
+  assert.equal(
+    Number.isFinite(clen) && clen > 0,
+    true,
+    `HEAD must still report a Content-Length, got ${String(r.headers["content-length"])}`,
+  );
 });
 
 // ============================================================================
@@ -669,11 +679,15 @@ await test("Error interceptor fires on 4xx when throwOnError:true", async () => 
   client.useError((ctx) => {
     interceptedCode = (ctx.error as KinetexError)?.code ?? "";
   });
-  try {
-    await client.get("/status/404");
-  } catch {
-    /* expected */
-  }
+  await assert.rejects(
+    () => client.get("/status/404"),
+    (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.equal((err as { response?: { status?: number } }).response?.status, 404);
+      return true;
+    },
+    "a 404 must reject",
+  );
   assert.ok(interceptedCode.length > 0, "Error interceptor should have fired");
 });
 
@@ -994,18 +1008,32 @@ await test("SSEClient parses events from a streaming endpoint", async () => {
     reconnect: false,
   });
 
-  // Verify the client can connect and get a response (even if not SSE format)
-  let connectionAttempted = false;
+  // The old form was `assert.ok(connectionAttempted || true)`, which is a
+  // tautology: it passed for every possible value, including when the client
+  // never connected at all. Both branches of the old try/catch also set the
+  // same flag to true, so nothing could distinguish success from failure.
+  //
+  // The real, checkable property: iterating a non-SSE endpoint must terminate
+  // — either by yielding a parsed event or by throwing a parse/transport error.
+  // Hanging forever is the failure this now rules out.
+  let outcome: "yielded" | "threw" | "exhausted" = "exhausted";
+  let thrown: unknown = null;
   try {
     for await (const _event of client) {
-      connectionAttempted = true;
-      break; // just need one iteration
+      outcome = "yielded";
+      break;
     }
-  } catch (_e) {
-    connectionAttempted = true; // connection made, not SSE format = expected
+  } catch (err) {
+    outcome = "threw";
+    thrown = err;
   }
-
-  assert.ok(connectionAttempted || true, "SSEClient should attempt connection");
+  assert.notEqual(outcome, "exhausted", "the SSE iterator must terminate, not hang");
+  if (outcome === "threw") {
+    assert.ok(
+      thrown instanceof Error,
+      `a thrown SSE failure must be an Error, got ${String(thrown)}`,
+    );
+  }
   // Real SSE test is in tests/runtimes/cloudflare-worker.ts
 });
 
@@ -1538,8 +1566,13 @@ await test("negotiateContentType selects from available types", async () => {
     "application/json",
     "text/plain",
   ]);
-  assert.ok(selected !== null);
-  assert.ok(selected === "application/json" || selected === "text/plain");
+  // "application/json" is the only offered type that appears in the Accept
+  // header, so the result is fully determined. The old disjunction also allowed
+  // "text/plain", which the server never offered — it would have masked a
+  // negotiation bug that picked the wrong entry.
+  assert.equal(selected, "application/json");
+  // With nothing on offer there is no valid answer: null, not a silent default.
+  assert.equal(negotiateContentType("text/html,application/json;q=0.9", []), null);
 });
 
 await test("parseLinkHeader returns array with uri and rel", async () => {
@@ -1936,23 +1969,22 @@ await test("formatBytes formats sizes with correct units", async () => {
   assert.ok(formatBytes(1500).includes("KB"));
 });
 
-await test("formatRate returns string with B, KB, or MB suffix", async () => {
-  const r1 = formatRate(1024);
-  assert.ok(r1.includes("KB") || r1.includes("B"), `Rate: ${r1}`);
-  const r2 = formatRate(1024 * 1024);
-  assert.ok(r2.includes("MB") || r2.includes("KB"), `Rate: ${r2}`);
+await test("formatRate returns the exact string", async () => {
+  // The disjunction `includes("KB") || includes("B")` is satisfied by "B"
+  // alone, so a wrong unit or a wrong magnitude still passed. formatRate is
+  // formatBytes plus "/s", so both are pinned.
+  assert.equal(formatRate(0), "0 B/s");
+  assert.equal(formatRate(1024), "1 KB/s");
+  assert.equal(formatRate(1024 * 1024), "1 MB/s");
 });
 
-await test("formatETA returns human-readable time string", async () => {
-  const etaZero = formatETA(0);
-  assert.ok(typeof etaZero === "string");
-  const etaSecs = formatETA(5000);
-  assert.ok(
-    etaSecs.includes("s") || etaSecs.includes("sec") || etaSecs.includes("0"),
-    `ETA: ${etaSecs}`,
-  );
-  const etaMins = formatETA(120_000);
-  assert.ok(etaMins.includes("m") || etaMins.includes("2"), `ETA: ${etaMins}`);
+await test("formatETA returns the exact duration string", async () => {
+  // `includes("s") || includes("sec") || includes("0")` accepts almost any
+  // string; pin the three documented shapes.
+  assert.equal(formatETA(0), "0s");
+  assert.equal(formatETA(5000), "5s");
+  assert.equal(formatETA(120_000), "2m 0s");
+  assert.equal(formatETA(3_600_000), "1h 0m 0s");
 });
 
 await test("formatProgress formats ProgressSnapshot to string", async () => {
@@ -2728,11 +2760,19 @@ await test("CLOSED → OPEN after threshold HTTP 503 failures", async () => {
   });
 
   for (let i = 0; i < 3; i++) {
-    try {
-      await client.get("/status/503", { retry: false });
-    } catch {
-      /* expected 503 */
-    }
+    await assert.rejects(
+      () => client.get("/status/503", { retry: false }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, `attempt ${i + 1} must reject`);
+        assert.equal(
+          (err as { response?: { status?: number } }).response?.status,
+          503,
+          `attempt ${i + 1} must be a 503`,
+        );
+        return true;
+      },
+      `attempt ${i + 1} of 3 must reject with 503`,
+    );
   }
 
   assert.ok(opens.length >= 1, "onOpen callback must fire when threshold exceeded");
@@ -2752,11 +2792,19 @@ await test("CircuitOpenError thrown when circuit is OPEN — no network call mad
 
   // Trip the circuit
   for (let i = 0; i < 2; i++) {
-    try {
-      await client.get("/status/500", { retry: false });
-    } catch {
-      /* expected */
-    }
+    await assert.rejects(
+      () => client.get("/status/500", { retry: false }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, `attempt ${i + 1} must reject`);
+        assert.equal(
+          (err as { response?: { status?: number } }).response?.status,
+          500,
+          `attempt ${i + 1} must be a 500`,
+        );
+        return true;
+      },
+      `attempt ${i + 1} of 2 must reject with 500`,
+    );
   }
 
   // A request to a known-good endpoint must now throw CircuitOpenError
@@ -2816,11 +2864,19 @@ await test("Circuit OPEN → HALF_OPEN probe after resetTimeoutMs elapses", asyn
 
   // Trip it open
   for (let i = 0; i < 2; i++) {
-    try {
-      await client.get("/status/500", { retry: false });
-    } catch {
-      /* expected */
-    }
+    await assert.rejects(
+      () => client.get("/status/500", { retry: false }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, `attempt ${i + 1} must reject`);
+        assert.equal(
+          (err as { response?: { status?: number } }).response?.status,
+          500,
+          `attempt ${i + 1} must be a 500`,
+        );
+        return true;
+      },
+      `attempt ${i + 1} of 2 must reject with 500`,
+    );
   }
   assert.ok(events.includes("open"), "Circuit must open");
 
@@ -2839,7 +2895,10 @@ await test("Per-origin isolation: one origin's circuit does not affect another",
 
   // Use two separate clients pointing to different origins
   const clientA = new Kinetex({ baseURL: "https://httpbin.org", timeout: T, throwOnError: true });
-  const clientB = new Kinetex({ baseURL: "https://httpbingo.org", timeout: T });
+  // A second, independently-reachable origin. httpbingo.org was used here and
+  // has started answering 402 to kinetex's requests, which the old bare
+  // `catch {}` turned into a permanent silent pass.
+  const clientB = new Kinetex({ baseURL: "https://jsonplaceholder.typicode.com", timeout: T });
 
   clientA.enableCircuitBreaker({
     failureThreshold: 2,
@@ -2856,11 +2915,19 @@ await test("Per-origin isolation: one origin's circuit does not affect another",
 
   // Trip clientA's circuit
   for (let i = 0; i < 2; i++) {
-    try {
-      await clientA.get("/status/500", { retry: false });
-    } catch {
-      /* expected */
-    }
+    await assert.rejects(
+      () => clientA.get("/status/500", { retry: false }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, `attempt ${i + 1} must reject`);
+        assert.equal(
+          (err as { response?: { status?: number } }).response?.status,
+          500,
+          `attempt ${i + 1} must be a 500`,
+        );
+        return true;
+      },
+      `clientA attempt ${i + 1} of 2 must reject with 500`,
+    );
   }
 
   // clientA rejects
@@ -2872,13 +2939,22 @@ await test("Per-origin isolation: one origin's circuit does not affect another",
   }
   assert.ok(caughtA instanceof CircuitOpenError, "clientA circuit must be open");
 
-  // clientB is unaffected — httpbingo.org /get returns 200
+  // clientB is unaffected — jsonplaceholder /todos/1 returns 200
   try {
-    const r = await clientB.get("/get", { retry: false });
+    const r = await clientB.get("/todos/1", { retry: false });
     assert.equal(r.status, 200, "clientB must be unaffected by clientA's open circuit");
-  } catch {
-    // httpbingo.org may be unavailable in CI — skip rather than fail
-    console.log("    [skip] httpbingo.org unavailable");
+  } catch (e) {
+    // The bare `catch {}` this replaced encloses the assertion above, so it
+    // reported a pass even when clientB *was* affected. Only a transport
+    // failure may skip.
+    const why = `${(e as { name?: string })?.name ?? ""}: ${(e as { message?: string })?.message ?? String(e)}`;
+    assert.ok(
+      /fetch failed|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|ECONNRESET|EAI_AGAIN|timeout|network|socket/i.test(
+        why,
+      ),
+      `clientB isolation check failed for a non-network reason and must not be skipped: ${why}`,
+    );
+    console.log(`    [skip] jsonplaceholder unavailable: ${why}`);
   }
 });
 
@@ -2968,9 +3044,17 @@ await test("POSTs bypass deduplication entirely", async () => {
   assert.equal(r1.status, 200);
   assert.equal(r2.status, 200);
 
-  // Dedup metrics must be zero — POSTs don't go through the dedup map
+  // POSTs are not coalesced — each one above reached httpbin on its own, which
+  // is what this test is actually for. `misses` is documented as "requests that
+  // triggered a real network call", and a POST excluded by the `methods` filter
+  // is exactly that, so it counts. The old assertion of zero here pinned the
+  // pre-fix behaviour, where a client that only ever made POSTs reported
+  // totalRequests 0 and hitRate 0 no matter how much traffic it sent.
+  // tests/dedup.test.mts asserts the corrected contract directly.
   const m = client.dedupMetrics!;
-  assert.strictEqual(m.misses + m.hits, 0, "POSTs must not touch dedup counters");
+  assert.strictEqual(m.hits, 0, "POSTs are never coalesced, so there can be no hit");
+  assert.strictEqual(m.misses, 2, "each POST is a real network call and counts as a miss");
+  assert.strictEqual(m.totalRequests, 2);
 });
 
 await test("disableDedup() stops coalescing", async () => {
@@ -3505,11 +3589,21 @@ await test("OTel span is ended with ERROR status on TimeoutError", async () => {
   const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: 500 });
   client.setTracer(tracer);
 
-  try {
-    await client.get("/delay/10", { retry: false });
-  } catch {
-    /* expected timeout */
-  }
+  // Asserted, not discarded: if the request stopped timing out, this would
+  // have passed while reporting span status ERROR for a successful call.
+  await assert.rejects(
+    () => client.get("/delay/10", { retry: false }),
+    (err: unknown) => {
+      assert.ok(err instanceof Error, "a 500ms timeout must reject");
+      assert.equal(
+        (err as { code?: string }).code,
+        "ETIMEOUT",
+        "the failure must be a TimeoutError, not some other rejection",
+      );
+      return true;
+    },
+    "/delay/10 against a 500ms timeout must reject",
+  );
 
   assert.ok(spans.length >= 1, "A span must be created even for timed-out requests");
   const last = spans[spans.length - 1];
@@ -3773,17 +3867,27 @@ await test("Abort during retry sleep cancels immediately", async () => {
   ctrl.abort(); // pre-aborted
 
   const start = Date.now();
-  let threw = false;
-  try {
-    // sleep is not exported — test indirectly by making a request with pre-aborted signal
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: T });
-    await client.get("/status/200", { signal: ctrl.signal, retry: false });
-  } catch {
-    threw = true;
-  }
+  // sleep is not exported — test indirectly by making a request with a
+  // pre-aborted signal. `let threw = false; try {} catch { threw = true }` only
+  // proved that *something* was thrown, so a request that failed for an
+  // unrelated reason counted. The concrete error is asserted instead.
+  const preAborted = new Kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  await assert.rejects(
+    () => preAborted.get("/status/200", { signal: ctrl.signal, retry: false }),
+    (err: unknown) => {
+      assert.ok(err instanceof Error, "a pre-aborted request must throw an Error");
+      assert.equal(
+        (err as { code?: string }).code,
+        "EABORT",
+        "the failure must be an abort, not some other rejection",
+      );
+      return true;
+    },
+    "a pre-aborted signal must abort the request",
+  );
+  preAborted.destroy();
 
   const elapsed = Date.now() - start;
-  assert.ok(threw, "Pre-aborted signal must throw immediately");
   assert.ok(elapsed < 500, `Pre-aborted request must throw in < 500ms, took ${elapsed}ms`);
 });
 
@@ -4035,10 +4139,12 @@ await test("httpVersion: HTTP/1.1 uses fetch transport", async () => {
 // §20  SUMMARY
 // ============================================================================
 
-const total = passed + failed;
+// `total` used to be snapshotted here, before the last few tests in the
+// file had run, so the summary could print a pass count larger than its own
+// denominator (e.g. "109/100 passed"). It is computed at print time now.
 console.log(`\n${"═".repeat(60)}`);
 console.log(
-  `  Real-World Results: ${passed}/${total} passed${failed > 0 ? `  (${failed} FAILED)` : ""}`,
+  `  Real-World Results: ${passed}/${passed + failed} passed${failed > 0 ? `  (${failed} FAILED)` : ""}`,
 );
 console.log(`${"═".repeat(60)}`);
 

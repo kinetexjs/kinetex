@@ -19,17 +19,23 @@ export type HTTPMethod =
   "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "TRACE" | "CONNECT";
 
 /**
- * HTTP protocol versions supported by the library.
+ * HTTP protocol versions the library can actually use.
  *
  * When set in {@link KinetexRequest.httpVersion}, the client attempts to use the specified version.
  * Falls back to the next available version if the requested version is unavailable:
  * - `HTTP/2` requires ALPN negotiation or h2 upgrade support
- * - `HTTP/3` requires HTTP/3-capable transport (experimental)
  *
  * In most runtimes (Deno, Bun, Browser), HTTP/2 is negotiated automatically over TLS.
  * On Node.js, use {@link createTransport} with `preferHTTP2: true` for HTTP/2 support.
+ *
+ * `HTTP/3` is deliberately absent. As of this writing no runtime kinetex targets
+ * ships an HTTP/3 *client* — Node's QUIC work is not in a stable release,
+ * Deno's `fetch` has no HTTP/3, and Bun's `node:quic` is listen-only — so
+ * offering the value let callers request something that silently came back as
+ * HTTP/2. A server that advertises `Alt-Svc: h3` is reported as `HTTP/2`,
+ * which is the protocol the response was really served over.
  */
-export type HTTPVersion = "HTTP/1.0" | "HTTP/1.1" | "HTTP/2" | "HTTP/3";
+export type HTTPVersion = "HTTP/1.0" | "HTTP/1.1" | "HTTP/2";
 
 /**
  * Branded type utility — creates a nominal subtype.
@@ -775,6 +781,73 @@ export interface HookContext {
 // ============================================================================
 
 /**
+ * HTTP/2 session pool tuning.
+ *
+ * Only applies on Node.js, and only when the client uses the built-in
+ * `NodeHTTP2Transport` — that is, when no custom `fetch` is configured and
+ * `httpVersion` is not `"HTTP/1.1"`. On every other runtime, and whenever
+ * `FetchTransport` is selected, requests are pooled by the runtime's own
+ * `fetch` implementation, which this client does not configure; these options
+ * are then ignored.
+ *
+ * @example
+ * ```ts
+ * const client = kinetex({
+ *   sessionPool: { maxSessions: 20, sessionTTLMs: 120_000 },
+ * });
+ * ```
+ */
+export interface SessionPoolConfig {
+  /**
+   * How long a cached session may be reused before it is evicted, in ms.
+   * Default: `300_000` (5 minutes).
+   */
+  sessionTTLMs?: number;
+
+  /**
+   * Interval between HTTP/2 keepalive pings, in ms. A ping failure evicts the
+   * session. Set to `0` to disable keepalive pings. Default: `30_000`.
+   */
+  pingIntervalMs?: number;
+
+  /**
+   * Maximum number of concurrently cached sessions (one per origin), with
+   * least-recently-used eviction. Default: `100`.
+   */
+  maxSessions?: number;
+
+  /**
+   * HTTP/2 connection (CONNECT) timeout in ms. Default: `30_000`.
+   */
+  connectTimeoutMs?: number;
+
+  /**
+   * HTTP/2 per-stream request timeout in ms. Default: `30_000`.
+   */
+  requestTimeoutMs?: number;
+
+  /**
+   * Use a dedicated keep-alive agent on the legacy HTTP/1.1 (`node:https`)
+   * path, which only runs on Node.js versions without a global `fetch` (< 18).
+   *
+   * This path previously inherited `https.globalAgent`, whose `keepAlive`
+   * default flipped on in Node 19 — so the same code handshaked per request on
+   * Node 18 and pooled on Node 20+. An explicit agent makes the behaviour
+   * consistent, and bounds the idle-socket pool that the global agent's 256
+   * free sockets would otherwise hold open.
+   *
+   * Default: `true`.
+   */
+  http1KeepAlive?: boolean;
+
+  /**
+   * Maximum number of idle sockets retained by the legacy HTTP/1.1 keep-alive
+   * agent. Default: `16`.
+   */
+  http1MaxSockets?: number;
+}
+
+/**
  * Global configuration for a `Kinetex` client instance.
  */
 export interface KinetexConfig {
@@ -829,8 +902,56 @@ export interface KinetexConfig {
   /** Preferred HTTP version. Default: "HTTP/2" */
   httpVersion?: HTTPVersion;
 
+  /**
+   * HTTP/2 session pool tuning. Node.js only, and ignored when a custom
+   * `fetch` is supplied (that forces {@link FetchTransport}, which cannot use
+   * a session pool). See {@link SessionPoolConfig}.
+   */
+  sessionPool?: SessionPoolConfig;
+
+  /**
+   * Bound how many requests may be in flight at once (a bulkhead).
+   *
+   * Distinct from {@link KinetexConfig.rateLimit}, which bounds requests per
+   * unit of _time_ and releases its token at dispatch — so `rateLimit: 100`
+   * per minute still permits 100 simultaneous sockets. A permit here is held
+   * for the whole request, including its retries, and returned when it
+   * settles.
+   *
+   * @example
+   * ```ts
+   * const client = kinetex({
+   *   concurrencyLimit: { maxConcurrent: 8 },
+   * });
+   * ```
+   */
+  concurrencyLimit?: import("./interceptors.ts").ConcurrencyLimitConfig;
+
   /** Custom fetch implementation (useful for testing). */
   fetch?: typeof globalThis.fetch;
+
+  /**
+   * A `fetch` implementation extension forwarded verbatim to the runtime —
+   * most usefully an `undici` dispatcher (`Agent`, `ProxyAgent`, `MockAgent`),
+   * which is the only way to control HTTP/1.1 connection pooling, route
+   * through an HTTP(S) proxy, or inject mock responses.
+   *
+   * Typed as `unknown` to keep kinetex dependency-free. Node's `fetch` reads
+   * `init.dispatcher`; Deno and Bun ignore it.
+   *
+   * Supplying this forces the fetch transport, since the Node HTTP/2
+   * transport has no notion of a dispatcher — see {@link SessionPoolConfig}.
+   *
+   * @example
+   * ```ts
+   * import { Agent } from "undici";
+   *
+   * const client = kinetex({
+   *   dispatcher: new Agent({ connections: 32, keepAliveTimeout: 10_000 }),
+   * });
+   * ```
+   */
+  dispatcher?: unknown;
 
   /** Interceptors registered at construction time. */
   interceptors?: {

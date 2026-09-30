@@ -315,20 +315,31 @@ export class HookEmitter {
     const list = this.listeners.get(event);
     if (!list || list.length === 0) return;
 
-    const toRemove = new Set<number>();
-    for (let i = 0; i < list.length; i++) {
-      const listener = list[i]!;
+    // Iterate a snapshot, and remove `once` listeners by identity rather than
+    // by index into the live array. Two things went wrong without that. A
+    // listener that registered another listener mid-emit had the new one
+    // called by the *same* emit, because the loop walks the live array and
+    // re-checks its length. And a listener that called `off()` mid-emit had
+    // its removal undone: the trailing write-back rebuilt the list from the
+    // snapshot taken before the emit, re-adding whatever it had just removed.
+    const snapshot = [...list];
+    const invokedOnce = new Set<{ fn: Function; once: boolean }>();
+
+    for (const listener of snapshot) {
       try {
         await (listener.fn as (d: HookEventMap[E]) => void | Promise<void>)(data);
       } catch {
         /* isolate listener errors */
       }
-      if (listener.once) toRemove.add(i);
+      if (listener.once) invokedOnce.add(listener);
     }
 
-    if (toRemove.size > 0) {
-      const remaining = list.filter((_, i) => !toRemove.has(i));
-      this.listeners.set(event, remaining);
+    if (invokedOnce.size > 0) {
+      const current = this.listeners.get(event) ?? [];
+      this.listeners.set(
+        event,
+        current.filter((l) => !invokedOnce.has(l)),
+      );
     }
   }
 
@@ -604,16 +615,24 @@ export class HookRegistry {
    * If any hook returns a HookResponse, it is treated as recovery and returned.
    */
   async runOnError(err: HookError, ctx: HookContext): Promise<HookResponse | null> {
+    let recovered: HookResponse | null = null;
     for (const hook of sortHooks(this.onError)) {
       if (!this._shouldRun(hook, ctx)) continue;
       const result = await this._safeRun(hook, () => hook.fn(err, ctx));
       this._maybeEject(hook, this.onError);
+      // First recovery wins; later hooks are not consulted.
       if (result && typeof result === "object" && "status" in result) {
-        return result as HookResponse;
+        recovered = result as HookResponse;
+        break;
       }
     }
+    // The emitter is the notification channel, not the recovery channel, so it
+    // fires on every error. This line used to sit after the loop behind a plain
+    // `return`, so a recovered error — the one an operator most wants to hear
+    // about, since the caller never sees it — was the only kind an
+    // `emitter.on("error", ...)` subscriber was never told about.
     await this.emitter.emit("error", err);
-    return null;
+    return recovered;
   }
 
   /** Execute all on-retry hooks. */
@@ -649,11 +668,7 @@ export class HookRegistry {
   runOnUploadProgress(evt: ProgressEvent, ctx: HookContext): void {
     for (const hook of sortHooks(this.onUploadProgress)) {
       if (!this._shouldRun(hook, ctx)) continue;
-      try {
-        hook.fn(evt, ctx);
-      } catch {
-        /* isolate */
-      }
+      this._safeRunSync(hook, () => hook.fn(evt, ctx));
       this._maybeEject(hook, this.onUploadProgress);
     }
     this.emitter.emit("upload:progress", evt);
@@ -663,11 +678,7 @@ export class HookRegistry {
   runOnDownloadProgress(evt: ProgressEvent, ctx: HookContext): void {
     for (const hook of sortHooks(this.onDownloadProgress)) {
       if (!this._shouldRun(hook, ctx)) continue;
-      try {
-        hook.fn(evt, ctx);
-      } catch {
-        /* isolate */
-      }
+      this._safeRunSync(hook, () => hook.fn(evt, ctx));
       this._maybeEject(hook, this.onDownloadProgress);
     }
     this.emitter.emit("download:progress", evt);
@@ -676,24 +687,25 @@ export class HookRegistry {
   /** Execute all on-cancel hooks. */
   runOnCancel(evt: CancelEvent, ctx: HookContext): void {
     for (const hook of sortHooks(this.onCancel)) {
-      try {
-        hook.fn(evt, ctx);
-      } catch {
-        /* isolate */
-      }
+      if (!this._shouldRun(hook, ctx)) continue;
+      this._safeRunSync(hook, () => hook.fn(evt, ctx));
       this._maybeEject(hook, this.onCancel);
     }
     this.emitter.emit("cancel", evt);
   }
 
-  /** Execute all on-connection hooks. */
-  runOnConnection(evt: ConnectionEvent): void {
+  /**
+   * Execute all on-connection hooks.
+   *
+   * `ctx` is required rather than optional: a hook registered with a
+   * `condition` can only be evaluated against a context, and making the
+   * parameter optional left the condition silently unevaluated for every caller
+   * that omitted it — which is a wrong answer rather than a compile error.
+   */
+  runOnConnection(evt: ConnectionEvent, ctx: HookContext): void {
     for (const hook of sortHooks(this.onConnection)) {
-      try {
-        hook.fn(evt);
-      } catch {
-        /* isolate */
-      }
+      if (!this._shouldRun(hook, ctx)) continue;
+      this._safeRunSync(hook, () => hook.fn(evt));
       this._maybeEject(hook, this.onConnection);
     }
     this.emitter.emit("connection", evt);
@@ -714,9 +726,19 @@ export class HookRegistry {
       const next = fn;
       fn = () => {
         if (!this._shouldRun(hook, ctx)) return next();
-        const result = hook.fn(ctx, next);
+        // `safe` is honoured here too. It used to be ignored, and ignored in
+        // the *other* direction: a `safe: true` around hook that threw took the
+        // whole request down. On failure the dispatch is still run, because an
+        // around hook that throws before calling `next` has no response to
+        // return and the pipeline cannot continue without one.
+        let failed = false;
+        const result = this._safeRunSync(hook, () => {
+          failed = true;
+          return hook.fn(ctx, next);
+        });
         this._maybeEject(hook, this.aroundHooks);
-        return result;
+        if (failed) return next();
+        return result!;
       };
     }
 
@@ -751,6 +773,25 @@ export class HookRegistry {
     } catch (err) {
       if (!hook.safe) throw err;
       // Safe mode: swallow and log
+      console.error(`[lifecycle] Hook "${hook.id}" threw:`, err);
+      return undefined;
+    }
+  }
+
+  /**
+   * Synchronous counterpart of {@link _safeRun}, used by the phases whose hook
+   * signature is synchronous (progress, cancel, connection) and by around hooks.
+   *
+   * These phases used a bare `try {} catch {}`, which ignored `safe` in both
+   * directions: `safe: false` — the documented default, "critical hooks that
+   * must propagate errors" — was swallowed, and `safe: true` was the only thing
+   * that produced the log line the other phases write.
+   */
+  private _safeRunSync<T, R>(hook: HookEntry<T>, fn: () => R): R | undefined {
+    try {
+      return fn();
+    } catch (err) {
+      if (!hook.safe) throw err;
       console.error(`[lifecycle] Hook "${hook.id}" threw:`, err);
       return undefined;
     }
@@ -879,8 +920,7 @@ export function tap<T>(fn: (value: T) => void | Promise<void>): (value: T) => Pr
  */
 export function injectHeaders(
   headers:
-    | Record<string, string>
-    | (() => Record<string, string> | Promise<Record<string, string>>),
+    Record<string, string> | (() => Record<string, string> | Promise<Record<string, string>>),
 ): BeforeRequestHook {
   return async (req) => ({
     ...req,
@@ -897,8 +937,14 @@ export function injectHeaders(
 export function withBaseURL(base: string): BeforeRequestHook {
   return (req) => {
     if (/^https?:\/\//i.test(req.url)) return;
-    const slash = base.endsWith("/") || req.url.startsWith("/") ? "" : "/";
-    return { ...req, url: `${base}${slash}${req.url}` };
+    // Join with exactly one slash. The old test asked "does either side already
+    // carry a slash, in which case add none" — which is wrong precisely when
+    // *both* do: `baseURL: "https://api.test/"` (the most common spelling) with
+    // the path `"/users"` produced "https://api.test//users". Trimming both sides
+    // and adding one slash is the only rule that is right in all four cases.
+    const baseTrimmed = base.replace(/\/+$/, "");
+    const pathTrimmed = req.url.replace(/^\/+/, "");
+    return { ...req, url: `${baseTrimmed}/${pathTrimmed}` };
   };
 }
 
@@ -1086,8 +1132,14 @@ export function createLoggingHooks(
   onError: OnErrorHook;
 } {
   const log = options.logger ?? ((msg, data) => console.log(msg, JSON.stringify(data)));
+  // The default list was `authorization` and `cookie` only, while
+  // `afterResponse` logs *response* headers — so `Set-Cookie` was written in
+  // cleartext by default, on a hook whose entire purpose is to log. The
+  // interceptors' own logging defaults already redact all four.
   const redact = new Set(
-    (options.redactHeaders ?? ["authorization", "cookie"]).map((h) => h.toLowerCase()),
+    (options.redactHeaders ?? ["authorization", "cookie", "set-cookie", "proxy-authorization"]).map(
+      (h) => h.toLowerCase(),
+    ),
   );
 
   function safeHeaders(h: Record<string, string>): Record<string, string> {

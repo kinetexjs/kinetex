@@ -470,7 +470,7 @@ describe("P0-4 credential headers are stripped cross-origin without a cookie jar
     assert.equal(hops[1]!.headers["x-tenant-token"], undefined);
   });
 
-  it("uses manual redirect following (redirect:manual) when credentials are present", async () => {
+  it("passes redirect:manual through for a request with a caller credential header", async () => {
     const { transport, hops } = mockTransport(() => ({}));
     const c = new Kinetex({ baseURL: "https://api.example.test" });
     const s = withTransport(c, transport);
@@ -478,15 +478,19 @@ describe("P0-4 credential headers are stripped cross-origin without a cookie jar
     assert.equal(hops[0]!.redirect, "manual");
   });
 
-  it("leaves plain requests on fetch's own redirect handling (redirect:follow)", async () => {
+  it("uses manual redirect following for a plain request, with no auth or headers", async () => {
+    // Every request is followed hop-by-hop by kinetex itself. Handing an
+    // unauthenticated request to fetch's own following would bypass the
+    // per-hop SSRF / httpsOnly / maxRedirects / loop gates entirely, which
+    // is how a 302 to 169.254.169.254 used to reach the metadata service.
     const { transport, hops } = mockTransport(() => ({}));
     const c = new Kinetex({ baseURL: "https://api.example.test" });
     const s = withTransport(c, transport);
     await s.client.get("/start");
     assert.equal(
       hops[0]!.redirect,
-      undefined,
-      "kinetex must not set redirect; fetch follows by default",
+      "manual",
+      "kinetex must screen every hop itself, not delegate to fetch",
     );
   });
 
@@ -508,7 +512,10 @@ describe("P0-4 credential headers are stripped cross-origin without a cookie jar
     assert.equal(hops[1]!.headers["cookie"], undefined);
   });
 
-  it("leaves a cookie-only request to fetch(), which strips it per spec", async () => {
+  it("drops a cookie header cross-origin even with no auth configured", async () => {
+    // Same guarantee as the apikey case above, but reached without any
+    // declared credential: a plain caller-supplied `cookie` header is still
+    // removed by kinetex's own follower, never by the transport.
     const { transport, hops } = mockTransport((req) =>
       req.url.includes("evil.example.com")
         ? {}
@@ -517,8 +524,9 @@ describe("P0-4 credential headers are stripped cross-origin without a cookie jar
     const c = new Kinetex({ baseURL: "https://api.example.test" });
     const s = withTransport(c, transport);
     await s.client.get("/start", { headers: { cookie: "a=b" } });
-    assert.equal(hops.length, 1, "no manual hop-by-hop following is needed");
+    assert.equal(hops.length, 2, "the hop must be followed by kinetex, not fetch");
     assert.equal(hops[0]!.headers["cookie"], "a=b");
+    assert.equal(hops[1]!.headers["cookie"], undefined);
   });
 
   it("reports redirected:true for a manually followed chain", async () => {
@@ -1104,7 +1112,11 @@ describe("P1-9 cache/dedup auth fingerprint covers every credential header", () 
     const hitB = await cache.get(reqB);
     assert.equal(hitB, null, "bob must not read alice's cached entry");
     const hitA = await cache.get(reqA);
-    assert.ok(hitA);
+    // Was a bare truthiness check: any non-null hit passed, including one
+    // holding bob's data. Pin the body alice stored.
+    assert.ok(hitA, "alice must still hit her own cached entry");
+    assert.equal(new TextDecoder().decode(hitA.entry.response.body), '{"user":"alice"}');
+    assert.equal(hitA.stale, false);
   });
 
   it("still serves a shared entry to identical credentials", async () => {
@@ -1477,7 +1489,13 @@ describe("P2 circuit breaker contract", () => {
   });
 
   it("counts only configured failure kinds in the sliding window", async () => {
-    const b = new CircuitBreaker("k2", { failureThreshold: 10, windowSize: 4 });
+    // `windowSize: 4` with `failureThreshold: 10` was another unreachable
+    // pair: the window can hold at most 4 results, so the threshold could
+    // never be reached. The breaker now widens a window that is smaller than
+    // the threshold (and warns), which would have silently made this window 10
+    // and turned "never grow past windowSize" into a statement about 10. A
+    // reachable pair keeps the FIFO behaviour under test.
+    const b = new CircuitBreaker("k2", { failureThreshold: 4, windowSize: 4 });
     for (let i = 0; i < 3; i++) {
       await assert.rejects(() =>
         b.execute(async () => {
@@ -1495,12 +1513,16 @@ describe("P2 circuit breaker contract", () => {
         }),
       );
     }
+    // 7 results have gone through (3 failures, a success, 3 failures) and the
+    // window holds the last 4: [success, fail, fail, fail]. The three original
+    // failures have aged out and the newest three remain.
     assert.equal(
       b.snapshot.failureCount,
       3,
       "the window is FIFO: the oldest entries age out, the newest stay",
     );
     assert.ok(b.snapshot.failureCount <= 4, "the sliding window must never grow past windowSize");
+    assert.equal(b.state, "CLOSED", "and the circuit must not have opened");
   });
 
   it("ignores non-countable failures by default", async () => {
@@ -1864,7 +1886,15 @@ describe("P2 socks5 Node connector does not leak timers or hang after EOF", () =
       const conn = await nodeTcpConnector("127.0.0.1", port, 2000);
       const buf = new Uint8Array(16);
       const first = await conn.read(buf);
-      assert.ok(first === null || first > 0, "the greeting must be readable");
+      // The server writes exactly "hello" (5 bytes) before ending, so the first
+      // read is 5 — not merely "something or null". Accepting `null` here let a
+      // regression that dropped the greeting entirely pass.
+      assert.equal(first, 5, "the 5-byte greeting must be readable in one read");
+      assert.equal(
+        String.fromCharCode(...[...buf.slice(0, first!)]),
+        "hello",
+        "the bytes read must be the greeting",
+      );
       // Wait for the server to end the socket, then read again: previously this
       // promise never settled.
       await new Promise((r) => setTimeout(r, 30));

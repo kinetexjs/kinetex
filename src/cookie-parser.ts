@@ -1646,7 +1646,12 @@ export function getPublicSuffix(hostname: string): string | null {
  * For IP addresses, returns the IP itself.
  */
 export function getRegistrableDomain(hostname: string): string | null {
-  const h = hostname.toLowerCase();
+  // The trailing dot is stripped here for the same reason it is in
+  // getPublicSuffix: without it the two disagreed about the same host.
+  // `getPublicSuffix("1.2.3.4.")` correctly returned "4", but this function
+  // split the *unstripped* string and handed back "4." — a fragment that is
+  // not a domain at all, and one a caller could then use as a cookie domain.
+  const h = hostname.toLowerCase().replace(/\.$/, "");
   if (isIPAddress(h)) return h;
 
   const suffix = getPublicSuffix(h);
@@ -1836,6 +1841,43 @@ const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
 const IPV6_RE = /^[\da-f:]+$/i;
 
 /**
+ * Structural IPv6 check.
+ *
+ * The previous test was `/^[\da-f:]+$/` plus "contains a colon", which is both
+ * too loose and too strict: it accepted `abc:123` and `cafe:babe` (a hostname
+ * happens to be spelled entirely in hex characters) and rejected the
+ * IPv4-mapped forms `::ffff:1.2.3.4` and `::1.2.3.4`, which are real
+ * addresses. `getRegistrableDomain("::ffff:1.2.3.4")` therefore returned the
+ * fragment "3.4". At most one `::` is allowed, a compressed form stands for
+ * at least one omitted group, and an unadorned form must have all eight.
+ */
+function isIPv6Literal(h: string): boolean {
+  let s = h;
+
+  // An embedded dotted quad occupies the last two hextets.
+  const lastColon = s.lastIndexOf(":");
+  if (lastColon >= 0 && s.slice(lastColon + 1).includes(".")) {
+    const v4 = s.slice(lastColon + 1);
+    if (!IPV4_RE.test(v4)) return false;
+    const o = v4.split(".").map(Number);
+    if (!o.every((p) => p >= 0 && p <= 255)) return false;
+    s =
+      s.slice(0, lastColon + 1) +
+      (((o[0]! << 8) | o[1]!).toString(16) + ":" + ((o[2]! << 8) | o[3]!).toString(16));
+  }
+
+  if (!IPV6_RE.test(s)) return false;
+  if (s.split("::").length > 2) return false; // at most one elision
+
+  const groupCount = (part: string | undefined) => (part ?? "").split(":").filter(Boolean).length;
+  if (s.includes("::")) {
+    const [head, tail] = s.split("::");
+    return groupCount(head) + groupCount(tail) <= 7;
+  }
+  return groupCount(s) === 8;
+}
+
+/**
  * Check whether a host string is an IPv4 or IPv6 address.
  *
  * @param host - Host string to check (may include brackets for IPv6, e.g. "[::1]")
@@ -1847,7 +1889,7 @@ export function isIPAddress(host: string): boolean {
     const parts = h.split(".").map(Number);
     return parts.every((p) => p >= 0 && p <= 255);
   }
-  return IPV6_RE.test(h) && h.includes(":");
+  return isIPv6Literal(h);
 }
 
 // ============================================================================
@@ -1863,7 +1905,13 @@ export function isIPAddress(host: string): boolean {
  */
 export function domainMatch(requestHost: string, cookieDomain: string): boolean {
   const rh = requestHost.toLowerCase();
-  const cd = cookieDomain.toLowerCase();
+  // RFC 6265 §5.2.3: a leading %x2E (".") in the Domain attribute is ignored.
+  // The parser already strips it, so this mattered only for a caller using
+  // this exported helper directly — and this function's own JSDoc documents
+  // `cookieDomain` as e.g. ".example.com", which it answered `false` for:
+  // neither the exact host nor any subdomain of it ever matched. A cookie set
+  // with the common `Domain=.example.com` spelling was simply not sent.
+  const cd = cookieDomain.toLowerCase().replace(/^\./, "");
 
   if (rh === cd) return true;
 
@@ -2022,13 +2070,23 @@ export function parseSetCookieHeader(header: string): ParsedCookie | null {
   if (eqIdx === -1) {
     // No equals sign at all — treat as value-only (empty name)
     name = "";
-    value = nameValueStr.trim();
+    value = nameValueStr;
   } else {
     name = nameValueStr.slice(0, eqIdx).trim();
-    value = nameValueStr.slice(eqIdx + 1).trim();
+    value = nameValueStr.slice(eqIdx + 1);
   }
 
   if (!isValidCookieName(name)) return null;
+
+  // Validate the raw value, BEFORE trimming. `trim()` runs first, so a control
+  // character at either end was stripped along with the surrounding space and
+  // the check could never see it: `a=\r\nX-Injected: 1` came back as the
+  // cookie `a` with the value "X-Injected: 1" instead of being rejected. The
+  // interior case was already refused, so the rejection applied only from the
+  // second character onwards.
+  if (!isValidCookieValue(value)) return null;
+
+  value = value.trim();
 
   // Strip surrounding double quotes from value (RFC 6265 §5.2 step 3)
   if (value.length >= 2 && value[0] === '"' && value[value.length - 1] === '"') {
@@ -2231,6 +2289,28 @@ export function formatSetCookieHeader(cookie: ParsedCookie): string {
  * @param raw - Raw Set-Cookie header string (possibly containing multiple cookies)
  * @returns Array of individual Set-Cookie strings
  */
+/**
+ * Decide whether a comma at `from` separates two cookies or is part of the
+ * value currently being read.
+ *
+ * Looks ahead to the next `,` or `;` — the rest of the current value or
+ * attribute — and reports whether that segment opens a `name=` pair. A
+ * trailing comma with nothing after it also separates, so the empty tail is
+ * dropped rather than kept as a value.
+ */
+function startsNewCookie(raw: string, from: number): boolean {
+  let j = from;
+  while (j < raw.length && (raw[j] === " " || raw[j] === "\t")) j++;
+  // Nothing but whitespace after the comma: a trailing separator.
+  if (j >= raw.length) return true;
+  for (; j < raw.length; j++) {
+    const c = raw[j]!;
+    if (c === ";" || c === ",") return false;
+    if (c === "=") return true;
+  }
+  return false;
+}
+
 export function splitSetCookieHeaders(raw: string): string[] {
   const cookies: string[] = [];
   let buffer = "";
@@ -2288,6 +2368,22 @@ export function splitSetCookieHeaders(raw: string): string[] {
     }
 
     if (char === "," && !inQuotedValue && (afterSemicolon || valueComplete || nameComplete)) {
+      // A comma only separates cookies when what follows looks like a new
+      // `name=value` pair. It otherwise belongs to the value being read —
+      // above all `Expires=Thu, 01 Jan 2099 00:00:00 GMT`, the RFC 6265 §5.2
+      // date format, which is the reason this function exists at all.
+      //
+      // The test used to be "have we seen a value or an attribute yet", and
+      // that is true the instant the first `=` is read, so it committed on
+      // EVERY comma: a single cookie carrying an Expires was truncated to
+      // `a=1; Expires=Thu`, silently losing its expiry, and a collapsed
+      // two-cookie header was shredded into fragments such as
+      // `01 Jan 2099 00:00:00 GMT; Path=/; HttpOnly`.
+      if (!startsNewCookie(raw, i + 1)) {
+        buffer += char;
+        i++;
+        continue;
+      }
       commitCookie();
       while (i + 1 < raw.length && /\s/.test(raw[i + 1]!)) {
         i++;

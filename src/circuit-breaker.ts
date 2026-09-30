@@ -118,7 +118,11 @@ export class CircuitOpenError extends Error {
    * @param state - Snapshot of breaker state at rejection time
    */
   constructor(key: string, state: CircuitBreakerState) {
-    super(`Circuit breaker OPEN for "${key}" — request rejected`);
+    // The half-open probe limit rejects callers too, and in that case
+    // `state.state` is HALF_OPEN: the circuit is recovering, not open. Saying
+    // "OPEN" there pointed operators at the wrong problem during exactly the
+    // window they were watching to see recovery.
+    super(`Circuit breaker ${state.state} for "${key}" — request rejected`);
     this.name = "CircuitOpenError";
     this.state = state;
   }
@@ -191,6 +195,24 @@ export class CircuitBreaker {
     this.key = key;
     this.failureThreshold = config.failureThreshold ?? 5;
     this.windowSize = config.windowSize ?? 10;
+    // The window is a sliding buffer of the most recent `windowSize` results,
+    // so it can hold at most `windowSize` failures. If the window is smaller
+    // than the threshold, `failures >= failureThreshold` is unreachable and
+    // the circuit can never open — a breaker that silently does nothing, with
+    // no error and no other symptom. `{ windowSize: 2, failureThreshold: 5 }`
+    // stayed CLOSED through 50 consecutive failures. The window is widened to
+    // the threshold instead, which is the smallest coherent reading of the
+    // configuration. windowSize: 0 is the documented consecutive-count mode
+    // and is left alone.
+    if (this.windowSize > 0 && this.windowSize < this.failureThreshold) {
+      console.warn(
+        `[CircuitBreaker] "${key}": windowSize (${this.windowSize}) is smaller than ` +
+          `failureThreshold (${this.failureThreshold}), so the threshold could never be ` +
+          `reached and the circuit would never open. Raising windowSize to ` +
+          `${this.failureThreshold}.`,
+      );
+      this.windowSize = this.failureThreshold;
+    }
     this.resetTimeoutMs = config.resetTimeoutMs ?? 30_000;
     this.successThreshold = config.successThreshold ?? 2;
     this.halfOpenConcurrency = config.halfOpenConcurrency ?? 1;
@@ -205,8 +227,27 @@ export class CircuitBreaker {
 
   // ── Public API ──────────────────────────────────────────────────────────
 
-  /** The current circuit state. */
+  /**
+   * The current circuit state, as of right now.
+   *
+   * The OPEN → HALF_OPEN transition is driven by elapsed time, but it was only
+   * ever evaluated inside `execute()`. A caller reading `state` — a health
+   * endpoint, a dashboard, the `onRejected` snapshot — therefore saw a stale
+   * `OPEN` for as long as no traffic arrived, and could not tell a circuit
+   * that was about to probe from one that had been down for an hour. The
+   * elapsed check is applied on read as well. It is a pure read: the
+   * `onHalfOpen` callback still fires from `execute()`, so observing the state
+   * never mutates the breaker.
+   */
   get state(): CircuitState {
+    return this._effectiveState();
+  }
+
+  /** The state implied by `_state` and the elapsed time, without mutating anything. */
+  private _effectiveState(): CircuitState {
+    if (this._state === "OPEN" && this._openedAt !== null) {
+      if (Date.now() - this._openedAt >= this.resetTimeoutMs) return "HALF_OPEN";
+    }
     return this._state;
   }
 
@@ -220,7 +261,10 @@ export class CircuitBreaker {
       for (const ok of this._window) if (!ok) failureCount++;
     }
     return {
-      state: this._state,
+      // Time-derived, for the same reason as the `state` getter: a snapshot
+      // taken between the reset window elapsing and the next request would
+      // otherwise report a circuit as OPEN when it is ready to probe.
+      state: this._effectiveState(),
       failureCount,
       successCount: this._consecutiveSucc,
       lastFailureAt: this._lastFailureAt,

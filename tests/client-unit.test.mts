@@ -198,8 +198,14 @@ await test("logger:false keeps logger null", async () => {
 suite("Constructor edge cases");
 
 await test("empty config does not throw", () => {
-  const c = new Kinetex({});
-  c.destroy();
+  // Stated as an explicit assertion: "did not throw" was implicit in the
+  // harness catching, which is indistinguishable from "did nothing".
+  let c: Kinetex | undefined;
+  assert.doesNotThrow(() => {
+    c = new Kinetex({});
+  });
+  assert.ok(c !== undefined, "the constructor must return a client");
+  assert.doesNotThrow(() => c!.destroy());
 });
 
 await test("har:true enables HAR recording", async () => {
@@ -255,12 +261,17 @@ await test("config interceptors.error fires on 500", async () => {
       ],
     },
   });
-  try {
-    await client.get("/status/500");
-  } catch {
-    /* expected */
-  }
-  assert.equal(seen.length, 1);
+  await assert.rejects(
+    () => client.get("/status/500"),
+    (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.equal((err as { status?: number }).status, 500);
+      return true;
+    },
+    "a 500 must reject",
+  );
+  assert.equal(seen.length, 1, "the error interceptor must run exactly once");
+  assert.equal(seen[0], "error");
   client.destroy();
 });
 
@@ -384,11 +395,30 @@ await test("enableCircuitBreaker returns this", () => {
 });
 
 await test("tripCircuit and resetCircuit change state", () => {
+  // The name claimed a state transition that nothing verified: with trip and
+  // reset no-ops, this still passed.
   const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
   client.enableCircuitBreaker();
-  client.tripCircuit("https://httpbin.org");
-  client.resetCircuit("https://httpbin.org");
-  client.destroy();
+  try {
+    client.tripCircuit("https://httpbin.org");
+    const tripped = client.circuitSnapshots;
+    assert.ok(tripped["https://httpbin.org"], "tripCircuit must register a breaker");
+    assert.equal(
+      tripped["https://httpbin.org"]!.state,
+      "OPEN",
+      "tripCircuit must move the breaker to OPEN",
+    );
+
+    client.resetCircuit("https://httpbin.org");
+    const reset = client.circuitSnapshots;
+    assert.equal(
+      reset["https://httpbin.org"]!.state,
+      "CLOSED",
+      "resetCircuit must move the breaker back to CLOSED",
+    );
+  } finally {
+    client.destroy();
+  }
 });
 
 await test("disableCircuitBreaker clears snapshots", () => {
@@ -537,13 +567,29 @@ await test("subscribe calls onSuccess with response", async () => {
   client.destroy();
 });
 
-await test("subscribe without onError still fires (swallows error)", async () => {
+await test("subscribe without onError swallows the failure instead of crashing", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (e: unknown): void => {
+    unhandled.push(e);
+  };
+  process.on("unhandledRejection", onUnhandled);
   const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, throwOnError: true });
-  // Should not crash even without onError handler
-  client.GET("/status/500").subscribe(() => {});
-  // Give the error time to be swallowed
-  await new Promise((r) => setTimeout(r, 50));
-  client.destroy();
+  let successCalls = 0;
+  try {
+    // The documented contract: a callback-style subscription with no `onError`
+    // must contain the failure rather than raising an unhandled rejection.
+    // The previous version asserted nothing at all — it would have passed even
+    // if the rejection escaped and killed the process on the next tick.
+    client.GET("/status/500").subscribe(() => {
+      successCalls++;
+    });
+    await new Promise((r) => setTimeout(r, 100));
+  } finally {
+    client.destroy();
+    process.off("unhandledRejection", onUnhandled);
+  }
+  assert.equal(successCalls, 0, "a 500 must never reach the success callback");
+  assert.deepEqual(unhandled, [], "the failure must stay contained inside subscribe()");
 });
 
 // ============================================================================

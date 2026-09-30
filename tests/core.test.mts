@@ -5,19 +5,100 @@ let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
+/**
+ * True when httpbin answered with a status its own front end produces —
+ * 429 while rate-limiting, 502/503/504 when degraded — rather than the one
+ * the endpoint was asked for. The request never reached the endpoint, so an
+ * assertion on the status would be measuring the outage rather than the
+ * transport under test.
+ *
+ * `isUpstreamFlake` cannot catch this on its own: a mismatched
+ * `assert.equal(status, 200)` throws an `AssertionError`, which it
+ * deliberately excludes so a genuine assertion failure is never mistaken for
+ * a network problem. The status has to be inspected before the assert.
+ *
+ * Only these four statuses count. A 404 or 500 back from `/status/200` is a
+ * real failure and must still fail the run.
+ */
+function isUpstreamStatusDrift(status: number, expected: number): boolean {
+  return (
+    status !== expected && (status === 429 || status === 502 || status === 503 || status === 504)
+  );
+}
+
+/**
+ * Skip the remaining assertions in the current test when `status` is an
+ * upstream failure rather than `expected`. Returns true when it skipped.
+ */
+function skipOnUpstreamDrift(name: string, status: number, expected: number): boolean {
+  if (!isUpstreamStatusDrift(status, expected)) return false;
+  console.log(
+    `  ⚠  ${name} — assertions skipped (transient: httpbin answered ${status}, not ${expected})`,
+  );
+  return true;
+}
+
+/**
+ * True only for errors that mean "the third party misbehaved", not "our code is
+ * wrong". Deliberately conservative: anything unrecognised counts as a defect.
+ */
+function isUpstreamFlake(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  // An AssertionError can only come from this file's own `assert` calls.
+  if (err.name === "AssertionError") return false;
+  // A TypeError is either our code crashing or fetch's own network-level
+  // failure — the message is what separates the two.
+  if (err.name === "TypeError") {
+    return /fetch failed|network|ECONN|ENOTFOUND|EAI_AGAIN|socket hang up/i.test(err.message);
+  }
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === "string") {
+    if (
+      /^(ECONN|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EPIPE)$/.test(code)
+    )
+      return true;
+    // A 5xx surfaced as a KinetexError is the upstream service, not us.
+    if (/^EHTTP_5/.test(code)) return true;
+  }
+  return /\b(502|503|504)\b|upstream|bad gateway|service unavailable|gateway timeout/i.test(
+    err.message,
+  );
+}
+
+/**
+ * Per-test budget. Every client here is built with a 30s timeout, so 45s leaves
+ * headroom for the slowest legitimate case while still naming the test that
+ * stopped making progress — a hang in this file is otherwise silent, because a
+ * top-level `await run(...)` that never settles prints nothing further. The
+ * sentinel is a message rather than a flag, so the transient classifier below
+ * cannot quietly turn a hang into a skip.
+ */
+const TEST_BUDGET_MS = 45_000;
+
 async function run(
   name: string,
   fn: () => void | Promise<void>,
   opts: { transient?: string } = {},
 ) {
   try {
-    await fn();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.resolve(fn()),
+      new Promise<void>((_resolve, race) => {
+        timer = setTimeout(
+          () => race(new Error("__RACE_EXPIRED__ the test never settled")),
+          TEST_BUDGET_MS,
+        );
+      }),
+    ]).finally(() => clearTimeout(timer));
     console.log(`  ✅  ${name}`);
     passed++;
   } catch (err) {
-    if (opts.transient) {
-      // Upstream-service flake tolerance (same convention as a9dbdcf): log and
-      // continue instead of failing CI on a third-party 5xx/timeout.
+    if (opts.transient && isUpstreamFlake(err)) {
+      // Tolerance is scoped to errors that genuinely indicate a flaky third
+      // party. A TypeError from our own code, or a failed assertion, is a real
+      // defect and must fail the run — otherwise this escape hatch silently
+      // converts bugs into green CI.
       const msg = err instanceof Error ? err.message : String(err);
       console.log(`  ⚠  ${name} skipped (transient: ${opts.transient}) — ${msg}`);
       return;
@@ -49,6 +130,7 @@ import {
   getEffectiveRuntime,
 } from "../src/mod.ts";
 import { sendWithTimeout, readRawBody, decompressBodyStream } from "../src/core.ts";
+import { KinetexError, SizeLimitError } from "../src/types.ts";
 
 // ============================================================================
 // §1  RUNTIME DETECTION
@@ -57,17 +139,25 @@ import { sendWithTimeout, readRawBody, decompressBodyStream } from "../src/core.
 suite("Runtime detection");
 
 await run("detectRuntime returns a known runtime string", () => {
-  const valid = [
+  // Exactly the `Runtime` union, no more. "workerd" was in this list and is
+  // not a `Runtime` — `detectRuntime` has no branch that can return it — so it
+  // could only ever pad the assertion.
+  const valid: string[] = [
     "node",
     "deno",
     "bun",
     "browser",
     "cloudflare-workers",
     "edge",
-    "workerd",
     "unknown",
   ];
-  assert.ok(valid.includes(detectRuntime()));
+  assert.ok(valid.includes(detectRuntime()), `unexpected runtime: ${detectRuntime()}`);
+  // The constant and the effective value answer with members of the same set.
+  assert.ok(valid.includes(RUNTIME));
+  assert.ok(valid.includes(getEffectiveRuntime()));
+  // And it is the one this suite's HTTP/2 branch depends on, not merely a
+  // plausible-looking string.
+  assert.equal(detectRuntime(), "node", "the NodeHTTP2Transport section below needs Node");
 });
 
 await run("RUNTIME constant matches detectRuntime()", () => assert.equal(RUNTIME, detectRuntime()));
@@ -97,13 +187,34 @@ await run("createTransport returns transport with send", () => {
   assert.equal(typeof createTransport().send, "function");
 });
 
-await run("createTransport with custom fetch (HTTP/1.1)", () => {
-  let called = false;
+await run("createTransport with custom fetch (HTTP/1.1)", async () => {
+  let called = 0;
+  let seenUrl = "";
+  // preferHTTP2 is left at its default here on purpose: a custom fetch must
+  // force FetchTransport even then, because NodeHTTP2Transport drives node:http2
+  // and has nowhere to put one. The test set `called` and never looked at it,
+  // so a createTransport that dropped the caller's fetch on the floor passed.
   const t = createTransport(async (url, init) => {
-    called = true;
+    called++;
+    seenUrl = String(url);
     return globalThis.fetch(url, init);
-  }, false);
-  assert.notEqual(t, null);
+  });
+  assert.ok(
+    t instanceof FetchTransport,
+    `expected FetchTransport, got ${(t as { constructor: { name: string } }).constructor.name}`,
+  );
+  const raw = await t.send({
+    url: "https://httpbin.org/get",
+    method: "GET",
+    headers: {},
+    body: null,
+    signal: null,
+    meta: {},
+    httpVersion: "HTTP/1.1",
+  });
+  assert.equal(raw.status, 200);
+  assert.equal(called, 1, "the supplied fetch must be the one that runs");
+  assert.equal(seenUrl, "https://httpbin.org/get", "and it must receive the resolved URL");
 });
 
 // ============================================================================
@@ -124,35 +235,84 @@ await run("GET returns 200", async () => {
     httpVersion: "HTTP/1.1",
   });
   assert.equal(raw.status, 200);
+  // A RawResponse with the right status and nothing else — no statusText, no
+  // headers, a null body, a wrong protocol — satisfied a status check alone.
+  assert.equal(typeof raw.statusText, "string");
+  assert.ok(raw.statusText.length > 0, "the reason phrase must be carried through");
+  assert.match(raw.headers["content-type"] ?? "", /application\/json/);
+  assert.equal(raw.url, "https://httpbin.org/get");
+  assert.equal(raw.redirected, false, "a 200 on the URL that was sent is not a redirect");
+  assert.equal(raw.httpVersion, "HTTP/1.1", "no runtime evidence, so HTTP/1.1 is reported");
+  assert.equal(raw.alreadyDecompressed, true, "fetch() already decoded the body");
+  assert.ok(raw.body, "the body must be a stream, not null");
+  const decoded = (await new Response(raw.body).json()) as { url?: string };
+  assert.equal(decoded.url, "https://httpbin.org/get", "and the bytes must be readable");
 });
 
 await run("strict mode rejects invalid headers", async () => {
-  const t = new FetchTransport({ strict: true });
-  await assert.rejects(() =>
-    t.send({
-      url: "https://httpbin.org/get",
-      method: "GET",
-      headers: { x: "bad\x00header" },
-      body: null,
-      signal: null,
-      meta: {},
-      httpVersion: "HTTP/1.1",
-    }),
+  // `assert.rejects(fn)` with no predicate is satisfied by *any* rejection,
+  // so this passed on a DNS failure, on an EABORT, and on the EVALIDATION it
+  // was written for. Pinned to the class, the code, the message, and the fact
+  // that the request was never opened.
+  let opened = false;
+  const t = new FetchTransport({
+    strict: true,
+    fetchFn: async () => {
+      opened = true;
+      return new Response("ok");
+    },
+  });
+  await assert.rejects(
+    () =>
+      t.send({
+        url: "https://httpbin.org/get",
+        method: "GET",
+        headers: { x: "bad\x00header" },
+        body: null,
+        signal: null,
+        meta: {},
+        httpVersion: "HTTP/1.1",
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof KinetexError, `expected a KinetexError, got ${String(err)}`);
+      assert.equal((err as { code?: string }).code, "EVALIDATION");
+      assert.equal((err as { name?: string }).name, "KinetexError");
+      assert.match((err as Error).message, /Invalid header dropped in strict mode/);
+      assert.match((err as Error).message, /"x"/, "the offending header is named");
+      // The offending request is attached, which is the only way a caller can
+      // find out which request it was.
+      assert.equal((err as { request?: { url?: string } }).request?.url, "https://httpbin.org/get");
+      return true;
+    },
+    "strict mode must reject an invalid header value",
   );
+  assert.equal(opened, false, "the request must never be opened");
 });
 
 await run("POST with JSON body returns 200", async () => {
   const t = new FetchTransport();
+  const payload = JSON.stringify({ test: true, n: 42 });
   const raw = await t.send({
     url: "https://httpbin.org/post",
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ test: true }),
+    body: payload,
     signal: null,
     meta: {},
     httpVersion: "HTTP/1.1",
   });
   assert.equal(raw.status, 200);
+  // A GET returns 200 too. This is the *POST* test and nothing here looked at
+  // the body, so a transport that dropped it, sent it as a query parameter or
+  // double-encoded it answered 200 and passed.
+  const echoed = (await new Response(raw.body).json()) as {
+    json: unknown;
+    data: string;
+    headers: Record<string, string>;
+  };
+  assert.deepEqual(echoed.json, { test: true, n: 42 }, "the server must see the parsed body");
+  assert.equal(echoed.data, payload, "and the exact bytes that were sent");
+  assert.match(echoed.headers["Content-Type"] ?? "", /application\/json/);
 });
 
 await run("accept-encoding header default value is removed by FetchTransport", async () => {
@@ -195,10 +355,44 @@ await run("explicit accept-encoding value is preserved by FetchTransport", async
   assert.ok(ae.includes("identity"), `Explicit accept-encoding should be preserved. Got: ${ae}`);
 });
 
+await run(
+  "FetchTransport reports the URL it was finally served from",
+  async () => {
+    // `url: response.url || req.url` is the one line that tells a caller where a
+    // request actually ended up after a redirect. Nothing in this file exercised
+    // it on the fetch path: the only redirect tests go through
+    // NodeHTTP2Transport, so a FetchTransport that reported the URL it was *sent*
+    // to — the difference a caller needs in order to follow a relative `Location`
+    // or to log where the request landed — passed everything here.
+    const t = new FetchTransport();
+    const raw = await t.send({
+      url: "https://httpbin.org/redirect/1",
+      method: "GET",
+      headers: {},
+      body: null,
+      signal: null,
+      meta: {},
+      httpVersion: "HTTP/1.1",
+    });
+    assert.equal(raw.status, 200);
+    assert.equal(raw.redirected, true, "the hop happened");
+    assert.ok(
+      !raw.url.includes("/redirect/"),
+      `the reported URL is the destination, not the request: ${raw.url}`,
+    );
+    assert.equal(raw.url, "https://httpbin.org/get", "and it is the redirect target itself");
+  },
+  { transient: "httpbin.org intermittently answers 502 for redirects" },
+);
+
 await run("abort signal rejects immediately", async () => {
   const t = new FetchTransport();
   const ctrl = new AbortController();
   setTimeout(() => ctrl.abort(), 50);
+  const start = Date.now();
+  // The endpoint holds the response open for 5s, so "immediately" is a claim
+  // about time and nothing measured it: the only check was that some message
+  // contained the word "aborted".
   await assert.rejects(
     () =>
       t.send({
@@ -210,22 +404,49 @@ await run("abort signal rejects immediately", async () => {
         meta: {},
         httpVersion: "HTTP/1.1",
       }),
-    /aborted/,
+    (err: unknown) => {
+      assert.ok(err instanceof KinetexError, `expected a KinetexError, got ${String(err)}`);
+      assert.equal((err as { code?: string }).code, "EABORT");
+      assert.equal((err as { name?: string }).name, "KinetexError");
+      assert.match((err as Error).message, /aborted/);
+      // The runtime's own AbortError survives as the cause rather than being
+      // flattened into a message.
+      assert.equal((err as { cause?: { name?: string } }).cause?.name, "AbortError");
+      return true;
+    },
+    "an aborted request must reject with EABORT",
+  );
+  assert.ok(
+    Date.now() - start < 4_000,
+    `must reject when the signal fires, not when the server answers (${Date.now() - start}ms)`,
   );
 });
 
 await run("network error on bad URL", async () => {
   const t = new FetchTransport();
-  await assert.rejects(() =>
-    t.send({
-      url: "https://192.0.2.99/nonexistent",
-      method: "GET",
-      headers: {},
-      body: null,
-      signal: null,
-      meta: {},
-      httpVersion: "HTTP/1.1",
-    }),
+  // TEST-NET-1: guaranteed not routable, so this is a connect failure rather
+  // than an answer. `assert.rejects(fn)` with no predicate would be satisfied
+  // by any failure at all, including one of our own.
+  await assert.rejects(
+    () =>
+      t.send({
+        url: "https://192.0.2.99/nonexistent",
+        method: "GET",
+        headers: {},
+        body: null,
+        signal: null,
+        meta: {},
+        httpVersion: "HTTP/1.1",
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof KinetexError, `expected a KinetexError, got ${String(err)}`);
+      assert.equal((err as { code?: string }).code, "ENETWORK");
+      // The underlying failure is kept, so the cause of a network error is
+      // still diagnosable.
+      assert.ok((err as { cause?: unknown }).cause, "the underlying error is attached as cause");
+      return true;
+    },
+    "an unreachable host must reject with ENETWORK",
   );
 });
 
@@ -246,6 +467,8 @@ await run("GET via HTTP/2 returns 200", async () => {
     meta: {},
     httpVersion: "HTTP/2",
   });
+  if (skipOnUpstreamDrift("GET via HTTP/2 returns 200", raw.status, 200)) return;
+  if (skipOnUpstreamDrift("GET via HTTP/2 returns 200", raw.status, 200)) return;
   assert.equal(raw.status, 200);
   assert.equal(raw.httpVersion, "HTTP/2");
 });
@@ -261,7 +484,14 @@ await run("POST with JSON body via HTTP/2", async () => {
     meta: {},
     httpVersion: "HTTP/2",
   });
+  if (skipOnUpstreamDrift("POST with JSON body via HTTP/2", raw.status, 200)) return;
+  if (skipOnUpstreamDrift("POST with JSON body via HTTP/2", raw.status, 200)) return;
   assert.equal(raw.status, 200);
+  // Same gap as the FetchTransport POST above: only the status was checked, so
+  // the HTTP/2 body-attachment path — the one with its own serializer, because
+  // it bypasses fetch — was never observed actually sending anything.
+  const echoed = (await new Response(raw.body).json()) as { json: unknown };
+  assert.deepEqual(echoed.json, { hello: "h2" });
 });
 
 await run(
@@ -307,8 +537,24 @@ await run("request timeout fires", async () => {
     });
     assert.fail("should have timed out");
   } catch (err: any) {
-    assert.ok(Date.now() - start < 10000);
-    assert.ok(err.code === "ETIMEOUT" || err.message.includes("timed out"));
+    assert.ok(Date.now() - start < 10_000, "must fail at the timeout, not hang");
+    // The code, not "ETIMEOUT or a message that happens to mention it": a
+    // generic network error carrying the word "timed out" used to satisfy this.
+    assert.equal(err.code, "ETIMEOUT", "the failure must carry the timeout code");
+    // A transport-level request timeout is a plain KinetexError carrying
+    // ETIMEOUT, not the client-level `TimeoutError` the timeout interceptor
+    // throws. Pinning the distinction keeps the two paths from drifting into
+    // one another unnoticed.
+    assert.equal(
+      err.name,
+      "KinetexError",
+      "the transport timeout is a KinetexError, not a client-level TimeoutError",
+    );
+    const { KinetexError } = await import("../src/types.ts");
+    assert.ok(
+      err instanceof KinetexError,
+      `expected a KinetexError, got ${err?.constructor?.name ?? typeof err}`,
+    );
   }
 });
 
@@ -340,7 +586,15 @@ await run("follows redirect", async () => {
     redirect: "follow",
   });
   assert.equal(raw.status, 200);
-  assert.ok(raw.redirected);
+  // Was a bare truthiness check on the flag, which is false by default and so
+  // only ever proved the constructor set it. Pin the flag and the hop itself.
+  assert.equal(raw.redirected, true);
+  // The hop itself, without coupling to httpbin's redirect target: the
+  // returned URL must no longer be the /redirect/1 URL that was sent.
+  assert.ok(
+    !raw.url.includes("/redirect/"),
+    `transport should report the post-redirect url, got ${raw.url}`,
+  );
 });
 
 await run("redirect manual returns 3xx", async () => {
@@ -356,18 +610,83 @@ await run("redirect manual returns 3xx", async () => {
     redirect: "manual",
   });
   assert.ok(raw.status >= 300 && raw.status < 400);
-  assert.ok(raw.headers["location"]);
+  // `assert.ok(raw.headers["location"])` is true of any non-empty string, and
+  // of a boolean, and of a number. The status is pinned to the two a single-hop
+  // redirect can return, and the target is pinned to the hop itself.
+  assert.ok(
+    raw.status === 302 || raw.status === 303,
+    `a one-hop redirect answers 302 or 303, got ${raw.status}`,
+  );
+  assert.equal(typeof raw.headers["location"], "string");
+  // RFC 9110 §10.2.2 allows Location to be a relative reference, and this
+  // origin sends one ("/get"), so the shape that matters is that it is *not*
+  // the URL that was sent — i.e. the hop was computed, not echoed.
+  assert.ok(
+    !raw.headers["location"]!.includes("/redirect/"),
+    `the target must be the destination, got ${raw.headers["location"]}`,
+  );
+  assert.match(raw.headers["location"]!, /^(\/|https?:)/, "a path or an absolute URL");
+  // Nothing followed it: the URL reported is still the one that was sent.
+  assert.equal(raw.url, "https://httpbin.org/redirect/1");
+  assert.equal(raw.redirected, false, "with redirect: manual nothing is followed");
 });
 
 await run("destroy cleanly", () => {
-  const t = new NodeHTTP2Transport();
-  t.destroy();
-  t.destroy();
+  let t: NodeHTTP2Transport | undefined;
+  assert.doesNotThrow(() => {
+    t = new NodeHTTP2Transport();
+  });
+  assert.ok(t !== undefined, "the constructor must return a transport");
+  // destroy() is documented as idempotent; a second call must also not throw.
+  assert.doesNotThrow(() => t!.destroy());
+  assert.doesNotThrow(() => t!.destroy());
+  assert.equal(typeof t!.send, "function", "destroy must leave a usable-shaped object");
 });
 
 await run("custom session options construct", () => {
-  const t = new NodeHTTP2Transport({ sessionTTLMs: 100, pingIntervalMs: 0 });
-  t.destroy();
+  let t: NodeHTTP2Transport | undefined;
+  assert.doesNotThrow(() => {
+    t = new NodeHTTP2Transport({ sessionTTLMs: 100, pingIntervalMs: 0 });
+  });
+  assert.ok(t !== undefined);
+  // The options must actually land on the instance, not just be accepted.
+  // This read `_sessionTTLMs`, which is not a field the transport has at all —
+  // the real ones carry no underscore — so the assertion reduced to
+  // `undefined === 100 || undefined === undefined`, which is true of a
+  // constructor that ignored every option it was handed.
+  const priv = t as unknown as Record<string, unknown>;
+  assert.equal(priv.sessionTTLMs, 100, "sessionTTLMs must reach the instance");
+  assert.equal(priv.pingIntervalMs, 0, "and 0 must survive rather than become the default");
+  // The rest of the option surface, including the three this test did not
+  // mention at all — a `maxSessions` that never arrives is what let the pool
+  // grow without bound.
+  const full = new NodeHTTP2Transport({
+    maxSessions: 3,
+    connectTimeoutMs: 1111,
+    requestTimeoutMs: 2222,
+    http1MaxSockets: 7,
+    strict: true,
+    ca: "-----BEGIN CERTIFICATE-----",
+  }) as unknown as Record<string, unknown>;
+  assert.equal(full.maxSessions, 3, "maxSessions");
+  assert.equal(full._connectTimeoutMs, 1111, "connectTimeoutMs");
+  assert.equal(full._requestTimeoutMs, 2222, "requestTimeoutMs");
+  assert.equal(full._http1MaxSockets, 7, "http1MaxSockets");
+  assert.equal(full._strict, true, "strict");
+  assert.equal(full._ca, "-----BEGIN CERTIFICATE-----", "ca");
+  // And the documented defaults when nothing is passed.
+  const def = new NodeHTTP2Transport() as unknown as Record<string, unknown>;
+  assert.equal(def.sessionTTLMs, 300_000, "sessionTTLMs default");
+  assert.equal(def.pingIntervalMs, 30_000, "pingIntervalMs default");
+  assert.equal(def.maxSessions, 100, "maxSessions default");
+  assert.equal(def._connectTimeoutMs, 30_000, "connectTimeoutMs default");
+  assert.equal(def._requestTimeoutMs, 30_000, "requestTimeoutMs default");
+  assert.equal(def._http1KeepAlive, true, "http1KeepAlive default");
+  assert.equal(def._http1MaxSockets, 16, "http1MaxSockets default");
+  assert.equal(def._strict, false, "strict default");
+  for (const x of [t!, full, def] as unknown as Array<{ destroy(): void }>) {
+    assert.doesNotThrow(() => x.destroy());
+  }
 });
 
 // ============================================================================
@@ -458,7 +777,31 @@ await run("enforces size limit", async () => {
       c.close();
     },
   });
-  await assert.rejects(() => readRawBody(s, 50, ""), /size limit/);
+  await assert.rejects(
+    () => readRawBody(s, 50, ""),
+    (err: unknown) => {
+      assert.ok(err instanceof SizeLimitError, `expected a SizeLimitError, got ${String(err)}`);
+      assert.match((err as Error).message, /size limit/i);
+      // The counts are the diagnostic — how much arrived against what was
+      // allowed. A regex over the message cannot tell 100 bytes from 50.
+      const e = err as SizeLimitError & { limit?: number };
+      assert.equal(e.limit, 50, "the configured limit is reported");
+      assert.match((err as Error).message, /100 bytes/, "and how much had arrived");
+      return true;
+    },
+    "a body over the limit must be refused",
+  );
+  // The limit is inclusive: a body of exactly maxBytes is allowed through, and
+  // this is the boundary the old regex-over-a-single-oversized-chunk test never
+  // reached.
+  const exact = new ReadableStream({
+    start(c) {
+      c.enqueue(new Uint8Array(25));
+      c.enqueue(new Uint8Array(25));
+      c.close();
+    },
+  });
+  assert.equal((await readRawBody(exact, 50, "")).byteLength, 50);
 });
 
 await run("abort signal cancels", async () => {
@@ -469,7 +812,16 @@ await run("abort signal cancels", async () => {
   });
   const c = new AbortController();
   setTimeout(() => c.abort(), 20);
-  await assert.rejects(() => readRawBody(s, 0, "", c.signal), /aborted/);
+  await assert.rejects(
+    () => readRawBody(s, 0, "", c.signal),
+    (err: unknown) => {
+      assert.ok(err instanceof KinetexError, `expected a KinetexError, got ${String(err)}`);
+      assert.equal((err as { code?: string }).code, "EABORT");
+      assert.equal((err as Error).message, "Response reading aborted");
+      return true;
+    },
+    "an abort mid-read must reject with EABORT",
+  );
 });
 
 await run("pre-aborted signal throws immediately", async () => {
@@ -481,7 +833,20 @@ await run("pre-aborted signal throws immediately", async () => {
   });
   const c = new AbortController();
   c.abort();
-  await assert.rejects(() => readRawBody(s, 0, "", c.signal), /aborted/);
+  const start = Date.now();
+  await assert.rejects(
+    () => readRawBody(s, 0, "", c.signal),
+    (err: unknown) => {
+      assert.ok(err instanceof KinetexError);
+      assert.equal((err as { code?: string }).code, "EABORT");
+      return true;
+    },
+    "an already-aborted signal must reject with EABORT",
+  );
+  // "Immediately" is a claim about time. The stream enqueues and closes, so a
+  // version that read it first and consulted the signal afterwards would
+  // resolve with the bytes and pass a substring check on some other error.
+  assert.ok(Date.now() - start < 50, "and without draining the stream first");
 });
 
 await run("readRawBody with stream that errors on read", async () => {
@@ -509,8 +874,17 @@ await run("text content-type returns string", () => {
 });
 
 await run("binary returns Uint8Array", () => {
+  // `instanceof` alone is satisfied by a Uint8Array of the wrong bytes, or of
+  // none at all.
   const r = parseBody(new Uint8Array([0xff, 0xaa]), "application/octet-stream");
   assert.ok(r instanceof Uint8Array);
+  assert.deepEqual(Array.from(r as Uint8Array), [0xff, 0xaa], "the bytes are carried through");
+  // A content type carrying parameters takes the same branch.
+  const withParams = parseBody(
+    new Uint8Array([1]),
+    "application/octet-stream; charset=binary",
+  ) as Uint8Array;
+  assert.deepEqual(Array.from(withParams), [1]);
 });
 
 await run("empty body returns null", () =>
@@ -519,6 +893,31 @@ await run("empty body returns null", () =>
 
 await run("JSON parse failure falls back to text", () => {
   assert.equal(parseBody(new TextEncoder().encode("not-json"), "application/json"), "not-json");
+  // The hook is the designed way to learn the parse failed, and nothing in this
+  // file had ever passed one.
+  const seen: Array<{ bytes: number; code: string; message: string }> = [];
+  const raw = new TextEncoder().encode("not-json");
+  assert.equal(
+    parseBody(raw, "application/json", undefined, (bytes, err) => {
+      seen.push({
+        bytes: bytes.byteLength,
+        code: (err as { code?: string }).code ?? "",
+        message: err.message,
+      });
+    }),
+    "not-json",
+  );
+  assert.equal(seen.length, 1, "the hook fires exactly once");
+  assert.equal(seen[0]!.bytes, raw.byteLength, "and receives the raw bytes, not the text");
+  assert.equal(seen[0]!.code, "PARSE_ERROR", "with the reason on the error");
+  assert.match(seen[0]!.message, /falling back to raw text/);
+  // A hook that throws must not take the response down with it.
+  assert.equal(
+    parseBody(new TextEncoder().encode("not-json"), "application/json", undefined, () => {
+      throw new Error("hook exploded");
+    }),
+    "not-json",
+  );
 });
 
 await run("custom parser", () => {
@@ -657,13 +1056,394 @@ await run("multiple sequential requests", async () => {
 });
 
 // ============================================================================
+// REGRESSIONS — one case per defect this round's audit found
+// ============================================================================
+
+suite("Regressions (core round)");
+
+const kreq = (over: Record<string, unknown> = {}) =>
+  ({
+    method: "GET",
+    url: "https://httpbin.org/get",
+    headers: {},
+    body: null,
+    signal: null,
+    meta: {},
+    httpVersion: "HTTP/1.1",
+    ...over,
+  }) as never;
+
+await run("regression: a runtime's protocol string is normalised to HTTPVersion", async () => {
+  // Deno answered "2.0" and was translated; Bun answers "1.1" and was returned
+  // unchanged, so a plain HTTP/1.1 response on Bun reported the string "1.1" —
+  // outside the `HTTPVersion` union, reaching every consumer of
+  // `res.httpVersion` through a type the compiler had already agreed with. A
+  // consumer switching on "HTTP/1.1" fell through silently, and the runtimes
+  // where it happens are the ones CI does not execute.
+  const versionOf = async (httpVersion: string | undefined): Promise<string> => {
+    const res = new Response("x");
+    if (httpVersion !== undefined) {
+      (res as unknown as Record<string, unknown>).httpVersion = httpVersion;
+    }
+    const t = new FetchTransport(async () => res as never);
+    return (await t.send(kreq())).httpVersion;
+  };
+  // Every spelling Deno and Bun actually use, plus the union's own members.
+  for (const [raw, expected] of [
+    ["1.1", "HTTP/1.1"],
+    ["1", "HTTP/1.0"],
+    ["1.0", "HTTP/1.0"],
+    ["2", "HTTP/2"],
+    ["2.0", "HTTP/2"],
+    ["HTTP/1.1", "HTTP/1.1"],
+    ["HTTP/1.0", "HTTP/1.0"],
+    ["HTTP/2", "HTTP/2"],
+    // Case and surrounding whitespace must not be a way to widen the field.
+    ["  1.1  ", "HTTP/1.1"],
+    ["HTTP/2 ", "HTTP/2"],
+    ["h2", "HTTP/2"],
+  ] as const) {
+    assert.equal(await versionOf(raw), expected, `httpVersion ${JSON.stringify(raw)}`);
+  }
+  // A protocol this library cannot speak says nothing, so it falls through to
+  // the evidence rather than being reported as one.
+  assert.equal(await versionOf("3"), "HTTP/1.1", "an unknown version is not reported as one");
+  assert.equal(await versionOf("quic"), "HTTP/1.1");
+  assert.equal(await versionOf(undefined), "HTTP/1.1", "and no property at all is the default");
+  // With the field normalised, no value outside the union can be produced.
+  const allowed = new Set(["HTTP/1.0", "HTTP/1.1", "HTTP/2"]);
+  for (const raw of ["1.1", "2", "2.0", "1", "3", "h2", "", "HTTP/3"]) {
+    assert.ok(allowed.has(await versionOf(raw)), `${JSON.stringify(raw)} left the union`);
+  }
+});
+
+await run("regression: a request header named __proto__ is sent, not swallowed", async () => {
+  // `__proto__` is made of token characters, so it passed the header-name check
+  // — and then `sanitizedHeaders[name] = value` is a [[Set]], which sent it to
+  // the inherited setter, which ignores a primitive. The header did not
+  // overwrite anything: it disappeared, and the caller was never told. A
+  // caller whose headers came from a JSON config is exactly who sends it.
+  let seen: Record<string, string> = {};
+  const t = new FetchTransport(async (_u, init) => {
+    seen = init.headers as Record<string, string>;
+    return new Response("ok");
+  });
+  // A literal `__proto__:` in an object literal sets the prototype and creates
+  // no own key, so the header has to be built the way a parsed config builds it.
+  const headers = JSON.parse('{"__proto__":"polluted","X-Kept":"1"}') as Record<string, string>;
+  await t.send(kreq({ headers }));
+  assert.equal(seen["__proto__"], "polluted", "the header must be sent");
+  assert.equal(seen["X-Kept"], "1", "and the rest of the headers with it");
+  assert.deepEqual(Object.getOwnPropertyNames(seen).sort(), ["X-Kept", "__proto__"]);
+  assert.equal(Object.getPrototypeOf(seen), Object.prototype, "and nothing else moves");
+  assert.equal(({} as Record<string, unknown>).polluted, undefined, "Object.prototype is clean");
+  // The accept-encoding strip and the validity check still run on it: an
+  // invalid value under that name is still dropped.
+  // The NUL is spelled as a JSON escape, so it survives JSON.parse and arrives
+  // as a real control character in the header value.
+  const bad = JSON.parse('{"__proto__":"bad\\u0000value"}') as Record<string, string>;
+  let seen2: Record<string, string> = {};
+  const t2 = new FetchTransport({
+    fetchFn: async (_u, init) => {
+      seen2 = init.headers as Record<string, string>;
+      return new Response("ok");
+    },
+  });
+  await t2.send(kreq({ headers: bad }));
+  // `in` is useless here: `__proto__` is an accessor on Object.prototype, so
+  // `"__proto__" in {}` is true of every object. The own-key list is the check.
+  assert.equal(
+    Object.getOwnPropertyNames(seen2).includes("__proto__"),
+    false,
+    "an invalid value is still refused",
+  );
+  assert.deepEqual(Object.getOwnPropertyNames(seen2), []);
+});
+
+await run(
+  "regression: the HTTP/2 path validates headers exactly as FetchTransport does",
+  async () => {
+    // The HTTP/2 loop had its own hand-rolled control-character scan over the
+    // value, so it never checked the header *name* at all and had no upper
+    // bound: a name that is not a token reached `session.request()` and came back
+    // as a raw ERR_INVALID_HTTP2_HEADER instead of being dropped (non-strict) or
+    // raising EVALIDATION (strict), and a value above U+00FF — which
+    // FetchTransport refuses because no ByteString header value can carry it —
+    // was sent on this path and dropped on that one. Same request, two
+    // transports, two answers, and HTTP/2 is the default on Node.
+    const strict = new NodeHTTP2Transport({ strict: true, requestTimeoutMs: 20_000 });
+    try {
+      for (const [label, headers, needle] of [
+        ["a name that is not a token", JSON.parse('{"X Bad":"1"}'), /not a valid header name/],
+        ["a value above U+00FF", JSON.parse('{"X-A":"\ud83d\ude00"}'), /control characters/],
+        ["a NUL in a value", { "X-A": "a\u0000b" }, /control characters/],
+      ] as const) {
+        await assert.rejects(
+          () =>
+            strict.send(
+              kreq({ headers: headers as Record<string, string>, httpVersion: "HTTP/2" }),
+            ),
+          (err: unknown) => {
+            assert.ok(err instanceof KinetexError, `${label}: expected a KinetexError`);
+            assert.equal((err as { code?: string }).code, "EVALIDATION", label);
+            assert.match((err as Error).message, needle, label);
+            assert.match((err as Error).message, /^Strict mode: header /, label);
+            return true;
+          },
+          `strict HTTP/2 must reject ${label}`,
+        );
+      }
+    } finally {
+      strict.destroy();
+    }
+    // Non-strict drops rather than throwing, and the request still completes —
+    // which is the whole point of the non-strict mode and is what a raw
+    // ERR_INVALID_HTTP2_HEADER would have prevented.
+    //
+    // It also has to *say* what it dropped. The `onDroppedHeader` callback and
+    // the console warning are the entire reporting mechanism for a silently
+    // removed header, and this file never passed a callback to the HTTP/2
+    // transport at all — a version that dropped the header and told nobody
+    // satisfied every assertion above.
+    const dropped: Array<[string, string]> = [];
+    const lenient = new NodeHTTP2Transport({
+      requestTimeoutMs: 20_000,
+      onDroppedHeader: (name, value) => dropped.push([name, value]),
+    });
+    try {
+      const raw = await lenient.send(
+        kreq({ headers: JSON.parse('{"X Bad":"1","X-Kept":"1"}'), httpVersion: "HTTP/2" }),
+      );
+      assert.equal(raw.status, 200, "the request must still go through");
+      const echoed = (await new Response(raw.body).json()) as { headers: Record<string, string> };
+      assert.equal(echoed.headers["X-Bad"], undefined, "the invalid name is dropped");
+      assert.equal(echoed.headers["X-Kept"], "1", "and the valid one is not");
+      assert.deepEqual(dropped, [["X Bad", "1"]], "the callback names the header and its value");
+    } finally {
+      lenient.destroy();
+    }
+    // A value refused for its *content* is reported the same way, so a caller
+    // can find out which header went missing.
+    const dropped2: Array<[string, string]> = [];
+    const lenient2 = new NodeHTTP2Transport({
+      requestTimeoutMs: 20_000,
+      onDroppedHeader: (name, value) => dropped2.push([name, value]),
+    });
+    try {
+      await lenient2.send(
+        kreq({ headers: JSON.parse('{"X-A":"bad\\u0000value"}'), httpVersion: "HTTP/2" }),
+      );
+      assert.deepEqual(
+        dropped2.map(([n]) => n),
+        ["X-A"],
+        "an invalid value is reported by name",
+      );
+    } finally {
+      lenient2.destroy();
+    }
+    // The same callback is what FetchTransport uses, and it receives the same
+    // pair — one mechanism, two transports.
+    const dropped3: Array<[string, string]> = [];
+    await new FetchTransport({
+      onDroppedHeader: (name, value) => dropped3.push([name, value]),
+      fetchFn: async () => new Response("ok"),
+    }).send(kreq({ headers: { "X-Bad": "a\u0000b" } }));
+    assert.deepEqual(dropped3, [["X-Bad", "a\u0000b"]]);
+  },
+  { transient: "httpbin.org intermittently answers 502" },
+);
+
+await run("regression: parseBody names the limit that rejected the body", async () => {
+  // A body that is perfectly valid JSON and merely larger than the limits
+  // parseBody chose silently became a raw string, and onParseFailure was told
+  // "JSON parse failed" — so the one piece of information that would let a
+  // caller tell a malformed body from an oversized one was discarded. The code
+  // is on the error so a handler can branch on it.
+  // The two limits report differently, and both are distinguishable from a
+  // malformed body: the depth guard is a pre-parse scan that names itself,
+  // while the post-parse size guard reports the one code it uses for every
+  // post-parse refusal. Both are pinned as they are, so a change to either is
+  // visible rather than silent.
+  const cases: Array<[label: string, text: string, code: string, message: RegExp]> = [
+    [
+      "depth",
+      `[${"[".repeat(200)}${"]".repeat(200)}]`,
+      "DEPTH_EXCEEDED",
+      /depth exceeds limit of 100/,
+    ],
+    [
+      "array length",
+      JSON.stringify(new Array(100_001).fill(1)),
+      "VALIDATION_FAILED",
+      /exceeds size limits/,
+    ],
+  ];
+  for (const [label, text, code, message] of cases) {
+    const raw = new TextEncoder().encode(text);
+    let seen: { code: string; message: string; bytes: number } | null = null;
+    const out = parseBody(raw, "application/json", undefined, (bytes, err) => {
+      seen = {
+        code: (err as { code?: string }).code ?? "",
+        message: err.message,
+        bytes: bytes.byteLength,
+      };
+    });
+    assert.equal(out, text, `${label}: the raw text is returned`);
+    assert.ok(seen, `${label}: the hook fires`);
+    assert.equal(seen!.code, code, `${label}: the limit is named on the error`);
+    assert.match(seen!.message, message, `${label}: and named in the message`);
+    assert.match(seen!.message, /falling back to raw text/, label);
+    assert.equal(seen!.bytes, raw.byteLength, `${label}: the raw bytes are handed over`);
+  }
+  // Malformed JSON keeps its own code, so the two are distinguishable.
+  let malformed: string | null = null;
+  parseBody(new TextEncoder().encode("{oops"), "application/json", undefined, (_b, err) => {
+    malformed = (err as { code?: string }).code ?? "";
+  });
+  assert.equal(malformed, "PARSE_ERROR", "a malformed body has its own code");
+  // And the three are all different, so a handler can tell them apart without
+  // parsing prose.
+  assert.equal(new Set([malformed, "DEPTH_EXCEEDED", "VALIDATION_FAILED"]).size, 3);
+  // And a body inside every limit still parses, with no hook call at all.
+  let called = 0;
+  assert.deepEqual(
+    parseBody(new TextEncoder().encode('{"a":1}'), "application/json", undefined, () => {
+      called++;
+    }),
+    { a: 1 },
+  );
+  assert.equal(called, 0, "a successful parse reports no failure");
+});
+
+await run("regression: setRuntime refuses a value the library cannot act on", async () => {
+  // The parameter is typed, but nothing checked it at runtime, and the callers
+  // that matter read the value from configuration. A typo was stored verbatim
+  // and became the effective runtime, and every `RUNTIME === "..."` branch in
+  // the library then missed: no fetch, no HTTP/2, no proxy, no Node-only path,
+  // with nothing thrown and nothing logged.
+  const before = getEffectiveRuntime();
+  for (const rt of ["node", "deno", "bun", "browser", "cloudflare-workers", "edge", "unknown"]) {
+    setRuntime(rt as never);
+    assert.equal(getEffectiveRuntime(), rt);
+  }
+  for (const bad of ["denno", "workerd", "", "Node", "HTTP/2", "node "]) {
+    assert.throws(
+      () => setRuntime(bad as never),
+      (err: unknown) => {
+        assert.ok(err instanceof TypeError, `${JSON.stringify(bad)}: expected a TypeError`);
+        assert.match((err as Error).message, /setRuntime: unknown runtime/);
+        // The message names the offender and lists what is acceptable, because
+        // a bare "invalid value" sends the reader to the source.
+        assert.match((err as Error).message, new RegExp(JSON.stringify(bad).slice(1, -1)));
+        assert.match((err as Error).message, /cloudflare-workers/);
+        return true;
+      },
+      `setRuntime must refuse ${JSON.stringify(bad)}`,
+    );
+    // A refused value must not have been stored either — otherwise the first
+    // bad call poisons every later getEffectiveRuntime().
+    assert.equal(getEffectiveRuntime(), "unknown", "the previous value stands");
+  }
+  // `null` still restores, and the round trip is clean.
+  setRuntime(null);
+  assert.equal(getEffectiveRuntime(), before);
+});
+
+// ── detectRuntime: every answer, not just this environment's ────────────────
+//
+// The existing coverage asserts `detectRuntime() === "node"`, which is this
+// environment's own answer and is the one answer that cannot be wrong here.
+// The other five come from globals read at call time, so they are reachable by
+// stubbing — and a mis-detection is silent and total: the choice decides
+// whether HTTP/2, the proxy path and the Node-only transports exist.
+
+suite("detectRuntime - every branch");
+
+await run("detectRuntime answers for each runtime, in precedence order", () => {
+  const g = globalThis as unknown as Record<string, unknown>;
+  const saved = new Map<string, unknown>();
+  const set = (key: string, value: unknown): void => {
+    if (!saved.has(key)) saved.set(key, g[key]);
+    if (value === undefined) delete g[key];
+    else g[key] = value;
+  };
+
+  // Each row: globals to install, the answer expected, and why that answer wins.
+  const cases: Array<[string, Record<string, unknown>, string]> = [
+    ["deno", { Deno: { version: "1.40.0" } }, "deno"],
+    // Deno without a `version` is not a Deno: the first arm tests both halves.
+    ["deno without version", { Deno: {} }, "node"],
+    ["bun", { Bun: { version: "1.1.0" } }, "bun"],
+    ["cloudflare-workers", { caches: {} }, "cloudflare-workers"],
+    ["browser", { window: {}, document: {} }, "browser"],
+    // `window` alone is not a browser — Workers stub `window`, which is exactly
+    // what the comment in the source warns about.
+    ["window without document", { window: {} }, "node"],
+    ["node", {}, "node"],
+  ];
+
+  try {
+    for (const [label, globals, expected] of cases) {
+      for (const key of ["Deno", "Bun", "caches", "window", "document"]) set(key, undefined);
+      for (const [key, value] of Object.entries(globals)) set(key, value);
+      assert.equal(
+        detectRuntime(),
+        expected,
+        `${label}: expected ${expected}, got ${detectRuntime()}`,
+      );
+    }
+
+    // Deno outranks Bun, and Bun outranks Workers: the first match wins, so an
+    // environment exposing more than one global resolves the same way every
+    // time rather than depending on which check runs.
+    set("Deno", { version: "1.40.0" });
+    set("Bun", {});
+    set("caches", {});
+    assert.equal(detectRuntime(), "deno", "Deno outranks Bun and Workers");
+
+    set("Deno", undefined);
+    assert.equal(detectRuntime(), "bun", "Bun outranks Workers");
+
+    set("Bun", undefined);
+    set("caches", undefined);
+    set("window", undefined);
+    set("document", undefined);
+
+    // The WinterCG tail: no runtime marker, no fetch, so nothing identifies it.
+    const realProcess = g["process"];
+    const realFetch = g["fetch"];
+    try {
+      g["process"] = undefined;
+      g["fetch"] = () => undefined;
+      assert.equal(detectRuntime(), "edge", "fetch alone means a WinterCG edge runtime");
+      g["fetch"] = undefined;
+      assert.equal(detectRuntime(), "unknown", "nothing at all means unknown");
+    } finally {
+      g["process"] = realProcess;
+      g["fetch"] = realFetch;
+    }
+  } finally {
+    for (const key of ["Deno", "Bun", "caches", "window", "document"]) {
+      const original = saved.get(key);
+      if (original === undefined) delete g[key];
+      else g[key] = original;
+    }
+  }
+
+  // The real environment is restored: the next detection agrees with the first.
+  assert.equal(detectRuntime(), "node", "stubbing must not leak past the test");
+});
+
+// ============================================================================
 // §10  SUMMARY
 // ============================================================================
 
-const total = passed + failed;
+// `total` used to be snapshotted here, before the last few tests in the
+// file had run, so the summary could print a pass count larger than its own
+// denominator (e.g. "109/100 passed"). It is computed at print time now.
 console.log(`\n${"=".repeat(60)}`);
 console.log(
-  `  CORE TEST RESULTS: ${passed}/${total} passed${failed > 0 ? `  (${failed} FAILED)` : ""}`,
+  `  CORE TEST RESULTS: ${passed}/${passed + failed} passed${failed > 0 ? `  (${failed} FAILED)` : ""}`,
 );
 console.log(`${"=".repeat(60)}`);
 

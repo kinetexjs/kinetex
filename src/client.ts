@@ -41,7 +41,7 @@ import type {
   PipelineStageName,
 } from "./types.ts";
 
-import { KinetexError, HTTPStatusError, AbortError, toRequestId } from "./types.ts";
+import { KinetexError, HTTPStatusError, AbortError, RedirectError, toRequestId } from "./types.ts";
 
 import {
   isValidHeaderName,
@@ -51,11 +51,12 @@ import {
   randomBytes,
 } from "./utils.ts";
 import { getAuthFingerprint, CREDENTIAL_HEADERS } from "./cache.ts";
-import { createRateLimitInterceptor } from "./interceptors.ts";
+import { createRateLimitInterceptor, ConcurrencyLimiter } from "./interceptors.ts";
 import { SigV4Signer } from "./aws-sigv4.ts";
 import { createDigestAuthorizer } from "./digest.ts";
+import { generateIdempotencyKey, isValidIdempotencyKey, parseRetryAfter } from "./headers.ts";
 
-import { DEFAULT_ACCEPT_ENCODING } from "./core.ts";
+import { DEFAULT_ACCEPT_ENCODING, encodeMultipart } from "./core.ts";
 import {
   createTransport,
   sendWithTimeout,
@@ -188,7 +189,30 @@ export interface OTelTracer {
    * @returns An {@link OTelSpan} instance for recording the span lifecycle.
    */
   startSpan(name: string, options?: { kind?: number }): OTelSpan;
+
+  /**
+   * Record a value into a histogram. Optional — omit it and only spans are
+   * produced.
+   *
+   * @param name  - Instrument name.
+   * @param value - Recorded value. For `http.client.request.duration` this is
+   *   in **seconds**, matching OpenTelemetry semantic conventions.
+   * @param attributes - Low-cardinality dimensions (method, status, host).
+   */
+  recordHistogram?(name: string, value: number, attributes?: MetricAttributes): void;
+
+  /**
+   * Increment a counter. Optional — omit it and only spans are produced.
+   *
+   * @param name  - Instrument name.
+   * @param value - Amount to add (default 1).
+   * @param attributes - Low-cardinality dimensions.
+   */
+  incrementCounter?(name: string, value?: number, attributes?: MetricAttributes): void;
 }
+
+/** Attribute values accepted by {@link OTelTracer}'s metric methods. */
+export type MetricAttributes = Record<string, string | number | boolean>;
 
 /**
  * Minimal interface for an OpenTelemetry-compatible span.
@@ -293,6 +317,8 @@ const HAR_REDACT_HEADERS = new Set([
  * `meta` key carrying the number of response-interceptor re-sends so a
  * self-retriggering interceptor cannot loop forever.
  */
+/** Request-meta key: a clock-skew correction has already been spent. */
+const AWS_SKEW_CORRECTED = "__awsSkewCorrected";
 const INTERCEPTOR_RESEND_DEPTH = "__interceptorResendDepth";
 
 /** Hard cap on consecutive response-interceptor re-sends (digest refresh, etc.). */
@@ -380,6 +406,31 @@ function redactHARHeader(name: string, value: string): { name: string; value: st
  * O(1) ring-buffer HAR entry recorder.
  * Stores up to `maxEntries` entries, evicting oldest first.
  */
+/**
+ * The `postData` block for a recorded request, or `{}` when there is nothing
+ * safe or possible to record.
+ *
+ * Kept out of `record()` so the recorder's entry literal reads as the HAR it
+ * claims to conform to, and so the "may I record this?" decision has one home.
+ */
+function harPostData(req: KinetexRequest): { postData?: { mimeType: string; text: string } } {
+  if (!req.body) return {};
+  const mimeType = req.headers["content-type"] ?? "";
+  // Same policy as the response body: skip anything that is not plain text.
+  if (mimeType && !isHARBodySafeToRecord(mimeType)) return {};
+  let text: string;
+  if (typeof req.body === "string") {
+    text = req.body;
+  } else if (req.body instanceof Uint8Array) {
+    text = new TextDecoder().decode(req.body);
+  } else if (req.body instanceof ArrayBuffer) {
+    text = new TextDecoder().decode(new Uint8Array(req.body));
+  } else {
+    return {}; // stream / FormData / Blob: not readable without consuming it
+  }
+  return { postData: { mimeType, text: text.slice(0, HAR_MAX_BODY_CHARS) } };
+}
+
 class HARRecorder {
   /** Ring buffer of entries keyed by monotonic counter. */
   private readonly _buf = new Map<number, HAREntry>();
@@ -479,6 +530,17 @@ class HARRecorder {
           if (req.body instanceof ArrayBuffer) return req.body.byteLength;
           return -1; // Unknown (stream, FormData, etc.)
         })(),
+        // `postData` is declared on `HAREntry` as "Posted data, if applicable"
+        // and was never written, so a HAR exported from a client that POSTs
+        // anything shows an empty request body in every viewer — the response
+        // body, the query string, the headers and the URL are all there, and
+        // the one part that explains what was actually sent is not. The gates
+        // are the ones the response side already uses: a body is recorded only
+        // when its content type is safe to record, it is truncated to the same
+        // limit, and a body that cannot be read without consuming it (a stream,
+        // a FormData) is omitted rather than guessed at — which is what the
+        // `bodySize: -1` above already admits.
+        ...harPostData(req),
       },
       response: {
         status: res.status,
@@ -632,38 +694,6 @@ async function applyAuth(req: KinetexRequest, auth: AuthConfig): Promise<Kinetex
 // ============================================================================
 
 /**
- * Headers the Fetch spec already drops when a redirect crosses origins.
- * Anything credential-bearing outside this set is forwarded by fetch() itself,
- * which is why those requests must be redirected manually.
- * See {@link CROSS_ORIGIN_STRIP_HEADERS}.
- */
-const FETCH_SPEC_STRIPPED_ON_REDIRECT = new Set(["authorization", "cookie", "proxy-authorization"]);
-
-/**
- * True when the request carries a credential-bearing header that fetch()
- * would forward across a cross-origin redirect. Drives the decision to follow
- * redirects manually even when no cookie jar is configured.
- *
- * Two sources are consulted: the well-known CREDENTIAL_HEADERS names, and a
- * declared `apikey` auth header, whose name is chosen by the application and so
- * cannot be known to the library.
- */
-function hasForwardedCredentials(
-  headers: Record<string, string> | undefined,
-  auth?: AuthConfig | undefined | false,
-): boolean {
-  if (auth && auth.type === "apikey") return true;
-  if (!headers) return false;
-  for (const name of Object.keys(headers)) {
-    const lower = name.toLowerCase();
-    if (CROSS_ORIGIN_STRIP_HEADERS.has(lower) && !FETCH_SPEC_STRIPPED_ON_REDIRECT.has(lower)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
  * Headers stripped when a redirect crosses origins (FIX H2).
  * These carry credentials and must never be forwarded to a different origin.
  */
@@ -707,7 +737,12 @@ function redactUserInfo(url: string): string {
  * @returns Fully-qualified URL string.
  * @throws {KinetexError} EVALIDATION — if URL is unsafe, params exceed limits, or URL too long.
  */
-function buildURL(base: string | undefined, url: string, params: QueryParams | undefined): string {
+function buildURL(
+  base: string | undefined,
+  url: string,
+  params: QueryParams | undefined,
+  allowedSchemes: string[] = ["http", "https"],
+): string {
   const MAX_QUERY_PARAM_COUNT = 100;
   const MAX_URL_LENGTH = 8192;
 
@@ -737,7 +772,7 @@ function buildURL(base: string | undefined, url: string, params: QueryParams | u
   }
 
   if (!params || Object.keys(params).length === 0) {
-    if (!isSafeURL(full)) {
+    if (!isSafeURL(full, allowedSchemes)) {
       throw new KinetexError(
         `URL "${redactUserInfo(full)}" failed safety check — blocked private/loopback address or forbidden scheme`,
         "EVALIDATION",
@@ -748,6 +783,14 @@ function buildURL(base: string | undefined, url: string, params: QueryParams | u
 
   try {
     const u = new URL(full);
+    // The params branch screens the URL after appending them, so it needs the
+    // same scheme list as the no-params branch above.
+    if (!isSafeURL(u, allowedSchemes)) {
+      throw new KinetexError(
+        `URL "${redactUserInfo(full)}" failed safety check — blocked private/loopback address or forbidden scheme`,
+        "EVALIDATION",
+      );
+    }
     let paramCount = 0;
 
     for (const [key, value] of Object.entries(params)) {
@@ -977,7 +1020,13 @@ function computeRetryDelay(cfg: RetryConfig, attempt: number, retryAfterMs: numb
   }
 
   const capped = Math.min(exp, cfg.maxDelayMs);
-  return Math.floor(capped + capped * cfg.jitter * Math.random());
+  const jittered = capped + capped * cfg.jitter * Math.random();
+  // `maxDelayMs` is documented as a maximum, so the cap must be re-applied
+  // *after* jitter. It was not: base 1000, cap 1200, jitter 1 returned 2000ms,
+  // so the option never bounded worst-case latency at all — it bounded only the
+  // pre-jitter base. With the default jitter of 0.3 a 30 s cap still allowed
+  // 39 s.
+  return Math.min(Math.floor(jittered), cfg.maxDelayMs);
 }
 
 /**
@@ -989,14 +1038,21 @@ function computeRetryDelay(cfg: RetryConfig, attempt: number, retryAfterMs: numb
 function getRetryAfterMs(headers: Record<string, string>): number | null {
   const ra = headers["retry-after"];
   if (!ra) return null;
-  if (/^\d+$/.test(ra.trim())) {
-    const seconds = parseInt(ra, 10);
-    if (!isFinite(seconds) || seconds < 0) return null;
+  // Delegate to the single RFC 7231 §7.1.1 parser instead of a second,
+  // looser copy: Date.parse() accepts "-5", "1.5" and "+5" as dates, which
+  // used to yield a 0 ms (i.e. "ignore Retry-After") back-off on a 429.
+  const parsed = parseRetryAfter(ra);
+  if (parsed.delay !== null) {
     const MAX_RETRY_AFTER_SEC = 86_400; // 24 hours
-    return Math.min(seconds, MAX_RETRY_AFTER_SEC) * 1000;
+    return Math.min(parsed.delay, MAX_RETRY_AFTER_SEC) * 1000;
   }
-  const ms = Date.parse(ra);
-  return isNaN(ms) ? null : Math.max(0, Math.min(ms - Date.now(), 86_400_000));
+  if (parsed.date) {
+    // A date in the past genuinely means "retry now" — 0 is the answer, not a
+    // parse failure. Cap at 24 h so a bogus far-future date cannot stall.
+    const MAX_RETRY_AFTER_MS = 86_400_000;
+    return Math.max(0, Math.min(parsed.date.getTime() - Date.now(), MAX_RETRY_AFTER_MS));
+  }
+  return null;
 }
 
 // ============================================================================
@@ -1062,6 +1118,15 @@ export class Kinetex {
   private readonly _wsClients: Set<WSClient> = new Set();
 
   /**
+   * Optional bulkhead bounding in-flight requests. `null` when
+   * `concurrencyLimit` is not configured, which keeps the hot path free of a
+   * limiter check.
+   */
+  private readonly _concurrencyLimiter: ConcurrencyLimiter | null;
+  /** SigV4 signer kept so a clock-skew correction survives across retries. */
+  private _awsSigner: SigV4Signer | null = null;
+
+  /**
    * @param config - Global client configuration.
    */
   constructor(config: KinetexConfig = {}) {
@@ -1082,10 +1147,18 @@ export class Kinetex {
       this.interceptors.addRequest(rlInterceptor as RequestInterceptor);
     }
 
+    // Concurrency limiter (bulkhead). Held as an object rather than a request
+    // interceptor because a permit must survive until the request settles,
+    // and interceptors cannot wrap the downstream call.
+    this._concurrencyLimiter = config.concurrencyLimit
+      ? new ConcurrencyLimiter(config.concurrencyLimit)
+      : null;
+
     // AWS SigV4 request signing — registered synchronously (static import).
     // Active immediately; no race between first request and interceptor registration.
     if (config.awsSigning) {
       const signer = new SigV4Signer(config.awsSigning);
+      this._awsSigner = signer;
       this.interceptors.addRequest(async (ctx: InterceptorContext) => {
         const req = ctx.request;
         let signableBody: string | Uint8Array | null = null;
@@ -1105,8 +1178,15 @@ export class Kinetex {
     this.transport = createTransport(
       config.fetch,
       config.httpVersion !== "HTTP/1.1",
-      undefined,
-      config.strictHeaders ? { strict: true } : undefined,
+      // The HTTP/2 session pool was configurable on the transport but the
+      // client always passed `undefined` here, so `sessionPool` on the client
+      // config could not tune it.
+      config.sessionPool,
+      {
+        ...(config.strictHeaders ? { strict: true } : {}),
+        ...(config.dispatcher !== undefined ? { dispatcher: config.dispatcher } : {}),
+        ...(config.proxy !== undefined ? { proxy: config.proxy } : {}),
+      },
     );
 
     // Register config-level interceptors
@@ -1547,26 +1627,18 @@ export class Kinetex {
   /**
    * Returns deduplication metrics.
    *
-   * @returns An object with `hits` (coalesced request count), `misses` (actual network request count),
-   *          and `inFlightCount` (currently in-flight requests), or `null` if dedup is not enabled.
+   * The full `DedupMap.getStats()` snapshot, so a caller has to reach for one
+   * shape rather than two. The wrapper used to expose only `hits`, `misses`
+   * and `inFlightCount` — which meant the hit rate, the only figure anyone
+   * actually wants from a dedup map, was unavailable on the client even
+   * though the map computed it.
+   *
+   * @returns `{ hits, misses, totalRequests, hitRate, inFlightCount, trackedKeys }`,
+   *          or `null` if dedup is not enabled.
    */
-  get dedupMetrics(): {
-    /** Number of requests that shared an in-flight or windowed response. */
-    hits: number;
-    /** Number of requests that triggered a real network call. */
-    misses: number;
-    /** Number of currently in-flight requests. */
-    inFlightCount: number;
-  } | null {
+  get dedupMetrics(): ReturnType<DedupMap["getStats"]> | null {
     if (!this._dedup) return null;
-    return {
-      /** Number of requests that shared an in-flight or windowed response. */
-      hits: this._dedup.hits,
-      /** Number of requests that triggered a real network call. */
-      misses: this._dedup.misses,
-      /** Number of currently in-flight requests. */
-      inFlightCount: this._dedup.inFlightCount,
-    };
+    return this._dedup.getStats();
   }
 
   // ── §8.5d  Circuit Breaker ────────────────────────────────────────────────
@@ -1650,7 +1722,20 @@ export class Kinetex {
    * ```
    */
   async ws(url: string, options: Partial<WSClientConfig> = {}): Promise<WSClient> {
-    const fullURL = buildURL(this.cfg.baseURL, url, this.cfg.params);
+    // `ws://` / `wss://` have to be allowed here, and only here. The default
+    // `["http", "https"]` is what stops an ordinary HTTP request from being
+    // pointed at a WebSocket scheme, and every other buildURL caller keeps it.
+    // Without this opt-in the documented `client.ws("wss://…")` form — the one
+    // in the README and in this method's own JSDoc — failed the SSRF scheme
+    // check and threw EVALIDATION on every call, so `client.ws()` could not
+    // connect to anything. Only the scheme list is widened: the loopback and
+    // private-range checks still apply to WebSocket URLs.
+    const fullURL = buildURL(this.cfg.baseURL, url, this.cfg.params, [
+      "http",
+      "https",
+      "ws",
+      "wss",
+    ]);
     const headers = mergeHeaders(this.cfg.headers, options.headers as Record<string, string>);
 
     // Apply auth headers manually since WS handshake goes through the browser
@@ -1693,7 +1778,12 @@ export class Kinetex {
       if (this.cfg.baseURL) {
         const baseUrl = new URL(this.cfg.baseURL);
         const wsIsSecure = wsUrl.protocol === "wss:";
-        const httpIsSecure = baseUrl.protocol === "https:";
+        // A baseURL may itself be a WebSocket URL — `kinetex({ baseURL:
+        // "wss://…" })` then `client.ws("/path")` is the natural spelling, and
+        // it is what the README's origin-validation section shows. Comparing
+        // `wss:` only against `https:` rejected that pairing outright, so a
+        // client configured with a WebSocket baseURL could never open a socket.
+        const httpIsSecure = baseUrl.protocol === "https:" || baseUrl.protocol === "wss:";
         if (wsIsSecure !== httpIsSecure || wsUrl.host !== baseUrl.host) {
           throw new KinetexError(
             `WebSocket origin ${wsUrl.origin} does not match baseURL origin ${baseUrl.origin}`,
@@ -1818,16 +1908,18 @@ export class Kinetex {
       mergeParams(this.cfg.params, options.params),
     );
 
-    // FIX (M7): proxy configuration was stored but never consumed — a silent
-    // no-op that sent traffic directly to the target, bypassing the user's
-    // proxy entirely. Fail fast with actionable guidance instead.
-    const proxy = options.proxy ?? this.cfg.proxy;
-    if (proxy) {
+    // A client-level `proxy` is honoured by the Node transport, which tunnels
+    // every connection through it with CONNECT. A per-request `proxy` cannot be:
+    // the transport pools one connection per origin, so honouring a per-request
+    // proxy would mean tearing the pool down mid-flight. Reject it with an
+    // accurate reason rather than silently ignoring it.
+    const perRequestProxy = options.proxy;
+    if (perRequestProxy) {
       throw new KinetexError(
-        "proxy is configured but kinetex's built-in transports cannot route through it: " +
-          "HTTP(S) proxies require a custom fetch with a proxy agent (e.g. undici ProxyAgent " +
-          "passed via the `fetch` option), and SOCKS5 requires createSocks5Tunnel() from " +
-          "kinetex/socks5. Set up one of those instead of relying on `proxy` silently doing nothing.",
+        "A per-request `proxy` is not supported because the transport pools one connection " +
+          "per origin — set `proxy` on the client instead, or use a custom `fetch` with a " +
+          "proxy agent for per-request routing. SOCKS5 requires createSocks5Tunnel() from " +
+          "kinetex/socks5.",
         "EVALIDATION",
       );
     }
@@ -1847,6 +1939,15 @@ export class Kinetex {
         throw new KinetexError(`Invalid URL: ${err}`, "EVALIDATION");
       }
     }
+
+    // A multipart body has no size until it is encoded, and the encoding is
+    // the same call the dispatch path makes below, so it is done once here and
+    // the result reused. The guard used to estimate it with a flat 76 bytes per
+    // part, which is less than the framing `encodeMultipart` actually writes
+    // for its 70-character generated boundary: a form sized to exactly the
+    // estimate passed this check and then went out roughly 45 bytes per part
+    // over the limit the caller had set.
+    let preEncodedForm: { bytes: Uint8Array; boundary: string } | undefined;
 
     // Enforce request size limit if configured
     const maxRequestSize = options.maxRequestSize ?? this.cfg.maxRequestSize ?? 0;
@@ -1869,18 +1970,13 @@ export class Kinetex {
         // FIX (H4): previously silently skipped — count the serialized form.
         bodySize = new TextEncoder().encode(options.body.toString()).byteLength;
       } else if (options.body instanceof FormData) {
-        // FIX (H4): estimate multipart size instead of skipping entirely —
-        // the old skip allowed unbounded uploads past the configured limit.
-        const boundaryOverhead = 76; // per part: --boundary, headers, CRLF (conservative)
-        for (const [name, value] of options.body) {
-          bodySize += new TextEncoder().encode(name).byteLength + boundaryOverhead;
-          if (typeof value === "string") {
-            bodySize += new TextEncoder().encode(value).byteLength;
-          } else {
-            bodySize += value.size;
-          }
-        }
-        bodySize += boundaryOverhead; // final boundary
+        // FIX (H4): the old branch skipped FormData entirely, which allowed
+        // unbounded uploads past the configured limit; it then replaced the
+        // skip with an estimate whose per-part constant was smaller than the
+        // framing it stood in for. The exact bytes are the only honest
+        // answer, and they are needed a few lines below anyway.
+        preEncodedForm = await encodeMultipart(options.body);
+        bodySize = preEncodedForm.bytes.byteLength;
       } else if (options.body instanceof ReadableStream) {
         // FIX (H4): a stream's size cannot be known without consuming it —
         // reject rather than silently bypassing the limit. Callers who need
@@ -1935,6 +2031,26 @@ export class Kinetex {
       meta: { ...options.meta },
       httpVersion: options.httpVersion ?? this.cfg.httpVersion ?? "HTTP/2",
     };
+
+    // A `FormData` body is encoded here rather than handed to the transport,
+    // because the encoding and the `Content-Type` that describes it have to be
+    // produced together. The raw Node transports bypass fetch, and
+    // `serializeRawBody` — the function written so they would not send an empty
+    // body — covered `URLSearchParams` and `Blob` but not `FormData`, so on the
+    // default transport on Node a form upload went out with no body and no
+    // `Content-Type` and the server recorded an empty form. The response was an
+    // ordinary 200, so nothing downstream could tell.
+    if (req.body !== null && req.body instanceof FormData && !req.headers["content-type"]) {
+      const encoded = preEncodedForm ?? (await encodeMultipart(req.body));
+      req = {
+        ...req,
+        headers: {
+          ...req.headers,
+          "content-type": `multipart/form-data; boundary=${encoded.boundary}`,
+        },
+        body: encoded.bytes,
+      };
+    }
 
     // Default Content-Type for JSON bodies
     if (
@@ -2123,6 +2239,106 @@ export class Kinetex {
     startMs: number,
     wallClockMs?: number,
   ): Promise<KinetexResponse<T>> {
+    // A permit is held for the whole logical request — including every retry
+    // attempt — and released in `finally`, so a throw or an exhausted retry
+    // budget can never leak one and permanently shrink the pool.
+    const run = async (): Promise<KinetexResponse<T>> => {
+      if (!this._concurrencyLimiter) {
+        return await this._executeWithRetryInner<T>(
+          req,
+          retryCfg,
+          timeout,
+          options,
+          startMs,
+          wallClockMs,
+        );
+      }
+      await this._concurrencyLimiter.acquire(req.signal);
+      try {
+        return await this._executeWithRetryInner<T>(
+          req,
+          retryCfg,
+          timeout,
+          options,
+          startMs,
+          wallClockMs,
+        );
+      } finally {
+        this._concurrencyLimiter.release();
+      }
+    };
+
+    // Metrics measure the whole logical request, retries included, and are
+    // emitted from `finally` so failures and aborts are counted too. The
+    // no-tracer case is not short-circuited here: `_recordMetrics` returns
+    // immediately when telemetry is off, and this client then pays nothing
+    // beyond the call it already makes on every request.
+    const metricsStart = Date.now();
+    let status: number | undefined;
+    let errorCode: string | undefined;
+    try {
+      const res = await run();
+      status = res.status;
+      return res;
+    } catch (err) {
+      errorCode = (err as { code?: string }).code;
+      throw err;
+    } finally {
+      this._recordMetrics(req, status, errorCode, Date.now() - metricsStart);
+    }
+  }
+
+  /**
+   * Emit request metrics to the configured tracer, if it supports them.
+   *
+   * Failures here are swallowed on purpose: telemetry must never be able to
+   * fail a request that otherwise succeeded.
+   *
+   * @param req - The originating request.
+   * @param status - Final HTTP status, or undefined if the request threw.
+   * @param errorCode - `KinetexError` code, or undefined on success.
+   * @param durationMs - Wall-clock duration of the logical request.
+   */
+  private _recordMetrics(
+    req: KinetexRequest,
+    status: number | undefined,
+    errorCode: string | undefined,
+    durationMs: number,
+  ): void {
+    const tracer = this._otelTracer;
+    if (!tracer) return;
+
+    // `req.url` is always an absolute, already-parsed URL by the time a
+    // request reaches here: `buildURL()` constructs it and the SSRF safety
+    // check parses it again before dispatch, so there is nothing to guard.
+    const attributes: MetricAttributes = {
+      "http.request.method": req.method,
+      "server.address": new URL(req.url).hostname,
+    };
+    if (status !== undefined) attributes["http.response.status_code"] = status;
+    if (errorCode !== undefined) attributes["error.type"] = errorCode;
+
+    try {
+      // Seconds, per OTel semantic conventions for http.client.request.duration.
+      tracer.recordHistogram?.("http.client.request.duration", durationMs / 1000, attributes);
+      tracer.incrementCounter?.("http.client.request.count", 1, attributes);
+      if (errorCode !== undefined) {
+        tracer.incrementCounter?.("http.client.error.count", 1, attributes);
+      }
+    } catch {
+      // Swallowed — see the doc comment.
+    }
+  }
+
+  /** Retry loop body. See {@link _executeWithRetry} for the concurrency gate. */
+  private async _executeWithRetryInner<T>(
+    req: KinetexRequest,
+    retryCfg: RetryConfig | false,
+    timeout: number,
+    options: SendOptions<T>,
+    startMs: number,
+    wallClockMs?: number,
+  ): Promise<KinetexResponse<T>> {
     let attempt = 0;
     while (true) {
       attempt++;
@@ -2191,21 +2407,67 @@ export class Kinetex {
             method: req.method,
           });
         }
-        if (retryCfg && attempt <= retryCfg.maxRetries) {
+        // Clock-skew correction. `SigV4Signer.handleClockSkewError` existed and
+        // `detectClockSkew` was a public export, but nothing in the library
+        // ever called them: a client with a wrong clock got a 403
+        // `RequestTimeTooSkewed`, retried if 403 happened to be in `statuses`,
+        // and re-signed the identical wrong timestamp every attempt. Correcting
+        // here is bounded to one attempt per logical request, so a server that
+        // keeps reporting a different time cannot spin.
+        let clockSkewCorrected = false;
+        const skewResponse = (err as { response?: KinetexResponse<unknown> }).response;
+        if (this._awsSigner && skewResponse && (err as KinetexError).code === "EHTTPSTATUS") {
+          // `data` is the parsed body: a string for text, a Uint8Array for any
+          // other content type (which is what an XML error body arrives as),
+          // and an object only for JSON.
+          const raw = skewResponse.data;
+          const body =
+            typeof raw === "string"
+              ? raw
+              : raw instanceof Uint8Array
+                ? new TextDecoder().decode(raw)
+                : raw instanceof ArrayBuffer
+                  ? new TextDecoder().decode(new Uint8Array(raw))
+                  : JSON.stringify(raw ?? "");
+          if (
+            this._awsSigner.handleClockSkewError(skewResponse.status, body, skewResponse.headers)
+          ) {
+            clockSkewCorrected = !req.meta[AWS_SKEW_CORRECTED];
+            if (clockSkewCorrected) req.meta[AWS_SKEW_CORRECTED] = true;
+          }
+        }
+
+        if (retryCfg && (attempt <= retryCfg.maxRetries || clockSkewCorrected)) {
+          // A thrown HTTPStatusError already carries the full response. This
+          // path used to hand hooks a context with `response: null` and a hard
+          // `null` Retry-After, so the *default* case — throwOnError: true,
+          // which is what every 429/503 goes through — ignored the server's
+          // Retry-After entirely and never fired lifecycle onRetry hooks.
+          const errResponse = skewResponse ?? null;
           const retryCtx: RetryContext = {
             request: req,
-            response: null,
+            response: errResponse,
             error: err,
             attempt,
             maxRetries: retryCfg.maxRetries,
           };
-          const doRetry = retryCfg.shouldRetry
-            ? await retryCfg.shouldRetry(retryCtx)
-            : shouldRetry(retryCfg, retryCtx);
+          const doRetry = clockSkewCorrected
+            ? true
+            : retryCfg.shouldRetry
+              ? await retryCfg.shouldRetry(retryCtx)
+              : shouldRetry(retryCfg, retryCtx);
 
           if (doRetry) {
-            const delay = computeRetryDelay(retryCfg, attempt, null);
+            const delay = computeRetryDelay(
+              retryCfg,
+              attempt,
+              errResponse ? getRetryAfterMs(errResponse.headers) : null,
+            );
             await retryCfg.onRetry?.(retryCtx, delay);
+            await this.cfg.hooks?.onRetry?.reduce(async (p, fn) => {
+              await p;
+              await fn(retryCtx);
+            }, Promise.resolve());
             await sleep(delay, req.signal);
             continue;
           }
@@ -2332,9 +2594,7 @@ export class Kinetex {
       if (isRedirect) {
         // Check for redirect loops
         if (visited.has(raw.url)) {
-          throw new KinetexError(`Redirect loop detected: ${raw.url}`, "ENETWORK", {
-            request: req,
-          });
+          throw new RedirectError(`Redirect loop detected: ${raw.url}`, req);
         }
         visited.add(raw.url);
 
@@ -2345,13 +2605,26 @@ export class Kinetex {
 
         // `followRedirects: false` (or `maxRedirects: 0`) hands the 3xx back to
         // the caller instead of chasing it — the same shape fetch() returns for
-        // `redirect: "manual"`.
-        if (!followRedirects) return { ...raw, redirected: true };
+        // `redirect: "manual"`. It reported `redirected: true`, which is the one
+        // value `redirected` must never take: no hop was taken, `res.url` is
+        // still the request's own URL, and the whole point of the option is that
+        // the caller now has to read `Location` and decide for itself. A caller
+        // branching on `if (res.redirected)` to detect a cross-origin bounce was
+        // told it had already been redirected to a URL it never requested.
+        if (!followRedirects) return { ...raw, redirected: false };
 
         if (hop === maxRedirects) {
-          throw new KinetexError(`Too many redirects (exceeded ${maxRedirects})`, "ENETWORK", {
-            request: req,
-          });
+          // `EREDIRECT`, not `ENETWORK`. A redirect chain that has run out of
+          // hops is a deterministic answer from the origin: the same request
+          // produces the same chain. As an `ENETWORK` it fell into
+          // `shouldRetry`'s network-error case and the whole chain was replayed
+          // once per attempt — 16 requests against a server already looping,
+          // under a `maxRedirects: 3` the caller had set, and after the whole
+          // backoff schedule before the error they asked for finally arrived.
+          // `shouldRetry` already had a non-retryable `EREDIRECT` case, and
+          // `RedirectError` was already exported and documented; nothing
+          // constructed it.
+          throw new RedirectError(`Too many redirects (exceeded ${maxRedirects})`, req);
         }
 
         // Drain the redirect body (usually empty, but must be cancelled)
@@ -2483,7 +2756,7 @@ export class Kinetex {
     }
 
     // Unreachable
-    throw new KinetexError("Redirect loop", "ENETWORK", { request: req });
+    throw new RedirectError("Redirect loop", req);
   }
 
   // ── §8.8  Single attempt ──────────────────────────────────────────────────
@@ -2534,9 +2807,16 @@ export class Kinetex {
     this._trace(_traceId, "lifecycle_before", "end", startMs, attempt);
 
     // ── Cache lookup ───────────────────────────────────────────────────────
+    // `noCache()` sets `cache: { forceRefresh: true }`, and `forceRefresh` was
+    // declared on `CacheRequestConfig` and read *nowhere*: the lookup below ran
+    // exactly as if no option had been passed, so a warm entry was served and
+    // the fluent method documented as "Force a fresh fetch, bypassing any cached
+    // response" did not fetch. The fix is to skip the read for this request —
+    // the write still happens, which is what "refresh" means.
+    const forceRefresh = options.cache !== false && options.cache?.forceRefresh === true;
     if (options.cache !== false && this.cfg.cache) {
       const cache = await this.getCache();
-      if (cache) {
+      if (cache && !forceRefresh) {
         const cacheReq = { url: req.url, method: req.method, headers: req.headers };
         const hit = await cache.get(cacheReq);
 
@@ -2724,24 +3004,40 @@ export class Kinetex {
     }
 
     // ── Dispatch ───────────────────────────────────────────────────────────
-    // Redirects are followed by hand when EITHER:
-    //  - a cookie jar is active, so every intermediate Set-Cookie is captured
-    //    (fetch() silently drops them), or
-    //  - the request carries a credential header that fetch() would NOT strip on
-    //    a cross-origin redirect. Per the Fetch spec only `authorization`,
-    //    `cookie` and `proxy-authorization` are dropped, so a custom API-key
-    //    header would otherwise be forwarded verbatim to a foreign origin.
+    // Redirects are ALWAYS followed by hand, and that is not a preference.
+    //
+    // `_sendFollowingRedirects` is the only place kinetex checks a redirect
+    // *target*: the SSRF gate (`isSafeURL` on every hop), the `httpsOnly`
+    // policy, the redirect-loop detector, the `maxRedirects` cap, and the
+    // RFC 7231 method downgrade for 301/302/303. It also exists to capture
+    // intermediate Set-Cookie and to strip credentials across origins, which is
+    // why it used to be entered only when a cookie jar or a forwarded credential
+    // header happened to be configured.
+    //
+    // An ordinary GET is neither. So an ordinary GET's redirects were chased by
+    // the transport instead, and every check above was skipped: the HTTP/2
+    // transport's own loop resolved any `Location` and dialled it, and
+    // `FetchTransport` handed fetch `redirect: "follow"`, which does the same.
+    // A 302 to `http://127.0.0.1:9/` opened the socket (`ECONNREFUSED` came
+    // back from the loopback port, which is the point — nothing refused the
+    // connection first), and a 302 to `http://169.254.169.254/` was answered by
+    // the cloud metadata service. `httpsOnly: true` changed nothing on either
+    // path; both reported the same opaque `Protocol error`.
+    //
+    // The two reasons the follower was originally introduced are reasons it is
+    // *necessary*, not an exhaustive list of when it applies.
     const dispatchJar = await this.getCookieJar();
     const effectiveAuth = options.auth !== false ? (options.auth ?? this.cfg.auth) : undefined;
-    const needsManualRedirects =
-      dispatchJar !== null || hasForwardedCredentials(req.headers, effectiveAuth);
 
     this._trace(_traceId, "transport_send", "start", startMs, attempt);
     let raw: RawResponse;
     try {
-      raw = needsManualRedirects
-        ? await this._sendFollowingRedirects(req, timeout, dispatchJar ?? undefined, effectiveAuth)
-        : await sendWithTimeout(this.transport, req, timeout);
+      raw = await this._sendFollowingRedirects(
+        req,
+        timeout,
+        dispatchJar ?? undefined,
+        effectiveAuth,
+      );
     } catch (err) {
       // Cancel the progress-tracking ReadableStream to release the underlying
       // resource (byte counter, event listeners) when the transport throws.
@@ -2757,6 +3053,21 @@ export class Kinetex {
       throw err;
     }
     this._trace(_traceId, "transport_send", "end", startMs, attempt);
+
+    // ── Lifecycle: after request ───────────────────────────────────────────
+    // "After the request is sent (before response is processed)" — the window
+    // between the transport answering and the response being built, and the
+    // only place a caller can observe that the wire round trip is over without
+    // also having to see the parsed response. It was declared on `LifecycleHooks`
+    // and documented twice in the README, and never invoked: a caller who
+    // registered it got silence, on every code path, for every status.
+    //
+    // Deliberately *not* fired on the throw above: the request was not sent.
+    if (this.cfg.hooks?.onAfterRequest) {
+      for (const fn of this.cfg.hooks.onAfterRequest) {
+        await fn(req, this._hookCtx(ctx));
+      }
+    }
 
     // ── Handle 304 Not Modified ────────────────────────────────────────────
     if (raw.status === 304) {
@@ -3476,6 +3787,8 @@ export class Kinetex {
     if (IS_NODE && this.transport && "destroy" in this.transport) {
       (this.transport as { destroy: () => void }).destroy();
     }
+    // Reject anyone still parked on the queue — it can never drain now.
+    this._concurrencyLimiter?.drain();
     this._cookieJar = null;
     this._logger = null;
     this._dedup?.clear();
@@ -3533,6 +3846,37 @@ export class FluentRequest {
     this._options.headers = {
       ...(this._options.headers as Record<string, string>),
       [name.toLowerCase()]: value,
+    };
+    return this;
+  }
+
+  /**
+   * Attach an `Idempotency-Key`, generating one when none is given.
+   *
+   * Lets a retried `POST` be recognised as the same logical operation by the
+   * server instead of creating a duplicate. Because the header is set on the
+   * request options — not regenerated per attempt — every retry of this
+   * request carries the same key, which is the entire point.
+   *
+   * @param value - An explicit key, or `undefined` to generate a v4 UUID.
+   * @throws {TypeError} If `value` is not a valid key (see `isValidIdempotencyKey`).
+   *
+   * @example
+   * ```ts
+   * await client.POST("/charges").withJSON(body).idempotencyKey().json();
+   * ```
+   */
+  idempotencyKey(value?: string): this {
+    const key = value === undefined ? generateIdempotencyKey() : value;
+    if (!isValidIdempotencyKey(key)) {
+      throw new TypeError(
+        `idempotencyKey: ${typeof key === "string" ? JSON.stringify(key) : typeof key} is not a ` +
+          "valid Idempotency-Key — expected 1-255 visible ASCII characters",
+      );
+    }
+    this._options.headers = {
+      ...(this._options.headers as Record<string, string>),
+      "idempotency-key": key,
     };
     return this;
   }

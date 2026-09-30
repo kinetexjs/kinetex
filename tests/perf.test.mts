@@ -493,9 +493,11 @@ await test("Kinetex POST with 1KB body — should complete < 5s", async () => {
 // Summary
 // ============================================================================
 
-const total = passed + failed;
+// `total` used to be snapshotted here, before the last few tests in the
+// file had run, so the summary could print a pass count larger than its own
+// denominator (e.g. "109/100 passed"). It is computed at print time now.
 console.log(`\n── Summary ──`);
-console.log(`  Total: ${total}  Passed: ${passed}  Failed: ${failed}`);
+console.log(`  Total: ${passed + failed}  Passed: ${passed}  Failed: ${failed}`);
 if (failed > 0) {
   console.log(`\nFailures:`);
   for (const f of failures) {

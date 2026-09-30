@@ -78,6 +78,12 @@ export interface CacheEntry {
   lastModified: string | null;
   /** Hash of Vary-relevant request headers (null = Vary:*) */
   varyKey: string | null;
+  /**
+   * The response carried `Cache-Control: no-cache` or `must-revalidate`, so it
+   * may be stored but must not be reused without revalidating with the origin
+   * (RFC 9111 §5.2.2.4). Absent on entries persisted by an older version.
+   */
+  mustRevalidate?: boolean;
   /** Tags for group invalidation */
   tags: string[];
   /** Approximate entry size in bytes */
@@ -657,6 +663,13 @@ interface TTLResult {
  * Compute cache TTL, SWR window, and stale-on-error window
  * from Cache-Control headers, Expires header, or Last-Modified heuristic.
  */
+/** True when the response may be stored but must be revalidated before reuse. */
+function computeMustRevalidate(response: CacheableResponse): boolean {
+  const cc = response.headers["cache-control"] ?? response.headers["Cache-Control"] ?? "";
+  const d = parseCacheControl(cc);
+  return d.noCache || d.mustRevalidate;
+}
+
 function computeTTL(response: CacheableResponse, defaultTtl: number, honor: boolean): TTLResult {
   const cc = response.headers["cache-control"] ?? response.headers["Cache-Control"] ?? "";
   const d = parseCacheControl(cc);
@@ -687,7 +700,15 @@ function computeTTL(response: CacheableResponse, defaultTtl: number, honor: bool
       if (lm) {
         const lmTime = Date.parse(lm);
         if (!isNaN(lmTime)) {
-          ttlMs = Math.min((Date.now() - lmTime) * 0.1, defaultTtl);
+          // RFC 9111 §4.2.2: the heuristic lifetime is 10% of the interval
+          // between Last-Modified and the response's Date. That interval is
+          // negative whenever Last-Modified is in the future — routine, since
+          // the origin and the client rarely share a clock — and there was no
+          // lower clamp, so the entry was given a negative freshness lifetime
+          // and a staleUntil *before* its creation time. The clamp to 0 is the
+          // RFC's "already stale"; the stale windows then apply normally,
+          // instead of landing in the past and being unreachable.
+          ttlMs = Math.min(Math.max((Date.now() - lmTime) * 0.1, 0), defaultTtl);
         } else {
           ttlMs = defaultTtl;
         }
@@ -709,7 +730,11 @@ function computeTTL(response: CacheableResponse, defaultTtl: number, honor: bool
     ttlMs,
     swrMs,
     staleOnError,
-    shouldCache: ttlMs > 0 || swrMs > 0,
+    // Storable if it is fresh now, or already stale but covered by a
+    // stale-while-revalidate / stale-if-error window. The two windows were
+    // missing from this decision, so `max-age=0, stale-if-error=60` — the
+    // point of the directive — was reported as uncacheable.
+    shouldCache: ttlMs > 0 || swrMs > 0 || staleOnError > 0,
   };
 }
 
@@ -927,7 +952,12 @@ export class HTTPCache {
       this.stats.hits++;
       this.lru.touch(key);
       this._updateHitRate();
-      return { entry: cloneEntry(entry), stale: false };
+      // RFC 9111 §5.2.2.4: a `no-cache` response may be stored but must not be
+      // reused without revalidating. It used to be reported as a plain fresh
+      // hit, so an origin that sent `Cache-Control: no-cache` had its response
+      // served indefinitely from cache. Reporting it as stale routes it into the
+      // existing serve-stale-and-revalidate path instead.
+      return { entry: cloneEntry(entry), stale: entry.mustRevalidate === true };
     }
 
     // Stale-While-Revalidate window
@@ -990,7 +1020,14 @@ export class HTTPCache {
     // 9.10 — cap TTL to maxAbsoluteAgeMs so stored entries can never outlive the limit
     const absoluteCap = this.cfg.maxAbsoluteAgeMs;
     const cappedTtlMs = Math.min(ttlMs === Infinity ? absoluteCap : ttlMs, absoluteCap);
-    if (cappedTtlMs <= 0 && !options.force) return false;
+    // A zero (or negative) freshness lifetime does not by itself mean
+    // "unstoreable": RFC 9111 §4.2 still permits storing a response that is
+    // already stale, provided a stale-while-revalidate or stale-if-error
+    // window covers it — and `computeTTL` has just told us exactly that via
+    // `shouldCache`. This guard used to discard that decision, so the canonical
+    // CDN recipe `Cache-Control: max-age=0, stale-while-revalidate=60` was
+    // never cached at all, defeating the one directive it exists to enable.
+    if (cappedTtlMs <= 0 && swrMs <= 0 && staleOnError <= 0 && !options.force) return false;
     const varyHeader = res.headers["vary"] ?? res.headers["Vary"] ?? null;
     const varyKey = varyHeader ? buildVaryKey(varyHeader, req.headers) : "";
     // Vary: * means this response is per-user and must never be shared from cache
@@ -1006,6 +1043,7 @@ export class HTTPCache {
       etag: res.headers["etag"] ?? res.headers["ETag"] ?? null,
       lastModified: res.headers["last-modified"] ?? res.headers["Last-Modified"] ?? null,
       varyKey,
+      mustRevalidate: computeMustRevalidate(res),
       tags,
       size: bodySize + 256,
     };
@@ -1213,16 +1251,27 @@ export class HTTPCache {
     return { ...this.stats };
   }
 
-  /** Reset all cache statistics to zero. */
+  /**
+   * Reset the cache's counters to zero.
+   *
+   * `totalEntries` and `totalSizeBytes` are deliberately NOT reset: they are
+   * gauges of what is actually stored, not counters of events, and
+   * `_ensureCapacity()` reads them as the authoritative figures for the
+   * `maxEntries` / `maxSizeBytes` caps. Zeroing them while the entries are
+   * still in storage made eviction compare against a fiction — a cache with
+   * `maxSizeBytes: 600` was measured holding 1028 bytes across 4 entries
+   * after a reset — and made `getStats().totalEntries` report 0 for entries
+   * that were still there and still being served. Call `clear()` to empty the
+   * cache; use this to zero the hit/miss/eviction counters.
+   */
   resetStats(): void {
     this.stats = {
+      ...this.stats,
       hits: 0,
       misses: 0,
       staleHits: 0,
       errors: 0,
       evictions: 0,
-      totalEntries: 0,
-      totalSizeBytes: 0,
       hitRate: 0,
     };
   }

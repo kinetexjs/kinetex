@@ -72,18 +72,44 @@ async function cleanCloseServer(): Promise<{
  * The loop only runs while the stream is consumed, and it is deliberately not
  * awaited to completion: the test bounds it by wall clock and tears the client
  * down, so a stuck generator can never hold the suite open.
+ *
+ * The consumption error is captured, not discarded. Pumping a reconnecting
+ * client to exhaustion is *expected* to end in `SSEMaxReconnectsError`, but a
+ * silent `.catch(() => {})` cannot tell that apart from a genuine defect, so
+ * the error is asserted here and every caller inherits the check.
  */
 async function pumpFor(client: SSEClient, ms: number): Promise<void> {
   let done = false;
+  let outcome: { settled: boolean; error: unknown } = { settled: false, error: undefined };
   const consume = (async () => {
     for await (const _e of client.stream()) {
       if (done) break;
     }
-  })().catch(() => {});
+  })().then(
+    () => {
+      outcome = { settled: true, error: undefined };
+    },
+    (e: unknown) => {
+      outcome = { settled: true, error: e };
+    },
+  );
   await delay(ms);
   done = true;
   client.close();
   await Promise.race([consume, delay(1500)]);
+
+  assert.equal(outcome.settled, true, "the consume loop must terminate after close()");
+  if (outcome.error !== undefined) {
+    assert.ok(
+      outcome.error instanceof Error,
+      `consume loop must fail with an Error, got ${String(outcome.error)}`,
+    );
+    assert.match(
+      outcome.error.message,
+      /max reconnects|abort|close/i,
+      `unexpected consume failure: ${outcome.error.message}`,
+    );
+  }
 }
 
 suite("SSE reconnect");
@@ -195,11 +221,19 @@ await test("close() during a long back-off returns promptly", async () => {
 
   try {
     let done = false;
+    let outcome: { settled: boolean; error: unknown } = { settled: false, error: undefined };
     const consume = (async () => {
       for await (const _e of client.stream()) {
         if (done) break;
       }
-    })().catch(() => {});
+    })().then(
+      () => {
+        outcome = { settled: true, error: undefined };
+      },
+      (e: unknown) => {
+        outcome = { settled: true, error: e };
+      },
+    );
 
     // Let the first connection close cleanly so the client enters back-off.
     await delay(250);
@@ -208,6 +242,17 @@ await test("close() during a long back-off returns promptly", async () => {
     const elapsed = Date.now() - start;
     assert.ok(elapsed < 2000, `close() must not wait out a 30s back-off, took ${elapsed}ms`);
     done = true;
+    // close() must also settle the loop rather than leave it hanging.
+    await Promise.race([consume, delay(1500)]);
+    assert.equal(outcome.settled, true, "close() must terminate the consume loop");
+    if (outcome.error !== undefined) {
+      assert.ok(outcome.error instanceof Error, "the loop must fail with an Error");
+      assert.match(
+        outcome.error.message,
+        /abort|close|max reconnects/i,
+        `unexpected consume failure: ${outcome.error.message}`,
+      );
+    }
     await Promise.race([consume, delay(1500)]);
   } finally {
     client.close();

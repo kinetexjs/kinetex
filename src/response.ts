@@ -117,9 +117,15 @@ export class HTTPResponseError extends Error {
   get isClientError(): boolean {
     return this.status >= 400 && this.status < 500;
   }
-  /** Returns true if the status code is a server error (5xx). */
+  /**
+   * Returns true if the status code is a server error (5xx).
+   *
+   * Bounded above, like `isClientError` is at both ends. Unbounded, any
+   * status at or past 600 — a non-standard code, or anything a caller invents
+   * — reported itself as a server error.
+   */
   get isServerError(): boolean {
-    return this.status >= 500;
+    return this.status >= 500 && this.status < 600;
   }
   /** Returns true if the status is 404 Not Found. */
   get isNotFound(): boolean {
@@ -331,6 +337,59 @@ export function isBinary(contentType: string | null): boolean {
 // ============================================================================
 
 /**
+ * One `reader.read()` that also settles when the signal aborts.
+ *
+ * Checking `signal.aborted` at the top of the read loop is not enough, because
+ * the loop only gets another turn when the source produces a chunk or closes.
+ * A connection that stalls after its last byte leaves the read pending
+ * forever, so the abort was never observed and the promise never settled at
+ * all — `readText`/`readJSON`/`readBytes` simply hung, which is the one thing
+ * a signal exists to prevent. Racing the signal against the read is what makes
+ * an abort actually abort.
+ *
+ * An aborted read resolves as `{ done: true }` rather than rejecting, so each
+ * caller keeps its own established behaviour for an abort: the collecting
+ * readers re-check the signal and throw, while the streaming parsers stop
+ * iterating. `cancel()` is still issued so the source is released.
+ */
+function readWithAbort(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal | undefined,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (!signal) return reader.read();
+  if (signal.aborted) return Promise.resolve({ done: true, value: undefined });
+  return new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => {
+    const onAbort = (): void => {
+      void reader.cancel("aborted").catch(() => {});
+      resolve({ done: true, value: undefined });
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    reader
+      .read()
+      .then(resolve, reject)
+      .finally(() => {
+        signal.removeEventListener("abort", onAbort);
+      });
+  });
+}
+
+/**
+ * Normalise the `onExceed` mode, failing closed.
+ *
+ * The three modes were tested as a chain of `if`s that each ended in a
+ * `break`/`return`. A value matching none of them therefore fell straight
+ * through to the ordinary "push the chunk" line below and the size limit did
+ * nothing at all: `onExceed: "ignore"` against a 10-byte cap returned all
+ * 1000 bytes, through both `readBodyWithLimit` and `readText`. That is a
+ * fail-open on the guard this option exists to provide, and the config is a
+ * plain interface, so a value read from JSON or asserted at a call site
+ * reaches it. An unrecognised mode is treated as `"throw"`.
+ */
+function normaliseOnExceed(mode: SizeLimitConfig["onExceed"]): "throw" | "truncate" | "abort" {
+  return mode === "truncate" || mode === "abort" ? mode : "throw";
+}
+
+/**
  * Read a ReadableStream with a hard size limit.
  *
  * @param stream The source ReadableStream.
@@ -347,7 +406,7 @@ export async function readBodyWithLimit(
   limit: SizeLimitConfig,
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
-  const onExceed = limit.onExceed ?? "throw";
+  const onExceed = normaliseOnExceed(limit.onExceed);
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let bytesRead = 0;
@@ -358,8 +417,16 @@ export async function readBodyWithLimit(
         await reader.cancel("aborted");
         throw new DOMException("Response reading aborted", "AbortError");
       }
-      const { done, value } = await reader.read();
-      if (done) break;
+      const { done, value } = await readWithAbort(reader, signal);
+      if (done) {
+        // `done` is also how an aborted read settles (see readWithAbort), so
+        // the signal has to be re-checked here or a partial body would be
+        // returned as a complete one.
+        if (signal?.aborted) {
+          throw new DOMException("Response reading aborted", "AbortError");
+        }
+        break;
+      }
 
       const newTotal = bytesRead + value.byteLength;
 
@@ -417,7 +484,20 @@ const CHARSET_ALIASES: Record<string, string> = {
 
 function resolveCharset(charset: string | null): string {
   if (!charset) return "utf-8";
-  return CHARSET_ALIASES[charset.toLowerCase()] ?? "utf-8";
+  const key = charset.toLowerCase().trim();
+  // Own-property check, not a bare index. `CHARSET_ALIASES` is a plain object
+  // literal, so an unrecognised charset naming an `Object.prototype` member
+  // resolved to that member instead of falling back: `charset=constructor`
+  // reached `TextDecoder` as `function Object() { [native code] }` and
+  // `charset=__proto__` as `[object Object]`, either of which throws
+  // ERR_ENCODING_NOT_SUPPORTED and fails the whole body with a decode error
+  // naming a charset nobody sent. The charset is attacker-controlled — it
+  // comes straight off a response header — so that is a denial of service on
+  // body parsing, and `__proto__` is the kind of value a scanner fuzzes.
+  if (Object.prototype.hasOwnProperty.call(CHARSET_ALIASES, key)) {
+    return CHARSET_ALIASES[key]!;
+  }
+  return "utf-8";
 }
 
 /**
@@ -515,6 +595,15 @@ export function decompressStream(
     return brotliDecompressStream(stream);
   }
 
+  // ── zstd ─────────────────────────────────────────────────────────────────
+  // `DecompressionStream` has no "zstd" format in Node or the browsers as of
+  // this writing, but does in Bun and newer edge runtimes. Prefer it when
+  // present, otherwise fall back to node:zlib on Node 22+, and only then give
+  // up and pass the bytes through.
+  if (normalized === "zstd") {
+    return zstdDecompressStream(stream);
+  }
+
   // ── gzip / deflate ────────────────────────────────────────────────────────
   if (typeof DecompressionStream === "undefined") return stream;
 
@@ -538,36 +627,94 @@ export function decompressStream(
  * Uses node:zlib on Node.js. Returns the stream unchanged on other runtimes.
  */
 function brotliDecompressStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
-  // Detect Node.js safely - process may not exist in edge runtimes
-  let isNode = false;
+  // Non-Node runtime: we cannot decompress brotli natively. Return raw bytes —
+  // this will likely cause a parse error downstream, which is the correct
+  // behaviour (the server shouldn't have sent br in the first place).
+  if (!isNodeRuntime()) return stream;
+
+  return nodeZlibDecompressStream(stream, (zlib) => zlib.createBrotliDecompress());
+}
+
+/**
+ * True when running on Node.js.
+ *
+ * Read defensively: `process` does not exist in edge runtimes and reading it
+ * through a hostile global can throw.
+ */
+function isNodeRuntime(): boolean {
   try {
-    isNode =
+    return (
       typeof (globalThis as { process?: { versions?: { node?: string } } }).process?.versions
-        ?.node === "string";
+        ?.node === "string"
+    );
   } catch {
-    /* not Node */
+    return false;
   }
+}
 
-  if (!isNode) {
-    // Non-Node runtime: we cannot decompress brotli natively.
-    // Return raw bytes — this will likely cause a parse error downstream,
-    // which is the correct behaviour (server shouldn't have sent br).
-    return stream;
-  }
+/**
+ * Pipe a web ReadableStream through a `node:zlib` decompressor.
+ *
+ * @param stream - Compressed input.
+ * @param create - Builds the zlib transform from the imported module.
+ * @returns The decompressed stream.
+ */
+function nodeZlibDecompressStream(
+  stream: ReadableStream<Uint8Array>,
+  create: (zlib: typeof import("node:zlib")) => import("node:stream").Duplex,
+): ReadableStream<Uint8Array> {
+  // The node stream and the read loop can both try to settle the controller,
+  // and `cancel()` settles it too. Whichever arrives second would throw
+  // ERR_INVALID_STATE on an already closed controller — an unhandled throw
+  // that takes the whole process down, not just the request. Two reachable
+  // ways to get there:
+  //   * an upstream error rejects `reader.read()`, we error the controller,
+  //     and the `br.destroy()` below makes node emit "end" afterwards;
+  //   * the consumer cancels (an aborted request), and cancelling the source
+  //     makes zlib drain and emit "end" against a closed controller.
+  // Neither is exotic — a server aborting a response mid-body, or a client
+  // cancelling one, is ordinary traffic on any content-encoding response.
+  let settled = false;
+  // Hoisted so `cancel()` can reach it: the bridge holds a reader lock for the
+  // whole stream, and `ReadableStream.cancel()` rejects with ERR_INVALID_STATE
+  // on a locked stream. `reader.cancel()` is the supported way to abort it.
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  // `start()` awaits the dynamic import before locking the source, so a cancel
+  // can land in that window — an immediately-aborted request is the common
+  // case, not an edge one. Remember it and apply it once the reader exists.
+  let cancelRequested = false;
 
-  // Node.js: pipe through zlib.createBrotliDecompress() via a TransformStream bridge
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       // Dynamic import so non-Node runtimes never load node:zlib
       const zlib = await import("node:zlib");
-      const br = zlib.createBrotliDecompress();
-      const reader = stream.getReader();
+      const br = create(zlib);
+      reader = stream.getReader();
+
+      if (cancelRequested) {
+        // The source may already be gone; there is nothing left to release.
+        void reader.cancel().catch(() => undefined);
+        reader.releaseLock();
+        reader = null;
+        return;
+      }
+
+      const settleError = (e: unknown): void => {
+        if (settled) return;
+        settled = true;
+        controller.error(e);
+      };
 
       br.on("data", (chunk: Uint8Array) => {
+        if (settled) return;
         controller.enqueue(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
       });
-      br.on("end", () => controller.close());
-      br.on("error", (e) => controller.error(e));
+      br.on("end", () => {
+        if (settled) return;
+        settled = true;
+        controller.close();
+      });
+      br.on("error", settleError);
 
       try {
         while (true) {
@@ -580,14 +727,57 @@ function brotliDecompressStream(stream: ReadableStream<Uint8Array>): ReadableStr
         }
       } catch (e) {
         br.destroy(e instanceof Error ? e : new Error(String(e)));
-        controller.error(e);
+        settleError(e);
       } finally {
         reader.releaseLock();
+        reader = null;
       }
     },
     cancel() {
-      stream.cancel();
+      // Mark settled first: cancelling the reader resolves the loop's pending
+      // read as `done`, which ends the zlib transform and emits "end" against
+      // an already-closed controller.
+      settled = true;
+      cancelRequested = true;
+      void reader?.cancel().catch(() => undefined);
     },
+  });
+}
+
+/**
+ * Decompress a zstd-encoded ReadableStream.
+ *
+ * Tries, in order: the standard `DecompressionStream("zstd")` (Bun, newer edge
+ * runtimes), then `node:zlib`'s `createZstdDecompress` (Node 22+), then passes
+ * the bytes through unchanged. That last case is a genuine failure mode rather
+ * than a formality — kinetex does not advertise `zstd` in its default
+ * `accept-encoding`, so a server should never choose it, but a caller that sets
+ * the header explicitly (or proxies a response through) can still hit it.
+ */
+function zstdDecompressStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+  if (typeof DecompressionStream !== "undefined") {
+    try {
+      // "zstd" is a real CompressionFormat at runtime but is not yet in the
+      // TypeScript lib union, so it is asserted here rather than widened.
+      const Ctor = DecompressionStream as unknown as new (
+        format: string,
+      ) => TransformStream<Uint8Array, Uint8Array>;
+      return stream.pipeThrough(new Ctor("zstd"));
+    } catch {
+      // Format not recognised by this runtime — try node:zlib below.
+    }
+  }
+
+  if (!isNodeRuntime()) return stream;
+
+  // node:zlib gained zstd in Node 22; older versions have no such export.
+  return nodeZlibDecompressStream(stream, (zlib) => {
+    const create = (zlib as { createZstdDecompress?: () => import("node:stream").Duplex })
+      .createZstdDecompress;
+    if (typeof create !== "function") {
+      throw new Error("zstd decompression is not available in this Node.js version");
+    }
+    return create();
   });
 }
 
@@ -785,7 +975,7 @@ export async function* readNDJSON<T = unknown>(
     while (true) {
       if (options.signal?.aborted) break;
 
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithAbort(reader, options.signal);
       if (done) {
         // Process remaining buffer
         const trimmed = buffer.trim();
@@ -859,6 +1049,12 @@ export async function* readJSONStream<T = unknown>(
   let depth = 0;
   let buffer = "";
   let startIdx = -1;
+  // JSON string state for the scan below. Braces and brackets inside a string
+  // are DATA: the counter closed on a lone `}` in a value, cut the object in
+  // half, and reported both halves as parse errors — so the object was
+  // silently dropped. `{"note":"use } to close"}` yielded nothing at all.
+  let inString = false;
+  let escaped = false;
 
   const flushBuffer = (): string | null => {
     if (startIdx === -1) return null;
@@ -871,7 +1067,7 @@ export async function* readJSONStream<T = unknown>(
     while (true) {
       if (options.signal?.aborted) break;
 
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithAbort(reader, options.signal);
       if (done) {
         // Try to parse remaining content as final object
         const remaining = flushBuffer();
@@ -892,6 +1088,17 @@ export async function* readJSONStream<T = unknown>(
       for (let i = 0; i < buffer.length; i++) {
         const char = buffer[i]!;
 
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (char === "\\") escaped = true;
+          else if (char === '"') inString = false;
+          continue;
+        }
+        if (char === '"') {
+          inString = true;
+          continue;
+        }
+
         if (char === "{" || char === "[") {
           if (depth === 0) startIdx = i;
           depth++;
@@ -907,6 +1114,12 @@ export async function* readJSONStream<T = unknown>(
               options.onParseError?.(err, objStr);
             }
             buffer = buffer.slice(i + 1);
+            // The consumed object's index must not survive into the next
+            // object: the buffer was resliced underneath it, and a stale
+            // startIdx is an offset into a string it no longer indexes.
+            startIdx = -1;
+            inString = false;
+            escaped = false;
             i = -1;
           }
         }
@@ -1041,7 +1254,9 @@ export class ResponseCache {
     const entry = this.cache.get(key);
 
     if (!entry) return null;
-    if (Date.now() > entry.expiresAt) {
+    // `>=`, not `>`: an entry is expired AT its expiry instant, so
+    // `ttlMs: 0` served a cached response instead of expiring immediately.
+    if (Date.now() >= entry.expiresAt) {
       this.cache.delete(key);
       return null;
     }
@@ -1115,12 +1330,18 @@ export async function diffResponses(a: Response, b: Response): Promise<ResponseD
   const headersAdded: Record<string, string> = {};
   const headersRemoved: Record<string, string> = {};
 
+  // Own-property tests, not `in`. `in` walks the prototype chain, and these
+  // are plain object literals, so a header whose lowercased name is an
+  // `Object.prototype` member read as PRESENT in the other response when it
+  // was absent: a `constructor` header only on `a` came back as
+  // `headersChanged: { constructor: ["yes", null] }` — a removed header
+  // reported as changed-to-nothing, in a field typed `[string, string]`.
   for (const [k, v] of Object.entries(ha)) {
-    if (!(k in hb)) headersRemoved[k] = v;
+    if (!Object.prototype.hasOwnProperty.call(hb, k)) headersRemoved[k] = v;
     else if (hb[k] !== v) headersChanged[k] = [v, hb[k]!];
   }
   for (const [k, v] of Object.entries(hb)) {
-    if (!(k in ha)) headersAdded[k] = v!;
+    if (!Object.prototype.hasOwnProperty.call(ha, k)) headersAdded[k] = v!;
   }
 
   // Body diff (only if both are text)
@@ -1179,7 +1400,10 @@ export async function parseMultipartResponse(response: Response): Promise<Multip
   // Split on boundary
   // offset tracking via start variable
   const findBoundary = (from: number): number => {
-    for (let i = from; i < body.length - boundary.length; i++) {
+    // `<=`, not `<`: the loop needs `i + boundary.length <= body.length`, so
+    // a boundary sitting flush against the end of the body — no trailing
+    // newline at all — was the one position the search could not reach.
+    for (let i = from; i <= body.length - boundary.length; i++) {
       if (body.subarray(i, i + boundary.length).every((b, j) => b === boundary[j])) return i;
     }
     return -1;
@@ -1221,19 +1445,26 @@ export async function parseMultipartResponse(response: Response): Promise<Multip
       }
     }
 
-    const partBytes = body.subarray(start, end - 2); // strip trailing CRLF
-    const crlfPos = findDoubleCRLF(partBytes);
-    if (crlfPos === -1) {
+    // Strip the delimiter that precedes this boundary. It was a blind `- 2`
+    // on the assumption of CRLF, so a bare-LF body lost its last two real
+    // bytes, and a part framed some other way lost them too. Measured on the
+    // same two parts: `end - 2` gave "hell" and "worl".
+    let partEnd = end;
+    if (partEnd >= 2 && body[partEnd - 2] === 0x0d && body[partEnd - 1] === 0x0a) partEnd -= 2;
+    else if (partEnd >= 1 && body[partEnd - 1] === 0x0a) partEnd -= 1;
+
+    const brk = findHeaderBreak(body, start, partEnd);
+    if (!brk) {
       start = end + boundary.length;
       continue;
     }
 
-    const headerBytes = partBytes.subarray(0, crlfPos);
-    const partBody = partBytes.subarray(crlfPos + 4);
+    const headerBytes = body.subarray(start, brk.headerEnd);
+    const partBody = body.subarray(brk.bodyStart, partEnd);
 
     const headerText = new TextDecoder().decode(headerBytes);
     const headers: Record<string, string> = {};
-    for (const line of headerText.split(/\r\n/)) {
+    for (const line of headerText.split(/\r\n|\n/)) {
       const colon = line.indexOf(":");
       if (colon !== -1) {
         headers[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim();
@@ -1252,18 +1483,38 @@ export async function parseMultipartResponse(response: Response): Promise<Multip
   return parts;
 }
 
-function findDoubleCRLF(bytes: Uint8Array): number {
-  for (let i = 0; i < bytes.length - 3; i++) {
+/**
+ * Locate the blank line separating a part's headers from its body, accepting
+ * both CRLF and bare-LF framing.
+ *
+ * The old helper matched `\r\n\r\n` and nothing else, so a multipart body
+ * that used bare LF — non-conformant per RFC 2046, and produced in practice —
+ * parsed as ZERO parts rather than as a slightly-off one: every part failed
+ * the header/body split, each was skipped, and the caller got an empty array
+ * with no error. Both framings are now accepted, and the returned body offset
+ * is the real start of the content either way.
+ */
+function findHeaderBreak(
+  bytes: Uint8Array,
+  from: number,
+  to: number,
+): { headerEnd: number; bodyStart: number } | null {
+  for (let i = from; i < to; i++) {
+    // Bare LF: checked first because in `\r\n\r\n` the byte after the
+    // first LF is CR, so the two rules cannot both match at one position.
+    if (bytes[i] === 0x0a && bytes[i + 1] === 0x0a) {
+      return { headerEnd: i, bodyStart: i + 2 };
+    }
     if (
       bytes[i] === 0x0d &&
       bytes[i + 1] === 0x0a &&
       bytes[i + 2] === 0x0d &&
       bytes[i + 3] === 0x0a
     ) {
-      return i;
+      return { headerEnd: i, bodyStart: i + 4 };
     }
   }
-  return -1;
+  return null;
 }
 
 /**
@@ -1344,9 +1595,15 @@ export function extractServerTiming(headers: Record<string, string>): ServerTimi
       const params = parseParams(segments.slice(1).join(";"));
       const dur = params.get("dur");
 
+      // `Number.isFinite`, not `dur !== undefined`: `parseFloat` returns NaN
+      // for anything non-numeric, and `Server-Timing: x;dur=abc` is a
+      // malformed header a server can send. The NaN went straight into the
+      // metrics array, where it is not a number, fails every comparison, and
+      // vanishes from a chart with nothing to indicate why.
+      const parsed = dur !== undefined ? parseFloat(dur) : NaN;
       return {
         name,
-        duration: dur !== undefined ? parseFloat(dur) : null,
+        duration: Number.isFinite(parsed) ? parsed : null,
         description: params.get("desc") ?? null,
       };
     })
@@ -1388,11 +1645,22 @@ async function readBodyBytes(
       if (options.signal?.aborted) {
         throw new DOMException("Response reading aborted", "AbortError");
       }
-      const { done, value } = await reader.read();
-      if (done) break;
+      const { done, value } = await readWithAbort(reader, options.signal);
+      if (done) {
+        // See readWithAbort: an aborted read also resolves as done.
+        if (options.signal?.aborted) {
+          throw new DOMException("Response reading aborted", "AbortError");
+        }
+        break;
+      }
       chunks.push(value);
     }
   } finally {
+    // Cancel before releasing when we are bailing out, so the unread remainder
+    // of the body is discarded rather than left buffered on a released lock.
+    if (options.signal?.aborted) {
+      await reader.cancel("aborted").catch(() => {});
+    }
     reader.releaseLock();
   }
 
@@ -1405,7 +1673,7 @@ function applySizeLimit(
   limit: SizeLimitConfig,
   signal?: AbortSignal,
 ): ReadableStream<Uint8Array> {
-  const onExceed = limit.onExceed ?? "throw";
+  const onExceed = normaliseOnExceed(limit.onExceed);
   let bytesRead = 0;
 
   return new ReadableStream<Uint8Array>({
@@ -1418,8 +1686,15 @@ function applySizeLimit(
             controller.error(new DOMException("Response reading aborted", "AbortError"));
             return;
           }
-          const { done, value } = await reader.read();
+          const { done, value } = await readWithAbort(reader, signal);
           if (done) {
+            // See readWithAbort: an aborted read also resolves as done, and
+            // here the caller must see the error rather than a clean close.
+            if (signal?.aborted) {
+              await reader.cancel("aborted").catch(() => {});
+              controller.error(new DOMException("Response reading aborted", "AbortError"));
+              return;
+            }
             controller.close();
             break;
           }
@@ -1461,7 +1736,17 @@ function validateContentType(actual: string | null, expected: string, url: strin
   if (!actual) throw new ContentTypeError(expected, "(none)", url);
   const normalizedActual = actual.split(";")[0]?.trim().toLowerCase() ?? "";
   const normalizedExpected = expected.split(";")[0]?.trim().toLowerCase() ?? "";
-  if (!normalizedActual.startsWith(normalizedExpected)) {
+  // Media-type equality, not a string prefix. `startsWith` accepted
+  // `text/plaintext` for `text/plain` and `application/json-seq` for
+  // `application/json` — an `expectedContentType` set to narrow the parse to
+  // one format accepted every format whose name merely begins with it. A bare
+  // top-level type still matches the whole tree, which is the one prefix case
+  // that means something: `image` for `image/png`.
+  const actualType = normalizedActual.split("/")[0] ?? "";
+  const matches =
+    normalizedActual === normalizedExpected ||
+    (normalizedExpected.indexOf("/") === -1 && actualType === normalizedExpected);
+  if (!matches) {
     throw new ContentTypeError(expected, actual, url);
   }
 }

@@ -148,6 +148,8 @@ export type ErrorInterceptorResult = void | undefined | InterceptorResponse;
 export type InterceptorFn<T = unknown> = (ctx: InterceptorContext) => Promise<T> | T;
 
 import { getAuthFingerprint } from "./cache.ts";
+import { KinetexError } from "./types.ts";
+import { parseHTTPDate } from "./headers.ts";
 
 /** A request-phase interceptor function. */
 export type RequestInterceptorFn = (
@@ -645,7 +647,9 @@ export function createRetryInterceptor(config: Partial<RetryConfig> = {}): {
     const exp = cfg.baseDelayMs * Math.pow(2, attempt - 1);
     const capped = Math.min(exp, cfg.maxDelayMs);
     const jitterMs = capped * cfg.jitter * Math.random();
-    return Math.floor(capped + jitterMs);
+    // `maxDelayMs` is documented as a hard maximum, so it has to be applied
+    // after jitter too — capping first let jitter push the delay past it.
+    return Math.min(Math.floor(capped + jitterMs), cfg.maxDelayMs);
   }
 
   function shouldRetryCtx(ctx: InterceptorContext): boolean {
@@ -662,8 +666,12 @@ export function createRetryInterceptor(config: Partial<RetryConfig> = {}): {
     const ra = ctx.response?.headers["retry-after"] ?? ctx.response?.headers["Retry-After"];
     if (!ra) return null;
     if (/^\d+$/.test(ra.trim())) return parseInt(ra, 10) * 1000;
-    const ms = Date.parse(ra);
-    if (!isNaN(ms)) return Math.max(0, ms - Date.now());
+    // Only the three HTTP-date formats count. Raw `Date.parse` is lenient to a
+    // fault here: it happily accepts "1.5", "-5" and "+5" as ancient dates, so a
+    // malformed `Retry-After` resolved to ~0ms and silently cancelled the
+    // back-off instead of falling through to the exponential delay.
+    const ms = parseHTTPDate(ra);
+    if (ms !== null) return Math.max(0, ms - Date.now());
     return null;
   }
 
@@ -973,6 +981,12 @@ export interface LogEntry {
   attempt: number;
   /** Error message (null for request/response entries) */
   error: string | null;
+  /**
+   * Request headers, with the values of every name in `LoggingConfig.redactHeaders`
+   * replaced by `**REDACTED**`. The option was previously accepted but never
+   * applied, so header redaction silently did nothing.
+   */
+  headers: Record<string, string>;
 }
 
 export interface LoggingConfig {
@@ -1036,6 +1050,7 @@ export function createLoggingInterceptor(config: Partial<LoggingConfig> = {}): {
       durationMs: type !== "request" ? now() - ctx.startedAt : null,
       attempt: ctx.attempt,
       error: ctx.error instanceof Error ? ctx.error.message : null,
+      headers: redactHeaders(ctx.request.headers ?? {}),
     };
   }
 
@@ -1056,7 +1071,6 @@ export function createLoggingInterceptor(config: Partial<LoggingConfig> = {}): {
     cfg.logger(makeEntry("error", ctx));
   };
 
-  void redactHeaders; // used externally; suppress unused warning
   return { requestInterceptor, responseInterceptor, errorInterceptor };
 }
 
@@ -1367,6 +1381,19 @@ export function createRateLimitInterceptor(
   config: Partial<RateLimitConfig> = {},
 ): RequestInterceptorFn {
   const cfg = { ...RATE_LIMIT_DEFAULTS, ...config };
+  // A non-positive `limit` (or a non-positive `windowMs`) has no valid token-bucket
+  // state: the refill interval `windowMs / limit` becomes `Infinity` or `NaN`,
+  // which `setInterval` turns into a ~1ms busy-poll, and every request either
+  // throws or queues forever. Reject it up front rather than degrading silently.
+  if (!Number.isFinite(cfg.limit) || cfg.limit < 1) {
+    throw new RangeError(`rateLimit.limit must be a finite number >= 1, got ${cfg.limit}`);
+  }
+  if (!Number.isFinite(cfg.windowMs) || cfg.windowMs < 1) {
+    throw new RangeError(`rateLimit.windowMs must be a finite number >= 1, got ${cfg.windowMs}`);
+  }
+  if (!Number.isFinite(cfg.maxQueue) || cfg.maxQueue < 0) {
+    throw new RangeError(`rateLimit.maxQueue must be a finite number >= 0, got ${cfg.maxQueue}`);
+  }
   let tokens = cfg.limit;
   let lastRefill = now();
   const pending: Array<() => void> = [];
@@ -1428,6 +1455,246 @@ export class RateLimitError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "RateLimitError";
+  }
+}
+
+// ============================================================================
+// §11b  BUILT-IN: CONCURRENCY LIMITER
+// ============================================================================
+
+/**
+ * Configuration for the concurrency limiter (a bulkhead).
+ */
+export interface ConcurrencyLimitConfig {
+  /** Maximum number of requests in flight at once. Must be >= 1. */
+  maxConcurrent: number;
+  /** If true, queue excess requests instead of rejecting (default: true) */
+  queue: boolean;
+  /**
+   * Max queue depth before rejecting (default: 100).
+   *
+   * Must be a non-negative integer, or `Infinity` for an unbounded queue.
+   */
+  maxQueue: number;
+}
+
+/** Defaults for {@link ConcurrencyLimitConfig}. */
+export const CONCURRENCY_DEFAULTS: ConcurrencyLimitConfig = {
+  maxConcurrent: 10,
+  queue: true,
+  maxQueue: 100,
+};
+
+/**
+ * Raised when the concurrency limit is reached and the request cannot be
+ * queued (or queueing is disabled).
+ *
+ * Distinct from {@link RateLimitError}: a rate limit bounds requests per unit
+ * of _time_, this bounds requests in flight.
+ */
+export class ConcurrencyLimitError extends Error {
+  /** Machine-readable error code identifying this as a concurrency error */
+  readonly code = "ECONCURRENCY";
+  constructor(message: string) {
+    super(message);
+    this.name = "ConcurrencyLimitError";
+  }
+}
+
+interface ConcurrencyWaiter {
+  resolve: () => void;
+  reject: (err: Error) => void;
+  onAbort: (() => void) | null;
+  /** Signal the `onAbort` listener is attached to, for explicit detachment. */
+  signal: AbortSignal | null;
+}
+
+/**
+ * Detach a waiter's abort listener.
+ *
+ * Nulling `onAbort` alone is not enough: a caller-supplied signal usually
+ * outlives a single request, so the `{ once: true }` listener would stay
+ * attached forever and accumulate one closure per queued request.
+ */
+function detachAbortListener(waiter: ConcurrencyWaiter): void {
+  if (waiter.onAbort && waiter.signal) {
+    waiter.signal.removeEventListener("abort", waiter.onAbort);
+  }
+  waiter.onAbort = null;
+  waiter.signal = null;
+}
+
+/**
+ * A counting semaphore bounding how many requests may be in flight at once.
+ *
+ * The rate limiter is a token bucket: it releases a token at _dispatch_, so
+ * `limit: 100` per minute still permits 100 simultaneous sockets. This bounds
+ * concurrency instead — a permit is held for the whole request (including its
+ * retries) and returned only when it settles.
+ *
+ * Permits are handed directly to the next waiter on release, so releasing
+ * never transiently overshoots {@link ConcurrencyLimitConfig.maxConcurrent}.
+ *
+ * @example
+ * ```ts
+ * const limiter = new ConcurrencyLimiter({ maxConcurrent: 4 });
+ * await limiter.acquire();
+ * try {
+ *   await doWork();
+ * } finally {
+ *   limiter.release();
+ * }
+ * ```
+ */
+export class ConcurrencyLimiter {
+  private readonly cfg: ConcurrencyLimitConfig;
+  private active = 0;
+  private peak = 0;
+  private readonly waiters: ConcurrencyWaiter[] = [];
+
+  /**
+   * @param config - Partial configuration; omitted fields use {@link CONCURRENCY_DEFAULTS}.
+   * @throws {RangeError} If `maxConcurrent` is not a finite number >= 1, or
+   *   `maxQueue` is neither a non-negative integer nor `Infinity`.
+   */
+  constructor(config: Partial<ConcurrencyLimitConfig> = {}) {
+    this.cfg = { ...CONCURRENCY_DEFAULTS, ...config };
+    if (!Number.isFinite(this.cfg.maxConcurrent) || this.cfg.maxConcurrent < 1) {
+      throw new RangeError(
+        `concurrencyLimit.maxConcurrent must be a finite number >= 1, received ${String(this.cfg.maxConcurrent)}`,
+      );
+    }
+    // The cap is tested as `waiters.length >= maxQueue`, so `NaN` makes every
+    // comparison false and the queue stops bounding anything: each request then
+    // parks a waiter holding its promise, signal and closures, with nothing
+    // ever rejected. A negative value is the opposite failure — the first
+    // overflow is refused, so a configured depth of -1 silently means 0.
+    if (
+      this.cfg.maxQueue !== Number.POSITIVE_INFINITY &&
+      (!Number.isInteger(this.cfg.maxQueue) || this.cfg.maxQueue < 0)
+    ) {
+      throw new RangeError(
+        `concurrencyLimit.maxQueue must be a non-negative integer or Infinity, received ${String(this.cfg.maxQueue)}`,
+      );
+    }
+  }
+
+  /** Number of permits currently held. */
+  get inFlight(): number {
+    return this.active;
+  }
+
+  /** Number of requests currently waiting for a permit. */
+  get waiting(): number {
+    return this.waiters.length;
+  }
+
+  /** Highest concurrent in-flight count observed. */
+  get highWaterMark(): number {
+    return this.peak;
+  }
+
+  /**
+   * Take a permit, waiting in the queue if the limit is saturated.
+   *
+   * @param signal - Optional abort signal; aborting while queued removes the
+   *   waiter and rejects without ever consuming a permit.
+   * @throws {ConcurrencyLimitError} If queueing is disabled or the queue is full.
+   * @throws {KinetexError} With code `EABORT` if `signal` aborts while queued —
+   *   the same contract every other abort path in the library offers, so
+   *   `err.code === "EABORT"` and `err.isAbort` work here too.
+   */
+  acquire(signal?: AbortSignal | null): Promise<void> {
+    // Checked before anything else, so the answer does not depend on whether a
+    // permit happened to be free. This used to sit only inside the enqueue
+    // path, which gave the same call three different answers: on an idle pool
+    // the fast path granted the permit and dropped the abort entirely; with
+    // queueing disabled or the queue full, the abort was reported as a queue
+    // overflow, so a caller branching on `err.code === "EABORT"` treated a
+    // cancelled request as a capacity failure.
+    if (signal?.aborted) {
+      // Refused before a permit is taken, so none can leak.
+      return Promise.reject(new KinetexError("Concurrency acquire aborted", "EABORT"));
+    }
+
+    if (this.active < this.cfg.maxConcurrent) {
+      this.active++;
+      if (this.active > this.peak) this.peak = this.active;
+      return Promise.resolve();
+    }
+
+    if (!this.cfg.queue) {
+      return Promise.reject(
+        new ConcurrencyLimitError(
+          `Concurrency limit reached (${this.cfg.maxConcurrent} in flight) and queueing is disabled`,
+        ),
+      );
+    }
+    if (this.waiters.length >= this.cfg.maxQueue) {
+      return Promise.reject(
+        new ConcurrencyLimitError(`Concurrency queue is full (${this.cfg.maxQueue} waiting)`),
+      );
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      const waiter: ConcurrencyWaiter = { resolve, reject, onAbort: null, signal: null };
+
+      if (signal) {
+        if (signal.aborted) {
+          // Redundant with the check at the top of `acquire`, and kept as
+          // defence in depth: nothing awaits between the two, but an `abort`
+          // event never fires on an already-aborted signal, so if this branch
+          // were ever the only check the abort would be lost silently.
+          reject(new KinetexError("Concurrency acquire aborted", "EABORT"));
+          return;
+        }
+        waiter.onAbort = () => {
+          const idx = this.waiters.indexOf(waiter);
+          if (idx !== -1) this.waiters.splice(idx, 1);
+          reject(new KinetexError("Concurrency acquire aborted", "EABORT"));
+        };
+        waiter.signal = signal;
+        signal.addEventListener("abort", waiter.onAbort, { once: true });
+      }
+
+      this.waiters.push(waiter);
+    });
+  }
+
+  /**
+   * Return a permit taken by {@link acquire}.
+   *
+   * The permit is handed to the longest-waiting caller, so `inFlight` never
+   * exceeds `maxConcurrent`. Releasing with nothing held is a no-op.
+   */
+  release(): void {
+    if (this.active === 0) return;
+
+    const next = this.waiters.shift();
+    if (!next) {
+      this.active--;
+      return;
+    }
+
+    // Transfer the permit: `active` is intentionally left unchanged.
+    detachAbortListener(next);
+    next.resolve();
+  }
+
+  /**
+   * Drop every queued waiter, rejecting them with `reason`.
+   *
+   * Used by {@link Kinetex.destroy} so a shutdown cannot leave callers parked
+   * on a queue that will never drain.
+   *
+   * @param reason - Error to reject waiters with.
+   */
+  drain(reason: Error = new ConcurrencyLimitError("Client destroyed")): void {
+    const pending = this.waiters.splice(0, this.waiters.length);
+    for (const w of pending) {
+      detachAbortListener(w);
+      w.reject(reason);
+    }
   }
 }
 
@@ -1545,8 +1812,11 @@ export function createHARInterceptor(): {
       "application/octet-stream";
 
     const body = ctx.response.body;
-    const bSize =
-      body instanceof Uint8Array ? body.byteLength : typeof body === "string" ? body.length : 0;
+    // Byte length, not `.length`: a non-ASCII response body was under-reported in
+    // both `content.size` and `bodySize` by one byte per accented character and by
+    // three bytes per astral character. `computeBodySize` returns -1 for a body it
+    // cannot size, which HAR reports as 0 here (unchanged for those types).
+    const bSize = Math.max(0, computeBodySize(body));
 
     entries.push({
       startedDateTime: new Date(Date.now() - total).toISOString(),
@@ -1720,7 +1990,12 @@ function sleep(ms: number): Promise<void> {
 /** @internal Compute byte size of a request/response body. Exported for testing. */
 export function computeBodySize(body: BodyInit | string | Uint8Array | null): number {
   if (!body) return 0;
-  if (typeof body === "string") return body.length;
+  if (typeof body === "string") {
+    // UTF-8 byte length, not `.length` (UTF-16 code units). HAR `bodySize` and the
+    // metrics byte counters are byte counts, and a non-ASCII body was under-reported
+    // by 2 bytes per astral character and 1 per Latin-1 accented character.
+    return new TextEncoder().encode(body).length;
+  }
   if (body instanceof Uint8Array) return body.byteLength;
   if (body instanceof ArrayBuffer) return body.byteLength;
   return -1;

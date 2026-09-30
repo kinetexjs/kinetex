@@ -203,15 +203,38 @@ await test("retry with status 500 exhausts retries", async () => {
   const retry = createRetryInterceptor({
     maxRetries: 1,
     baseDelayMs: 10,
+    jitter: 0,
     retryStatuses: [500, 503],
   });
   m.useResponse(retry.responseInterceptor);
   m.useError(retry.errorInterceptor);
+  // In-process dispatcher so the dispatch count is exact and the test does not
+  // depend on a live 500. The old version asserted only the final status, which
+  // is 500 whether the retry fired once or not at all.
+  let calls = 0;
   const res = await m.execute(
     { url: "https://httpbin.org/status/500", method: "GET", headers: {} },
-    async () => await bin.get("/status/500", { throwOnError: false, retry: false }),
+    async () => {
+      calls++;
+      return {
+        status: 500,
+        statusText: "Internal Server Error",
+        headers: {},
+        data: { attempt: calls },
+        rawBody: null,
+        url: "",
+        cached: false,
+        redirected: false,
+        httpVersion: "HTTP/1.1",
+        durationMs: 0,
+        request: null as any,
+        attempt: calls,
+      } as any;
+    },
   );
   assert.equal(res.status, 500);
+  assert.equal(calls, 2, "maxRetries: 1 means exactly one retry, i.e. two dispatches");
+  assert.equal(res.data.attempt, 2, "the final response must come from the second dispatch");
 });
 
 // ── TIMEOUT INTERCEPTOR with real HTTP ───────────────────────────────────
@@ -233,14 +256,27 @@ await test("timeout on fast request", async () => {
 suite("Auth interceptor");
 await test("auth injects Bearer token", async () => {
   const m = new InterceptorManager();
-  const authSuite = createAuthInterceptor({ type: "bearer", token: "test-token" });
+  // `createAuthInterceptor` takes a bare `{ getToken }` provider, NOT the
+  // client-level AuthConfig. The old test passed `{ type, token }`, which is
+  // silently ignored, so `getToken` defaulted to `() => null` and no header was
+  // ever injected — the test only checked the status of an untouched request.
+  const authSuite = createAuthInterceptor({ getToken: () => "test-token" });
   m.useRequest(authSuite.requestInterceptor);
   m.useResponse(authSuite.responseInterceptor);
+  // The old version asserted only `status === 200`, which the plain httpbin call
+  // satisfies whether or not the interceptor ever ran. Capture the request the
+  // dispatcher actually receives and assert the token is on it.
+  let seen: Record<string, string> | null = null;
   const res = await m.execute(
     { url: "https://httpbin.org/headers", method: "GET", headers: {} },
-    async () => await bin.get<{ headers: Record<string, string> }>("/headers"),
+    async (req) => {
+      seen = req.headers;
+      return await bin.get<{ headers: Record<string, string> }>("/headers");
+    },
   );
   assert.equal(res.status, 200);
+  assert.ok(seen, "the dispatcher must have been called");
+  assert.equal(seen.authorization, "Bearer test-token");
 });
 
 // ── LOGGING INTERCEPTOR with real HTTP ───────────────────────────────────
@@ -319,6 +355,8 @@ await test("dedupe coalesces concurrent GETs", async () => {
     m.execute({ url: "https://httpbin.org/uuid", method: "GET", headers: {} }, dispatcher),
   ]);
   assert.equal((a as any).data.uuid, (b as any).data.uuid);
+  // Both responses are equal, but only if the leader's promise was shared.
+  assert.equal(callCount, 1, "two concurrent GETs of the same URL must dispatch once");
 });
 
 // ── CACHE INTERCEPTOR with real HTTP ─────────────────────────────────────
@@ -338,6 +376,14 @@ await test("cache interceptor caches responses", async () => {
     dispatcher,
   );
   assert.equal(callCount, 1);
+  // A single execute cannot distinguish "cached" from "never cached", so make a
+  // second one: the dispatcher must not run again and the hit must be flagged.
+  const r2 = await m.execute(
+    { url: "https://httpbin.org/uuid", method: "GET", headers: {} },
+    dispatcher,
+  );
+  assert.equal(callCount, 1, "the second execute must be served from the cache");
+  assert.equal(r1.data?.uuid, r2.data?.uuid, "the cached response must be replayed");
 });
 
 // ── RATE-LIMIT INTERCEPTOR with real HTTP ────────────────────────────────
@@ -551,33 +597,87 @@ await test("cache interceptor caches responses", async () => {
   assert.ok(r1.data?.uuid);
 });
 
-// Cache SWR: stale entry within stale-while-revalidate window
-await test("cache SWR serves stale then revalidates", async () => {
-  const cache = createCacheInterceptor({ ttlMs: 5000 });
+// Cache SWR: a stale entry is revalidated with a conditional request, and the
+// stale body is only restored when the server answers 304. Note this
+// interceptor does NOT serve the stale copy blind — the request always goes out.
+await test("cache SWR revalidates and restores the stale body on 304", async () => {
+  const cache = createCacheInterceptor({ defaultTtlMs: 60_000 });
   const m = new InterceptorManager();
   m.useRequest(cache.requestInterceptor);
   m.useResponse(cache.responseInterceptor);
-  const dispatcher = async () => {
-    const res = await bin.get("/get");
+
+  let dispatches = 0;
+  const seenIfNoneMatch: Array<string | undefined> = [];
+  const dispatcher = async (req: any) => {
+    dispatches++;
+    seenIfNoneMatch.push(req.headers["if-none-match"]);
+    if (dispatches === 1) {
+      return {
+        status: 200,
+        statusText: "OK",
+        headers: {
+          etag: '"v1"',
+          "cache-control": "public, max-age=1, stale-while-revalidate=3600",
+        },
+        data: { v: 1 },
+        rawBody: null,
+        url: "https://x.test/v",
+        cached: false,
+        redirected: false,
+        httpVersion: "HTTP/1.1",
+        durationMs: 0,
+        request: req,
+        attempt: 1,
+      } as any;
+    }
     return {
-      ...res,
-      headers: {
-        ...res.headers,
-        "cache-control": "public, max-age=1, stale-while-revalidate=3600",
-      },
-    };
+      status: 304,
+      statusText: "Not Modified",
+      headers: { etag: '"v1"' },
+      data: null,
+      rawBody: null,
+      url: "https://x.test/v",
+      cached: false,
+      redirected: false,
+      httpVersion: "HTTP/1.1",
+      durationMs: 0,
+      request: req,
+      attempt: 1,
+    } as any;
   };
+
   const r1 = await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
+    { url: "https://x.test/v", method: "GET", headers: {} } as any,
     dispatcher,
   );
   assert.equal(r1.status, 200);
-  await new Promise((r) => setTimeout(r, 1500));
+  assert.equal(dispatches, 1, "the first call is always a miss");
+  assert.equal(seenIfNoneMatch[0], undefined, "nothing is cached yet, so no conditional header");
+
+  // max-age=1 has elapsed but the entry is still inside the
+  // stale-while-revalidate window, so it is revalidated rather than discarded.
+  await new Promise((r) => setTimeout(r, 1200));
   const r2 = await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
+    { url: "https://x.test/v", method: "GET", headers: {} } as any,
     dispatcher,
   );
-  assert.equal(r2.status, 200);
+  assert.equal(dispatches, 2, "a stale-but-revalidatable entry must be revalidated, not dropped");
+  assert.equal(
+    seenIfNoneMatch[1],
+    '"v1"',
+    "revalidation must send if-none-match from the stored etag",
+  );
+  assert.equal(r2.status, 200, "a 304 with a stale entry must be restored to the cached response");
+  assert.deepEqual(r2.data, { v: 1 }, "the stale body must be replayed");
+
+  // The 304 refresh reset createdAt, so the entry is fresh again (max-age=1
+  // from the stale entry's own cache-control) and must be served from cache.
+  const r3 = await m.execute(
+    { url: "https://x.test/v", method: "GET", headers: {} } as any,
+    dispatcher,
+  );
+  assert.equal(dispatches, 2, "the refreshed entry is fresh and must not be refetched");
+  assert.deepEqual(r3.data, { v: 1 });
 });
 
 // Cache 304: mock 304 response — the response returns 304 (restoration is internal)
@@ -620,7 +720,10 @@ await test("cache 304 response is handled", async () => {
     { url: "https://httpbin.org/get", method: "GET", headers: {} },
     dispatcher,
   );
-  // A 304 without a matching cached entry is surfaced as-is (no stale restoration)
+  // `max-age=0` means the response is never stored (the interceptor skips
+  // ttlMs <= 0 entirely), so there is no stale entry to restore from and the 304
+  // is surfaced as-is. This is the "server answered 304 with nothing to restore"
+  // path; the real revalidation path is covered by the SWR test above.
   assert.equal(r2.status, 304);
   assert.equal(r2.cached, false);
   assert.equal(callNum, 2, "the second execute must revalidate rather than serve the entry");
@@ -732,6 +835,9 @@ await test("HAR handles Uint8Array request body", async () => {
   const log = har.getHAR();
   assert.equal(log.entries.length, 1);
   assert.equal(log.entries[0].request.method, "POST");
+  // `{"a":1}` is 7 UTF-8 bytes. Asserting only the method is what let the
+  // string-length-instead-of-byte-length bug through.
+  assert.equal(log.entries[0].request.bodySize, 7);
 });
 await test("HAR handles ArrayBuffer request body", async () => {
   const har = createHARInterceptor();
@@ -751,6 +857,7 @@ await test("HAR handles ArrayBuffer request body", async () => {
   const log = har.getHAR();
   assert.equal(log.entries.length, 1);
   assert.equal(log.entries[0].request.method, "POST");
+  assert.equal(log.entries[0].request.bodySize, 7, '`{"b":2}` is 7 UTF-8 bytes');
 });
 await test("HAR handles string request body", async () => {
   const har = createHARInterceptor();
@@ -770,6 +877,7 @@ await test("HAR handles string request body", async () => {
   const log = har.getHAR();
   assert.equal(log.entries.length, 1);
   assert.equal(log.entries[0].request.method, "POST");
+  assert.equal(log.entries[0].request.bodySize, 12, '"plain string" is 12 UTF-8 bytes');
 });
 
 // ── Content-Type uppercase fallback (line 1294) ─────────────────────────
@@ -905,8 +1013,228 @@ await test("eject across types", () => {
   assert.equal(m.errorCount, 1);
 });
 
+// ── REGRESSION: defects found by the strictest-assertion audit ────────
+suite("Regression: audit fixes");
+
+// Every case below drives the interceptor directly with a synthetic context,
+// so it is exact and independent of the network.
+
+function fakeRequest(over: Record<string, unknown> = {}): any {
+  return {
+    url: "https://x.test/a",
+    method: "GET",
+    headers: {},
+    body: null,
+    signal: null,
+    meta: {},
+    ...over,
+  };
+}
+function fakeResponse(over: Record<string, unknown> = {}): any {
+  return {
+    status: 200,
+    statusText: "OK",
+    headers: {},
+    data: null,
+    rawBody: null,
+    url: "https://x.test/a",
+    cached: false,
+    redirected: false,
+    httpVersion: "HTTP/1.1",
+    durationMs: 0,
+    request: fakeRequest(),
+    attempt: 1,
+    ...over,
+  };
+}
+
+await test("regression: Retry-After accepts only delta-seconds or an HTTP-date", async () => {
+  // `Date.parse` is lenient enough to read "1.5", "-5" and "+5" as ancient dates.
+  // Those resolved to ~0ms, silently skipping the back-off instead of falling
+  // through to the exponential delay.
+  const delayFor = async (retryAfter: string): Promise<number> => {
+    const seen: number[] = [];
+    const { responseInterceptor } = createRetryInterceptor({
+      maxRetries: 1,
+      baseDelayMs: 120,
+      jitter: 0,
+      maxDelayMs: 60_000,
+      onRetry: (_ctx, delayMs) => seen.push(delayMs),
+    });
+    await responseInterceptor({
+      attempt: 1,
+      error: null,
+      request: fakeRequest(),
+      startedAt: Date.now(),
+      response: fakeResponse({ status: 503, headers: { "retry-after": retryAfter } }),
+      store: new Map(),
+    } as any);
+    return seen[0]!;
+  };
+
+  // Valid delta-seconds is honoured.
+  assert.equal(await delayFor("2"), 2000);
+  assert.equal(await delayFor("  7  "), 7000);
+  // A valid HTTP-date that is already in the past means "retry now" -> 0.
+  assert.equal(await delayFor("Wed, 21 Oct 2015 07:28:00 GMT"), 0);
+  // Malformed values must be ignored so the exponential back-off still runs.
+  for (const bad of ["1.5", "-5", "+5", "0.5", "garbage", "5s", "2026-13-45"]) {
+    assert.equal(
+      await delayFor(bad),
+      120,
+      `Retry-After ${JSON.stringify(bad)} is not a valid header and must fall back to baseDelayMs`,
+    );
+  }
+});
+
+await test("regression: maxDelayMs is a hard cap even with jitter", async () => {
+  // jitter: 1 is the worst case — uncapped it would be base * (1 + 1) = 20000.
+  for (let i = 0; i < 25; i++) {
+    const seen: number[] = [];
+    const retry = createRetryInterceptor({
+      maxRetries: 5,
+      baseDelayMs: 10_000,
+      maxDelayMs: 500,
+      jitter: 1,
+      onRetry: (_ctx, delayMs) => seen.push(delayMs),
+    });
+    await retry.responseInterceptor({
+      attempt: 3,
+      error: null,
+      request: fakeRequest(),
+      startedAt: Date.now(),
+      response: fakeResponse({ status: 503 }),
+      store: new Map(),
+    } as any);
+    assert.ok(seen[0]! <= 500, `jitter pushed the delay to ${seen[0]}ms, past maxDelayMs=500`);
+  }
+});
+
+await test("regression: logging redacts the configured header names", async () => {
+  const entries: any[] = [];
+  const logging = createLoggingInterceptor({
+    logger: (e) => entries.push(e),
+    redactHeaders: ["Authorization", "X-Api-Key"],
+  });
+  const m = new InterceptorManager();
+  m.useRequest(logging.requestInterceptor);
+  await m.execute(
+    fakeRequest({
+      headers: {
+        authorization: "Bearer super-secret",
+        "X-Api-Key": "key-123",
+        "content-type": "application/json",
+      },
+    }),
+    async () => fakeResponse(),
+  );
+  assert.equal(entries.length, 1);
+  const hdrs = entries[0].headers;
+  assert.deepEqual(hdrs, {
+    authorization: "**REDACTED**",
+    "X-Api-Key": "**REDACTED**",
+    "content-type": "application/json",
+  });
+  // The secret must not survive anywhere in the serialised entry.
+  assert.ok(!JSON.stringify(entries[0]).includes("super-secret"));
+  assert.ok(!JSON.stringify(entries[0]).includes("key-123"));
+});
+
+await test("regression: logging redacts by default and on the error phase", async () => {
+  const entries: any[] = [];
+  const logging = createLoggingInterceptor({ logger: (e) => entries.push(e) });
+  const m = new InterceptorManager();
+  m.useRequest(logging.requestInterceptor);
+  m.useError(logging.errorInterceptor);
+  await m
+    .execute(fakeRequest({ headers: { cookie: "session=abc", "set-cookie": "a=b" } }), async () => {
+      throw new Error("boom");
+    })
+    .catch(() => {});
+  assert.equal(entries.length, 2, "one request entry and one error entry");
+  for (const e of entries) {
+    assert.equal(e.headers.cookie, "**REDACTED**");
+    assert.equal(e.headers["set-cookie"], "**REDACTED**");
+  }
+  assert.ok(!JSON.stringify(entries).includes("session=abc"));
+});
+
+await test("regression: computeBodySize reports UTF-8 bytes, not UTF-16 units", () => {
+  assert.equal(computeBodySize("hello"), 5);
+  assert.equal(computeBodySize("héllo"), 6, "é is 2 bytes in UTF-8");
+  assert.equal(computeBodySize("😀"), 4, "an astral character is 4 bytes and 2 units");
+  assert.equal(computeBodySize("日本語"), 9, "each CJK character is 3 bytes");
+  assert.equal(computeBodySize(""), 0);
+  assert.equal(computeBodySize(null), 0);
+  assert.equal(computeBodySize(new Uint8Array([1, 2, 3])), 3);
+  assert.equal(computeBodySize(new ArrayBuffer(10)), 10);
+  assert.equal(computeBodySize(new ReadableStream() as any), -1);
+});
+
+await test("regression: HAR response bodySize counts UTF-8 bytes", async () => {
+  const har = createHARInterceptor();
+  const m = new InterceptorManager();
+  m.useRequest(har.requestInterceptor);
+  m.useResponse(har.responseInterceptor);
+  await m.execute(fakeRequest({ url: "https://x.test/ja" }), async () =>
+    fakeResponse({ status: 200, body: "日本語" } as any),
+  );
+  const entry = har.getHAR().entries[0]!;
+  assert.equal(entry.response.bodySize, 9);
+  assert.equal(entry.response.content.size, 9);
+  assert.equal(entry.response.content.text, "日本語");
+});
+
+await test("regression: s-maxage never sets the stored TTL", async () => {
+  const cache = createCacheInterceptor({ defaultTtlMs: 12_345, maxEntries: 10 });
+  const m = new InterceptorManager();
+  m.useRequest(cache.requestInterceptor);
+  m.useResponse(cache.responseInterceptor);
+  const ttlFor = async (cc: string): Promise<number> => {
+    await m.execute(fakeRequest(), async () => fakeResponse({ headers: { "cache-control": cc } }));
+    const e = cache.store.get("GET:https://x.test/a")!;
+    cache.store.clear();
+    // The cache stamps entries from a fractional monotonic clock, so the delta
+    // is a float; the TTL itself is exact.
+    return Math.round(e.expiresAt - e.createdAt);
+  };
+  // `s-maxage` is a shared-cache directive and must not become a browser TTL.
+  assert.equal(await ttlFor("s-maxage=600"), 12_345);
+  assert.equal(await ttlFor("public, s-maxage=600"), 12_345);
+  // A real `max-age` next to it still wins.
+  assert.equal(await ttlFor("max-age=10, s-maxage=9999"), 10_000);
+  assert.equal(await ttlFor("max-age=60"), 60_000);
+});
+
+await test("regression: rate-limit rejects a config with no valid bucket", () => {
+  // limit: 0 made the refill interval `windowMs / 0` = Infinity, which
+  // setInterval clamped to ~1ms -- a busy-poll that also never released waiters.
+  for (const bad of [0, -1, NaN, Infinity]) {
+    assert.throws(
+      () => createRateLimitInterceptor({ limit: bad }),
+      RangeError,
+      `limit ${bad} must be rejected`,
+    );
+  }
+  for (const bad of [0, -1, NaN]) {
+    assert.throws(
+      () => createRateLimitInterceptor({ limit: 1, windowMs: bad }),
+      RangeError,
+      `windowMs ${bad} must be rejected`,
+    );
+  }
+  assert.throws(
+    () => createRateLimitInterceptor({ limit: 1, windowMs: 1000, maxQueue: -1 }),
+    RangeError,
+  );
+  // A valid config still constructs.
+  assert.equal(typeof createRateLimitInterceptor({ limit: 1, windowMs: 1000 }), "function");
+});
+
 // ── SUMMARY ──────────────────────────────────────────────────────────────
-const total = passed + failed;
+// `total` used to be snapshotted here, before the last few tests in the
+// file had run, so the summary could print a pass count larger than its own
+// denominator (e.g. "109/100 passed"). It is computed at print time now.
 console.log(`\n── RESULTS: ${passed} passed, ${failed} failed`);
 if (failures.length > 0) {
   console.log("\nFailed tests:");

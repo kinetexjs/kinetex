@@ -38,6 +38,31 @@ async function test(name: string, fn: () => void | Promise<void>): Promise<void>
   }
 }
 
+/**
+ * Assert a header was SENT on the first hop and STRIPPED before the second.
+ *
+ * The positive half is the point: without it, "hop 1 has no Authorization"
+ * also holds for a client that never sent one, so a total auth failure would
+ * read as a passing security test.
+ */
+function assertStripped(
+  mk: { received: Array<{ url: string; headers: Record<string, string> }> },
+  header: string,
+  sentValue: string,
+): void {
+  assert.equal(mk.received.length, 2, "expected exactly 2 hops, got %d", mk.received.length);
+  const first = mk.received[0];
+  const second = mk.received[1];
+  assert.notEqual(first.url, second.url, "hops must differ for a strip test to mean anything");
+  assert.equal(
+    first.headers[header],
+    sentValue,
+    "control: %s MUST be present on hop 0, else this test is vacuous",
+    header,
+  );
+  assert.equal(second.headers[header], undefined, "%s must be stripped before hop 1", header);
+}
+
 function suite(name: string): void {
   console.log(`\n── ${name}`);
 }
@@ -178,12 +203,15 @@ async function main(): Promise<void> {
     } finally {
       restore();
     }
-    assert.ok(mk.received.length >= 2);
+    assert.equal(mk.received.length, 2, "expected exactly 2 hops");
     const crossHop = mk.received[1];
     assert.ok(
       crossHop.url.startsWith("https://evil.example.test/"),
       "should reach cross-origin hop",
     );
+    // Positive control: both credentials were genuinely sent on hop 0.
+    assert.equal(mk.received[0].headers["authorization"], "Bearer SECRET-TOKEN");
+    assert.equal(mk.received[0].headers["x-api-key"], "SECRET-KEY");
     assert.equal(
       crossHop.headers["authorization"],
       undefined,
@@ -213,11 +241,7 @@ async function main(): Promise<void> {
     }
     const crossHop = mk.received[1];
     assert.ok(crossHop.url.startsWith("https://evil.example.test/"));
-    assert.equal(
-      crossHop.headers["cookie"],
-      undefined,
-      "Cookie must NOT be forwarded cross-origin",
-    );
+    assertStripped(mk, "cookie", "session=abc123");
   });
 
   await test("proxy-authorization is stripped cross-origin", async () => {
@@ -235,7 +259,7 @@ async function main(): Promise<void> {
     } finally {
       restore();
     }
-    assert.equal(mk.received[1].headers["proxy-authorization"], undefined);
+    assertStripped(mk, "proxy-authorization", "Basic cHJveHk6c2VjcmV0");
   });
 
   await test("x-csrf-token and www-authenticate are stripped cross-origin", async () => {
@@ -253,9 +277,8 @@ async function main(): Promise<void> {
     } finally {
       restore();
     }
-    const crossHop = mk.received[1];
-    assert.equal(crossHop.headers["x-csrf-token"], undefined);
-    assert.equal(crossHop.headers["www-authenticate"], undefined);
+    assertStripped(mk, "x-csrf-token", "csrf-123");
+    assertStripped(mk, "www-authenticate", "Basic realm=x");
   });
 
   await test("applyAuth does NOT re-inject Authorization on cross-origin hop", async () => {
@@ -273,11 +296,9 @@ async function main(): Promise<void> {
     } finally {
       restore();
     }
-    assert.equal(
-      mk.received[1].headers["authorization"],
-      undefined,
-      "applyAuth re-application must be suppressed on cross-origin hops",
-    );
+    // The control matters most here: applyAuth re-runs per hop, so hop 0
+    // carrying the token is what proves suppression on hop 1 is real.
+    assertStripped(mk, "authorization", "Bearer RETRY-LEAK");
   });
 
   await test("apikey auth header is stripped cross-origin", async () => {
@@ -295,7 +316,7 @@ async function main(): Promise<void> {
     } finally {
       restore();
     }
-    assert.equal(mk.received[1].headers["x-api-key"], undefined);
+    assertStripped(mk, "x-api-key", "key-123");
   });
 
   await test("x-auth-token / x-access-token / x-refresh-token stripped cross-origin", async () => {
@@ -317,10 +338,9 @@ async function main(): Promise<void> {
     } finally {
       restore();
     }
-    const crossHop = mk.received[1];
-    assert.equal(crossHop.headers["x-auth-token"], undefined);
-    assert.equal(crossHop.headers["x-access-token"], undefined);
-    assert.equal(crossHop.headers["x-refresh-token"], undefined);
+    assertStripped(mk, "x-auth-token", "a");
+    assertStripped(mk, "x-access-token", "b");
+    assertStripped(mk, "x-refresh-token", "c");
   });
 
   // ── §3 Protocol downgrade / cross-scheme ───────────────────────────────────
@@ -342,7 +362,7 @@ async function main(): Promise<void> {
     } finally {
       restore();
     }
-    assert.equal(mk.received[1].headers["authorization"], undefined);
+    assertStripped(mk, "authorization", "Bearer DOWNGRADE-LEAK");
   });
 
   // ── §4 Redirect loops and unsafe schemes ───────────────────────────────────
@@ -362,7 +382,14 @@ async function main(): Promise<void> {
       restore();
     }
     assert.equal(error instanceof Error, true, "expected error for redirect loop");
-    assert.equal(mk.received.length, 8, `should stop at the hop limit, got ${mk.received.length}`);
+    // Two requests: `/loop`, then the same target again, which the loop
+    // detector refuses. It used to be eight — the chain was raised as
+    // `ENETWORK`, so every retry attempt replayed it against a server already
+    // looping. The count *was* the defect, and the assertion recorded it as if
+    // it were the hop limit.
+    assert.equal(mk.received.length, 2, `should stop at the loop, got ${mk.received.length}`);
+    const code = (error as { code?: string }).code;
+    assert.equal(code, "EREDIRECT", "a redirect failure is not a network failure");
   });
 
   await test("redirect to file:// scheme is rejected", async () => {

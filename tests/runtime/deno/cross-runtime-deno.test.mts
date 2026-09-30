@@ -115,6 +115,27 @@ async function main() {
     assert(t instanceof FetchTransport);
   });
 
+  // The HTTP/2 session pool is Node-native. On Deno the transport is always
+  // FetchTransport, so `sessionPool` has nothing to tune — but it must be
+  // accepted and silently ignored, not throw and not change transport
+  // selection. Sockets here belong to Deno's own fetch, not to kinetex.
+  await test("sessionPool is accepted and ignored on Deno", () => {
+    const t = createTransport(undefined, true, { maxSessions: 4, sessionTTLMs: 1234 });
+    // Asserting FetchTransport is sufficient: the transport is one or the
+    // other, and this suite does not import NodeHTTP2Transport.
+    assert(
+      t instanceof FetchTransport,
+      "session options must not pull Deno onto the HTTP/2 transport",
+    );
+  });
+
+  await test("a client with sessionPool builds a FetchTransport", async () => {
+    const client = new Kinetex({ sessionPool: { maxSessions: 2, http1KeepAlive: false } });
+    const t = (client as unknown as { transport: unknown }).transport;
+    assert(t instanceof FetchTransport);
+    await client.destroy();
+  });
+
   suite("Kinetex client in Deno");
 
   await test("GET to httpbin returns 200", async () => {

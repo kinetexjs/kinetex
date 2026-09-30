@@ -9,7 +9,7 @@
  * Authorization header in one call.
  */
 
-import { randomBytes } from "./utils.ts";
+import { randomBytes, uint8ArrayToBase64 } from "./utils.ts";
 
 type DigestHashAlgo = "MD5" | "SHA-256" | "SHA-512-256";
 
@@ -177,6 +177,20 @@ export interface DigestChallenge {
  * console.log(challenge.realm); // "testrealm@host.com"
  * ```
  */
+/** Decode a hex digest string into its raw bytes. */
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  }
+  return out;
+}
+
+/** Decode `quoted-pair` escapes (RFC 7230 §3.2.6) in a quoted-string body. */
+function unescapeQuoted(value: string): string {
+  return value.replace(/\\(.)/g, "$1");
+}
+
 export function parseDigestChallenge(header: string): DigestChallenge {
   const challenge: Partial<DigestChallenge> = {
     algorithm: "MD5",
@@ -184,11 +198,20 @@ export function parseDigestChallenge(header: string): DigestChallenge {
 
   const cleaned = header.replace(/^Digest\s+/i, "").trim();
 
-  const regex = /(\w+)\s*=\s*(?:"([^"]*)"|([^,\s]+))/g;
+  // A quoted-string may contain a `quoted-pair` (RFC 7230 §3.2.6): `"` and
+  // `\\` are literal characters, not delimiters. The previous `"([^"]*)"`
+  // stopped at the first quote regardless of a preceding backslash, so
+  // `realm="a\"b"` parsed as `a\` and left `b"` to be re-scanned as if it
+  // were another parameter — a realm containing a quote silently truncated
+  // the challenge, and `realm="x\", qop="auth-int"` did the same to `qop`.
+  // Round-tripping a header produced by `formatDigestAuth` was therefore
+  // lossy for exactly the values that need escaping.
+  const quotedString = '"((?:[^"\\\\]|\\\\.)*)"';
+  const regex = new RegExp(`(\\w+)\\s*=\\s*(?:${quotedString}|([^,\\s]+))`, "g");
   let match: RegExpExecArray | null;
   while ((match = regex.exec(cleaned)) !== null) {
     const key = match[1]!.toLowerCase();
-    const value = (match[2] ?? match[3])!;
+    const value = match[2] !== undefined ? unescapeQuoted(match[2]) : match[3]!;
 
     switch (key) {
       case "realm":
@@ -508,7 +531,11 @@ export async function computeDigestResponse(
   const _cnonce = cnonce || randomBytes(5);
   const _nc = nc || "00000001";
 
-  const algo = resolveHashAlgo(challenge.algorithm);
+  const resolved = resolveHashAlgo(challenge.algorithm);
+  if (resolved === null) {
+    throw new Error(`Unsupported digest algorithm: ${challenge.algorithm}`);
+  }
+  const { algo, sess } = resolved;
 
   async function hash(s: string): Promise<string> {
     if (algo === "MD5") return md5(s);
@@ -516,14 +543,49 @@ export async function computeDigestResponse(
     return await sha256Hex(s);
   }
 
-  const ha1 = await hash(`${username}:${realm}:${password}`);
+  // `-sess` binds the session (RFC 7616 §3.4.4/§3.4.5): the client nonce and
+  // the server nonce are folded into HA1, so the same credentials cannot be
+  // replayed under a different nonce. It requires `qop` to be present,
+  // because without one there is no cnonce to fold in.
+  // With `userhash=true`, RFC 7616 §3.4.4 substitutes the hashed username
+  // for the plaintext one everywhere it appears — including inside HA1.
+  const user = challenge.userhash
+    ? uint8ArrayToBase64(hexToBytes(await hash(`${username}:${realm}`)))
+    : username;
+
+  let ha1 = await hash(`${user}:${realm}:${password}`);
+  if (sess) {
+    if (!challenge.qop) {
+      throw new Error(`Digest algorithm ${challenge.algorithm} requires a qop parameter`);
+    }
+    ha1 = await hash(`${ha1}:${nonce}:${_cnonce}`);
+  }
   const ha2 = await hash(`${method}:${uri}`);
 
   let response: string;
   const qopList = qop.split(/\s*,\s*/).filter(Boolean);
 
-  if (qopList.includes("auth") || qopList.includes("auth-int")) {
-    response = await hash(`${ha1}:${nonce}:${_nc}:${_cnonce}:${qopList[0]}:${ha2}`);
+  if (qopList.length > 0) {
+    // RFC 7616 §3.4.3: with `qop=auth-int`, HA2 is
+    //   H(method:uri:H(entity-body))
+    // and the entity-body hash is part of the response. This API is not given
+    // the body, so that hash cannot be produced — and the old code took
+    // `qopList[0]` and used it in the response while still hashing
+    // H(method:uri). A server offering `qop="auth-int,auth"`, which RFC 7616
+    // §3.4.4 explicitly says a client may see, was therefore answered with a
+    // `qop=auth-int` header carrying a response computed as if it were `auth`:
+    // a client that claims a protection it does not implement, and fails
+    // against every conforming server.
+    //
+    // So: prefer `auth`, which is the only one implementable here, and refuse
+    // rather than answer wrongly when only `auth-int` is offered.
+    if (!qopList.includes("auth")) {
+      throw new Error(
+        `Digest challenge offers only unsupported qop values: ${qopList.join(", ")}. ` +
+          `"auth-int" requires the entity body, which this API does not receive.`,
+      );
+    }
+    response = await hash(`${ha1}:${nonce}:${_nc}:${_cnonce}:auth:${ha2}`);
   } else {
     response = await hash(`${ha1}:${nonce}:${ha2}`);
   }
@@ -538,11 +600,68 @@ export async function computeDigestResponse(
  * @param algorithm - Algorithm string from the challenge (e.g. "MD5", "SHA-256")
  * @returns The resolved algorithm identifier
  */
-function resolveHashAlgo(algorithm: string): DigestHashAlgo {
-  const upper = algorithm.toUpperCase().replace(/-/g, "");
-  if (upper === "SHA256") return "SHA-256";
-  if (upper === "SHA512256") return "SHA-512-256";
-  return "MD5";
+/**
+ * Compute the `username*` value for a challenge offering `userhash=true`
+ * (RFC 7616 §3.4.4): `base64(H(username : realm))`.
+ *
+ * A server that sends `userhash=true` is telling the client *not* to send the
+ * username in the clear. The previous code parsed the flag, exposed it on the
+ * public {@link DigestChallenge} type with a JSDoc promising support, and then
+ * ignored it — sending a plain `username="admin"` back to a server that had
+ * explicitly asked for it to be hashed. That is a privacy regression, and the
+ * server rejects the request too, because HA1 was built from the unhashed name.
+ *
+ * @returns the base64 hashed username, or `null` when `userhash` is not offered
+ */
+export async function computeUsernameStar(
+  challenge: DigestChallenge,
+  username: string,
+): Promise<string | null> {
+  if (!challenge.userhash) return null;
+  const resolved = resolveHashAlgo(challenge.algorithm);
+  if (resolved === null) {
+    throw new Error(`Unsupported digest algorithm: ${challenge.algorithm}`);
+  }
+  const { algo } = resolved;
+  const digest =
+    algo === "MD5"
+      ? md5(`${username}:${challenge.realm}`)
+      : algo === "SHA-512-256"
+        ? sha512256Hex(`${username}:${challenge.realm}`)
+        : await sha256Hex(`${username}:${challenge.realm}`);
+  return uint8ArrayToBase64(hexToBytes(digest));
+}
+
+/**
+ * Resolve the challenge's `algorithm` field to a base hash plus the
+ * `-sess` session-binding flag (RFC 7616 §3.4.4/§3.4.5).
+ *
+ * Two separate defects lived here. First, "anything unrecognised is MD5" was
+ * a silent downgrade: `SCRAM-SHA-256` and `garbage` were answered with a
+ * 32-hex MD5 under a header naming a different algorithm, so the server's
+ * rejection blamed an algorithm the caller never chose. Second, the
+ * `-sess` forms stripped to `MD5SESS`/`SHA256SESS`, matched nothing, and then
+ * fell through the `hash` dispatch to its SHA-256 default — so `MD5-sess`
+ * was computed with SHA-256, and `SHA-256-sess` happened to work only by
+ * accident. An unrecognised algorithm is now an error.
+ *
+ * @returns the base algorithm and whether HA1 is session-bound, or `null`
+ *          when the algorithm is not one we can compute
+ */
+function resolveHashAlgo(algorithm: string): {
+  algo: DigestHashAlgo;
+  sess: boolean;
+} | null {
+  const trimmed = algorithm.trim();
+  const sess = /-sess$/i.test(trimmed);
+  const base = trimmed
+    .replace(/-sess$/i, "")
+    .toUpperCase()
+    .replace(/-/g, "");
+  if (base === "MD5") return { algo: "MD5", sess };
+  if (base === "SHA256") return { algo: "SHA-256", sess };
+  if (base === "SHA512256") return { algo: "SHA-512-256", sess };
+  return null;
 }
 
 // ============================================================================
@@ -574,6 +693,21 @@ function resolveHashAlgo(algorithm: string): DigestHashAlgo {
  *   "/dir/index.html", "f2/wE", "00000001");
  * ```
  */
+/**
+ * Escape a value for a `quoted-string` (RFC 7230 §3.2.6): backslash and double
+ * quote are escaped, everything else passes through.
+ *
+ * A username or URI containing `"` previously terminated the quoted string
+ * early and everything after it was parsed as further auth-params — a
+ * username of `evil", qop=auth, x="` produced a header carrying an attacker-
+ * chosen `qop` and an extra parameter. `realm` and `opaque` come from the
+ * *server*, so a hostile or compromised one could inject into the client's own
+ * outgoing Authorization header.
+ */
+function quoted(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
 export function formatDigestAuth(
   challenge: DigestChallenge,
   username: string,
@@ -581,24 +715,38 @@ export function formatDigestAuth(
   uri: string,
   cnonce?: string,
   nc?: string,
+  usernameStar?: string,
 ): string {
   const parts: string[] = [];
   const _cnonce = cnonce || randomBytes(5);
   const _nc = nc || "00000001";
 
-  parts.push(`username="${username}"`);
-  parts.push(`realm="${challenge.realm}"`);
-  parts.push(`nonce="${challenge.nonce}"`);
-  parts.push(`uri="${uri}"`);
-  parts.push(`response="${response}"`);
+  if (challenge.userhash) {
+    if (usernameStar === undefined) {
+      throw new Error(
+        "challenge offers userhash=true: pass the value from computeUsernameStar() " +
+          "as `usernameStar` — sending a plaintext username would defeat it",
+      );
+    }
+    parts.push(`username*="${quoted(usernameStar)}"`);
+  } else {
+    if (usernameStar !== undefined) {
+      throw new Error("usernameStar was given but the challenge does not offer userhash");
+    }
+    parts.push(`username="${quoted(username)}"`);
+  }
+  parts.push(`realm="${quoted(challenge.realm)}"`);
+  parts.push(`nonce="${quoted(challenge.nonce)}"`);
+  parts.push(`uri="${quoted(uri)}"`);
+  parts.push(`response="${quoted(response)}"`);
 
-  if (challenge.opaque) parts.push(`opaque="${challenge.opaque}"`);
+  if (challenge.opaque) parts.push(`opaque="${quoted(challenge.opaque)}"`);
   if (challenge.algorithm && challenge.algorithm !== "MD5")
     parts.push(`algorithm=${challenge.algorithm}`);
   if (challenge.qop) {
-    parts.push(`qop=${challenge.qop.split(/\s*,\s*/)[0]}`);
+    parts.push(`qop=auth`);
     parts.push(`nc=${_nc}`);
-    parts.push(`cnonce="${_cnonce}"`);
+    parts.push(`cnonce="${quoted(_cnonce)}"`);
   }
 
   return `Digest ${parts.join(", ")}`;
@@ -656,7 +804,16 @@ export async function createDigestAuthorization(
     cnonce,
     nc,
   );
-  return formatDigestAuth(challenge, username, response, uri, cnonce, nc);
+  const usernameStar = await computeUsernameStar(challenge, username);
+  return formatDigestAuth(
+    challenge,
+    username,
+    response,
+    uri,
+    cnonce,
+    nc,
+    usernameStar ?? undefined,
+  );
 }
 
 /**
@@ -697,6 +854,15 @@ export function createDigestAuthorizer(): (
       cnonce,
       nc,
     );
-    return formatDigestAuth(challenge, username, response, uri, cnonce, nc);
+    const usernameStar = await computeUsernameStar(challenge, username);
+    return formatDigestAuth(
+      challenge,
+      username,
+      response,
+      uri,
+      cnonce,
+      nc,
+      usernameStar ?? undefined,
+    );
   };
 }

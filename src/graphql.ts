@@ -92,8 +92,7 @@ export interface GraphQLClientConfig {
   url: string;
   /** Default headers for all requests */
   headers?:
-    | Record<string, string>
-    | (() => Record<string, string> | Promise<Record<string, string>>);
+    Record<string, string> | (() => Record<string, string> | Promise<Record<string, string>>);
   /** Fetch implementation */
   fetch?: typeof globalThis.fetch;
   /** Use GET for queries (default: false) */
@@ -377,6 +376,71 @@ const MALICIOUS_QUERY_PATTERNS = [
 ];
 
 /**
+ * Blank out the contents of every GraphQL string literal, preserving the
+ * document's length so the surrounding structure is unchanged.
+ *
+ * Both the injection scan and the brace counter used to read string literals
+ * as if they were code, so a query the caller was entitled to send was
+ * rejected:
+ *
+ * - `{ search(term: "javascript:void(0)") }` -> "malicious pattern: /javascript:/"
+ * - `{ run(code: "eval(x)") }`               -> "malicious pattern: /eval\s*\(/"
+ * - `{ page(html: "<div onerror=alert(1)>") }` -> "malicious pattern: /onerror\s*=/"
+ * - `{ css(v: "<!-- hi -->") }`              -> "malicious pattern: /<!--/"
+ * - `{ a(s: "}") b }`                        -> "GraphQL query has unbalanced braces"
+ * - `{ f(x: "{{") }`                         -> "malicious pattern: /\{\s*\{/"
+ *
+ * A client refusing to transmit a well-formed query is a hard failure for the
+ * caller, and none of these is a client-side hazard: what the *server* renders
+ * from a string it was sent is the server's responsibility to escape, which is
+ * precisely what a scan of the request text cannot check. The patterns stay
+ * exactly as strict for text *outside* string literals, which is where a
+ * malformed or hostile document actually shows up.
+ *
+ * Handles `"..."`, the block forms `"""..."""` and `'''...'''`, and `#`
+ * comments, and leaves an unterminated quote alone so the structural checks
+ * still see it.
+ */
+function maskGraphQLLiterals(query: string): string {
+  const out = query.split("");
+  let i = 0;
+  const n = query.length;
+  while (i < n) {
+    const ch = query[i]!;
+    // Comment to end of line.
+    if (ch === "#") {
+      while (i < n && query[i] !== "\n") out[i++] = " ";
+      continue;
+    }
+    // Block string: """ or '''.
+    if ((ch === '"' || ch === "'") && query[i + 1] === ch && query[i + 2] === ch) {
+      const delim = ch.repeat(3);
+      const end = query.indexOf(delim, i + 3);
+      const stop = end === -1 ? n : end + 3;
+      while (i < stop) out[i++] = " ";
+      continue;
+    }
+    // Ordinary string.
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      out[i] = " ";
+      i++;
+      while (i < n && query[i] !== quote && query[i] !== "\n") {
+        out[i] = " ";
+        i++;
+      }
+      if (i < n && query[i] === quote) {
+        out[i] = " ";
+        i++;
+      }
+      continue;
+    }
+    i++;
+  }
+  return out.join("");
+}
+
+/**
  * Validate a GraphQL query for safety.
  * Prevents excessively large queries and detects malicious patterns.
  *
@@ -390,9 +454,13 @@ function validateGraphQLQuery(query: string): void {
     throw new ValidationError(`GraphQL query exceeds maximum length of ${MAX_QUERY_LENGTH} bytes`);
   }
 
+  // Structural checks run on the document with its string literals blanked, so
+  // a brace or a keyword inside a value is treated as data, not as syntax.
+  const structural = maskGraphQLLiterals(query);
+
   // Check for malicious patterns
   for (const pattern of MALICIOUS_QUERY_PATTERNS) {
-    if (pattern.test(query)) {
+    if (pattern.test(structural)) {
       throw new ValidationError(`GraphQL query contains potentially malicious pattern: ${pattern}`);
     }
   }
@@ -400,8 +468,8 @@ function validateGraphQLQuery(query: string): void {
   // Basic depth check by counting open braces
   let depth = 0;
   let maxDepth = 0;
-  for (let i = 0; i < query.length; i++) {
-    const char = query[i];
+  for (let i = 0; i < structural.length; i++) {
+    const char = structural[i];
     if (char === "{") {
       depth++;
       maxDepth = Math.max(maxDepth, depth);
@@ -538,12 +606,26 @@ function buildMultipartBody(req: GraphQLRequest, uploads: GraphQLUpload[]): Form
   // Null out file variables in the operations object
   const operations = JSON.parse(buildJSONBody(req)) as Record<string, unknown>;
 
-  // Build map: { "0": ["variables.input.file"], "1": [...] }
+  // The multipart spec's `map` paths are rooted at the `operations` object,
+  // and its example is `{"0": ["variables.file"]}` — so the path a caller
+  // passes has to name `variables` for the nulling below to reach the variable
+  // the mutation actually declares. The documented examples here did the
+  // opposite (`path: "file"`, `path: "input.file"`), and they produced
+  // `{"variables": {"file": {}}, "file": null}`: the file was nulled at the
+  // top level of the request object where no variable lives, and the real
+  // variable kept its original value. The upload never bound.
+  //
+  // Both spellings are now accepted, and the map always carries the rooted
+  // form so the request stays spec-conformant.
   const map: Record<string, string[]> = {};
   for (let i = 0; i < uploads.length; i++) {
     const upload = uploads[i]!;
-    map[String(i)] = [upload.path];
-    setNestedValue(operations, upload.path, null);
+    const rooted =
+      upload.path === "variables" || upload.path.startsWith("variables.")
+        ? upload.path
+        : `variables.${upload.path}`;
+    map[String(i)] = [rooted];
+    setNestedValue(operations, rooted, null);
   }
 
   form.append("operations", JSON.stringify(operations));
@@ -568,7 +650,14 @@ function setNestedValue(obj: Record<string, unknown>, path: string, value: unkno
     if (key === "__proto__" || key === "constructor" || key === "prototype") {
       throw new ValidationError(`Invalid upload path: "${path}" — reserved key "${key}"`);
     }
-    if (!current[key] || typeof current[key] !== "object") current[key] = {};
+    // Whether this segment is an array or an object is decided by the segment
+    // *after* it: in `files.0` the container `files` holds an index, so it must
+    // be created as an array. Deciding by `key` instead produced `{}`, and the
+    // server then saw `variables.files` as `{"0": null}` — an object, not the
+    // list the mutation declared.
+    const nextIsIndex = /^(0|[1-9][0-9]*)$/.test(parts[i + 1]!);
+    const next = nextIsIndex ? [] : {};
+    if (!current[key] || typeof current[key] !== "object") current[key] = next;
     current = current[key] as Record<string, unknown>;
   }
   const leaf = parts[parts.length - 1]!;
@@ -629,7 +718,9 @@ async function executeHTTP<T>(
   apqMode: "none" | "omitQuery" | "full" = "none",
   getAPQHashFn?: (query: string) => Promise<string>,
 ): Promise<GraphQLResponse<T>> {
-  const headers = await buildHeaders(config);
+  // `req.headers` is last so a link (or a caller using `raw`) can override a
+  // default. It used to be ignored entirely.
+  const headers = await buildHeaders(config, req.headers ?? {});
   const opType = detectOperationType(req.query);
   const useGET = config.useGETForQueries && opType === "query";
 
@@ -788,9 +879,17 @@ export class GraphQLClient {
       ...config,
     };
 
-    // Terminal link — does the actual HTTP fetch
+    // Terminal link — does the actual HTTP fetch.
+    // `op.config` is honoured, not just `this.config`: links such as
+    // `authLink` replace it to inject headers, and the terminal previously
+    // discarded the replacement and read the constructor-time object, so
+    // nothing a link put there was ever sent.
     const terminal: GraphQLLinkNext = (op) =>
-      this._executeWithAPQ(op.request, op.signal ?? null) as Promise<GraphQLResponse>;
+      this._executeWithAPQ(
+        op.request,
+        op.signal ?? null,
+        (op.config as Required<GraphQLClientConfig>) ?? this.config,
+      ) as Promise<GraphQLResponse>;
 
     this.executeLink = buildLinkChain(this.config.links, terminal);
   }
@@ -911,7 +1010,7 @@ export class GraphQLClient {
       ...(variables !== undefined ? { variables } : {}),
       ...(options.operationName !== undefined
         ? { operationName: options.operationName }
-        : extractOperationName(query) !== undefined
+        : extractOperationName(query) !== null
           ? { operationName: extractOperationName(query)! }
           : {}),
       ...(options.extensions !== undefined ? { extensions: options.extensions } : {}),
@@ -986,14 +1085,12 @@ export class GraphQLClient {
       variables,
       ...(options.operationName !== undefined
         ? { operationName: options.operationName }
-        : extractOperationName(query) !== undefined
+        : extractOperationName(query) !== null
           ? { operationName: extractOperationName(query)! }
           : {}),
     } as GraphQLRequest;
 
-    const headers = await buildHeaders(this.config, {
-      /* drop content-type for multipart */
-    });
+    const headers = await buildHeaders(this.config, {/* drop content-type for multipart */});
     delete headers["content-type"]; // FormData sets it with boundary
 
     const form = buildMultipartBody(req, uploads);
@@ -1063,6 +1160,13 @@ export class GraphQLClient {
     requests: GraphQLRequest[],
     options: { signal?: AbortSignal } = {},
   ): Promise<T[]> {
+    // `query()` and `upload()` both run the query through the validator before
+    // sending; `batch()` did not, so a batch was the one way to bypass the
+    // length, depth and injection limits the module applies everywhere else.
+    for (const req of requests) {
+      validateGraphQLQuery(req.query);
+    }
+
     const headers = await buildHeaders(this.config);
     const controller = new AbortController();
     // Listener removed when the fetch settles — avoids accumulating on the
@@ -1091,8 +1195,38 @@ export class GraphQLClient {
       options.signal?.removeEventListener("abort", onExternalAbort);
     }
 
-    // FIX (H6): sanitize untrusted batch response JSON before validation.
-    const rawResults = sanitizeParsedJSON(await response.json()) as unknown;
+    // Every other path routes a non-JSON body through `parseGraphQLResponse`,
+    // which turns it into a typed `EPARSE` / `ENETWORK` GraphQLClientError.
+    // `batch()` called `response.json()` bare, so a 502 HTML error page threw a
+    // raw `SyntaxError` with no `code` at all — a caller switching on
+    // `err.code` got `undefined` and had no way to tell this from a bug.
+    const ct = response.headers.get("content-type") ?? "";
+    if (!response.ok && !ct.includes("application/json")) {
+      const text = await response.text().catch(() => "(unreadable)");
+      throw new GraphQLClientError(
+        `HTTP ${response.status}: ${response.statusText}\n${text}`,
+        "ENETWORK",
+        undefined,
+        requests[0],
+        undefined,
+        new Error(`HTTP ${response.status}`),
+      );
+    }
+
+    let rawResults: unknown;
+    try {
+      // FIX (H6): sanitize untrusted batch response JSON before validation.
+      rawResults = sanitizeParsedJSON((await response.json()) as unknown);
+    } catch (err) {
+      throw new GraphQLClientError(
+        "Failed to parse batch response as JSON",
+        "EPARSE",
+        undefined,
+        requests[0],
+        undefined,
+        err,
+      );
+    }
 
     // Validate response is array (B-5 fix)
     if (!Array.isArray(rawResults)) {
@@ -1106,6 +1240,22 @@ export class GraphQLClient {
     }
 
     const results = rawResults as GraphQLResponse<T>[];
+
+    // The contract is "one `data` per request, in order". A server returning a
+    // different number was mapped over anyway: two requests answered with one
+    // result silently returned one item, and one request answered with three
+    // returned three — with `requests[i]` `undefined` for the extra ones, so an
+    // `errors` entry there was attributed to no request at all. Positional
+    // alignment is the whole point of a batch, so a mismatch is an error.
+    if (results.length !== requests.length) {
+      throw new GraphQLClientError(
+        `Batch response has ${results.length} result(s) but ${requests.length} request(s) were sent`,
+        "EINVALIDRESPONSE",
+        undefined,
+        requests[0],
+        rawResults as GraphQLResponse<unknown>,
+      );
+    }
 
     return results.map((res, i) => {
       if (res.errors?.length) throw buildGraphQLError(res.errors, requests[i]!, res);
@@ -1184,7 +1334,7 @@ export class GraphQLClient {
       ...(variables !== undefined ? { variables } : {}),
       ...(options.operationName !== undefined
         ? { operationName: options.operationName }
-        : extractOperationName(query) !== undefined
+        : extractOperationName(query) !== null
           ? { operationName: extractOperationName(query)! }
           : {}),
     } as GraphQLRequest<V>;
@@ -1294,6 +1444,13 @@ export class GraphQLClient {
     req: GraphQLRequest,
     signal: AbortSignal | null,
   ): Promise<GraphQLResponse<T>> {
+    // A negative count made the loop condition false on the first evaluation,
+    // so the body never ran, `lastErr` was never assigned, and the method
+    // ended in `throw undefined` — a rejection carrying no value at all, so
+    // `err.message` threw a TypeError inside the caller's own error handler.
+    if (!Number.isInteger(this.config.retries) || this.config.retries < 0) {
+      throw new RangeError(`retries must be a non-negative integer, got ${this.config.retries}`);
+    }
     let lastErr: unknown;
     for (let attempt = 0; attempt <= this.config.retries; attempt++) {
       if (attempt > 0) await sleep(this.config.retryDelayMs * Math.pow(2, attempt - 1));
@@ -1311,15 +1468,14 @@ export class GraphQLClient {
   private async _executeWithAPQ<T>(
     req: GraphQLRequest,
     signal: AbortSignal | null,
+    config: Required<GraphQLClientConfig> = this.config,
   ): Promise<GraphQLResponse<T>> {
-    if (!this.config.enableAPQ) {
-      return executeHTTP<T>(req, this.config, signal, "none", undefined);
+    if (!config.enableAPQ) {
+      return executeHTTP<T>(req, config, signal, "none", undefined);
     }
 
     // APQ: first try without query string
-    const res1 = await executeHTTP<T>(req, this.config, signal, "omitQuery", (q) =>
-      this._getAPQHash(q),
-    );
+    const res1 = await executeHTTP<T>(req, config, signal, "omitQuery", (q) => this._getAPQHash(q));
 
     // Check if server responded with PersistedQueryNotFound
     const notFound = res1.errors?.some(
@@ -1329,7 +1485,7 @@ export class GraphQLClient {
     if (!notFound) return res1;
 
     // Retry with full query
-    return executeHTTP<T>(req, this.config, signal, "full", (q) => this._getAPQHash(q));
+    return executeHTTP<T>(req, config, signal, "full", (q) => this._getAPQHash(q));
   }
 }
 
@@ -1396,7 +1552,9 @@ export function errorLink(
       return await next(op);
     } catch (err) {
       if (!(err instanceof GraphQLClientError)) throw err;
-      const result = handler(err, op, () => next(op));
+      // Must be awaited: an async handler returning `null` — the documented
+      // way to say "re-throw" — would otherwise be a truthy Promise here.
+      const result = await handler(err, op, () => next(op));
       if (result) return result;
       throw err;
     }
@@ -1456,6 +1614,13 @@ export function retryLink(
 ): GraphQLLink {
   const max = options.maxRetries ?? 3;
   const delay = options.delayMs ?? 300;
+  // Same `throw undefined` defect as the client's own `retries`.
+  if (!Number.isInteger(max) || max < 0) {
+    throw new RangeError(`retryLink: maxRetries must be a non-negative integer, got ${max}`);
+  }
+  if (!Number.isFinite(delay) || delay < 0) {
+    throw new RangeError(`retryLink: delayMs must be a non-negative number, got ${delay}`);
+  }
   const should =
     options.shouldRetry ?? ((err) => !(err instanceof GraphQLClientError && err.isGraphQLError));
 
