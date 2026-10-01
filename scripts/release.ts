@@ -344,10 +344,7 @@ async function main() {
       return;
     }
     if (prState !== "OPEN") {
-      console.error(
-        `❌ No open PR found for ${startBranch} (state: ${prState || "none"}).` +
-          `${prState === "MERGED" ? " If it was merged, delete this branch and re-run from a branch off main — the tag step is safe to redo." : ""}`,
-      );
+      console.error(`❌ No open PR found for ${startBranch} (state: ${prState || "none"}).`);
       process.exit(1);
     }
     if (hasTag(`v${version}`)) {
