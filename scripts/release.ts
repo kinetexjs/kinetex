@@ -304,6 +304,45 @@ async function main() {
       return;
     }
     const prState = runSilentAllowFail(`gh pr view ${startBranch} --json state --jq .state`);
+    if (prState === "MERGED") {
+      // The PR landed but the tag did not. This is a real state the script used
+      // to dead-end on: `gh pr merge` and `git tag` are separate steps, so a
+      // human merging the PR — which is the normal outcome when a ruleset
+      // demands an approving review — skipped the tag entirely and nothing
+      // fired, because release.yml and publish.yml both trigger on `tags: v*`.
+      // The old message told the operator to delete the branch and start over,
+      // which cannot work: the version is already on main, so a fresh run
+      // would bump to the same number and open a second release PR for a
+      // version that is already released.
+      //
+      // So this state is finished rather than restarted: fetch what landed,
+      // confirm main really does carry this version, then tag and push.
+      console.log(`\n[tag] PR for ${version} is already merged — finishing the release.`);
+      if (hasTag(`v${version}`)) {
+        console.log(`  ✓ Tag v${version} already exists — nothing to do.`);
+        return;
+      }
+      runSilent("git fetch origin main --tags");
+      const mainVersion = JSON.parse(runSilent("git show origin/main:package.json"))
+        .version as string;
+      if (mainVersion !== version) {
+        console.error(
+          `❌ origin/main is at version ${mainVersion}, not ${version}. Refusing to tag the wrong commit.`,
+        );
+        process.exit(1);
+      }
+      const mergeSha = runSilent("git rev-parse --short origin/main");
+      run(`git tag -a "v${version}" -m "Release v${version}" origin/main`);
+      run(`git push origin "v${version}"`);
+      banner(version, [
+        `Tag v${version} pushed (on ${mergeSha}).`,
+        "CI is now publishing:",
+        "  • release.yml → GitHub Release (tar.gz + zip)",
+        "  • publish.yml → npm + JSR",
+        "  • docs.yml    → TypeDoc to GitHub Pages",
+      ]);
+      return;
+    }
     if (prState !== "OPEN") {
       console.error(
         `❌ No open PR found for ${startBranch} (state: ${prState || "none"}).` +
