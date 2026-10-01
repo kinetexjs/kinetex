@@ -2,6 +2,7 @@ import { kinetex } from "../src/mod.ts";
 import type { HTTPStatusError } from "../src/types.ts";
 import nodeAssert from "node:assert/strict";
 import { describe as nodeDescribe, it as nodeIt, after } from "node:test";
+import { createDriftGuard } from "./upstream.ts";
 
 /**
  * A hung test must fail rather than stall the runner: node:test's default
@@ -12,85 +13,41 @@ import { describe as nodeDescribe, it as nodeIt, after } from "node:test";
 const TEST_BUDGET_MS = 45_000;
 
 /**
- * Assertions that failed, and the `assert` every test in this file uses.
+ * The `assert` every test in this file uses, plus the two counters that decide
+ * this process's exit code.
  *
- * This file used to close with `process.exit(process.exitCode ?? 0)`, on the
- * theory that node:test had already recorded the run's verdict in
- * `process.exitCode`. It has not, and does not: when a test file is executed
- * directly rather than through `node --test`, that property is never assigned
- * — measured at 1.5 s and again at 4 s after the run, it was still
- * `undefined`. The forced exit is genuinely needed (this suite leaks
- * keep-alive sockets and would otherwise hang forever), so it evaluated to
- * `process.exit(0)` and the process reported **success after any number of
- * failures**. Every assertion here was printed to the terminal and enforced
- * against nothing: CI, a `&&` chain, and a mutation harness all saw green.
+ * The exit code is counted here rather than read from node:test. This file used
+ * to close with `process.exit(process.exitCode ?? 0)`, on the theory that
+ * node:test had already recorded the run's verdict in `process.exitCode`. It
+ * has not, and does not: when a test file is executed directly rather than
+ * through `node --test`, that property is never assigned — measured at 1.5 s
+ * and again at 4 s after the run, it was still `undefined`. The forced exit is
+ * genuinely needed (this suite leaks keep-alive sockets and would otherwise hang
+ * forever), so it evaluated to `process.exit(0)` and the process reported
+ * **success after any number of failures**. Every assertion here was printed to
+ * the terminal and enforced against nothing: CI, a `&&` chain, and a mutation
+ * harness all saw green.
  *
- * So the verdict is counted here. The count is taken at the assertion rather
- * than at the test boundary because neither `test()` nor `describe()` hands
- * back the object it built, and there is no in-process failure event short of
- * restructuring the file onto `run()`. A test that fails by throwing something
- * that is not an assertion — a stray `TypeError` — is not counted, which is
- * the one gap this leaves; the terminal output still shows it.
+ * Two counters, because two different things can go wrong. `failures` is a real
+ * defect in this client and must exit non-zero. `drift` is httpbin misbehaving
+ * — roughly seventy assertions in this file read a status straight off a live
+ * response, and a 429/502/503/504 from its front end says nothing about the
+ * transport under test. Drift does not fail the run, because the client did
+ * nothing wrong, but it is not silent either: every excused assertion is named
+ * in a report under its own heading, so "the suite was inconclusive here" can
+ * never be mistaken for "the suite passed".
+ *
+ * The count is taken at the assertion rather than at the test boundary because
+ * neither `it()` nor `describe()` hands back the object it built, and there is
+ * no in-process failure event short of restructuring the file onto a `run()`
+ * helper. A test that fails by throwing something that is not an assertion — a
+ * stray `TypeError` — is not counted, which is the one gap this leaves; the
+ * terminal output still shows it.
+ *
+ * The guard's own discrimination is pinned by `tests/upstream-drift.test.mts`;
+ * this file only wires it up.
  */
-let failures = 0;
-
-/**
- * Assertions that were inconclusive because the third party misbehaved.
- *
- * Roughly sixty of this file's assertions read a status straight off a live
- * httpbin response. httpbin is a free public service: it rate-limits, and it
- * answers 502/503/504 when its own front end is unwell. That is not a defect
- * in the client, but it used to be indistinguishable from one — the suite went
- * red on someone else's outage, which is how a real failure gets lost in the
- * noise of an expected one.
- *
- * Drift is therefore counted separately from failure. It does not fail the run,
- * because the client did nothing wrong; it is not silent either, because it is
- * reported under its own heading with every assertion named, so "the suite was
- * inconclusive here" can never be mistaken for "the suite passed".
- */
-let drift = 0;
-const driftSites: string[] = [];
-
-/** Statuses httpbin returns when *it* is unwell, rather than when asked to. */
-const UPSTREAM_DRIFT = new Set([429, 502, 503, 504]);
-
-/**
- * True when a failed status comparison is the third party drifting rather than
- * the client being wrong: both sides are HTTP statuses, they differ, and what
- * actually came back is one httpbin produces unprompted.
- */
-function isUpstreamStatusDrift(actual: unknown, expected: unknown): boolean {
-  if (typeof actual !== "number" || typeof expected !== "number") return false;
-  if (actual === expected) return false;
-  const statusish = (n: number) => n >= 100 && n <= 599;
-  return statusish(actual) && statusish(expected) && UPSTREAM_DRIFT.has(actual);
-}
-
-const assert = new Proxy(nodeAssert, {
-  get(target, prop, receiver) {
-    const value = Reflect.get(target, prop, receiver);
-    if (typeof value !== "function") return value;
-    const name = String(prop);
-    return (...args: unknown[]) => {
-      // The status comparisons all take (actual, expected) in that order.
-      if (isUpstreamStatusDrift(args[0], args[1])) {
-        drift++;
-        const site = new Error().stack?.split("\n")[2]?.trim() ?? "unknown site";
-        driftSites.push(
-          `${site} — expected ${String(args[1])}, httpbin answered ${String(args[0])}`,
-        );
-        return undefined;
-      }
-      try {
-        return (value as (...a: unknown[]) => unknown).apply(target, args);
-      } catch (err) {
-        failures++;
-        throw err;
-      }
-    };
-  },
-}) as typeof nodeAssert;
+const { assert, report: driftReport } = createDriftGuard<typeof nodeAssert>(nodeAssert);
 
 function it(name: string, fn: () => unknown): void {
   nodeIt(name, { timeout: TEST_BUDGET_MS }, fn as () => void | Promise<void>);
@@ -2796,24 +2753,15 @@ describe("mod - destroy() method", () => {
 // Force clean exit — node:test waits indefinitely for HTTP keep-alive sockets
 // to close. This ensures the process exits after all tests complete, with the
 // run's actual verdict rather than whatever `process.exitCode` happens to hold
-// (which is nothing; see the note above the `failures` counter).
+// (which is nothing; see the note above the drift guard).
 after(async () => {
   setTimeout(() => {
-    if (failures > 0) {
-      console.error(`\n${failures} test(s) failed.`);
+    if (driftReport.failures > 0) {
+      console.error(`\n${driftReport.failures} test(s) failed.`);
     }
-    if (drift > 0) {
-      // Printed whether or not anything failed, and under its own heading: a
-      // run whose httpbin assertions never actually ran must not read as a
-      // clean one.
-      console.error(
-        `\n⚠️  ${drift} assertion(s) were INCONCLUSIVE — httpbin answered a ` +
-          `drift status (429/502/503/504) where another was expected. They are not ` +
-          `counted as failures, because the client did not produce them, but they ` +
-          `did not run either:\n` +
-          driftSites.map((s) => `     - ${s}`).join("\n"),
-      );
-    }
-    process.exit(failures > 0 ? 1 : 0);
+    // Printed whether or not anything failed, and under its own heading: a run
+    // whose httpbin assertions never actually ran must not read as a clean one.
+    if (driftReport.drift > 0) console.error(driftReport.text());
+    process.exit(driftReport.failures > 0 ? 1 : 0);
   }, 500);
 });

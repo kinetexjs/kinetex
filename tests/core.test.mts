@@ -1,34 +1,21 @@
-import assert from "node:assert/strict";
+import nodeAssert from "node:assert/strict";
 import { kinetex } from "../src/mod.ts";
+import { isUpstreamFlake, isUpstreamStatusDrift } from "./upstream.ts";
+
+const assert = nodeAssert;
 
 let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
 /**
- * True when httpbin answered with a status its own front end produces —
- * 429 while rate-limiting, 502/503/504 when degraded — rather than the one
- * the endpoint was asked for. The request never reached the endpoint, so an
- * assertion on the status would be measuring the outage rather than the
- * transport under test.
+ * Skip the remaining assertions in the current test when `status` is an
+ * upstream failure rather than `expected`. Returns true when it skipped.
  *
  * `isUpstreamFlake` cannot catch this on its own: a mismatched
  * `assert.equal(status, 200)` throws an `AssertionError`, which it
  * deliberately excludes so a genuine assertion failure is never mistaken for
  * a network problem. The status has to be inspected before the assert.
- *
- * Only these four statuses count. A 404 or 500 back from `/status/200` is a
- * real failure and must still fail the run.
- */
-function isUpstreamStatusDrift(status: number, expected: number): boolean {
-  return (
-    status !== expected && (status === 429 || status === 502 || status === 503 || status === 504)
-  );
-}
-
-/**
- * Skip the remaining assertions in the current test when `status` is an
- * upstream failure rather than `expected`. Returns true when it skipped.
  */
 function skipOnUpstreamDrift(name: string, status: number, expected: number): boolean {
   if (!isUpstreamStatusDrift(status, expected)) return false;
@@ -43,37 +30,13 @@ function skipOnUpstreamDrift(name: string, status: number, expected: number): bo
  * transient error instead. The status has to be inspected before the assert,
  * exactly as `skipOnUpstreamDrift` does — a `502 !== 200` from the third
  * party says nothing about the transport under test.
+ *
+ * Both classifiers, and the reasoning behind their narrowness, live in
+ * `tests/upstream.ts` and are pinned by `tests/upstream-drift.test.mts`.
  */
 function assertOkStatus(status: number, label = "httpbin answered 200"): void {
   if (skipOnUpstreamDrift(label, status, 200)) return;
   assert.equal(status, 200);
-}
-
-/**
- * True only for errors that mean "the third party misbehaved", not "our code is
- * wrong". Deliberately conservative: anything unrecognised counts as a defect.
- */
-function isUpstreamFlake(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  // An AssertionError can only come from this file's own `assert` calls.
-  if (err.name === "AssertionError") return false;
-  // A TypeError is either our code crashing or fetch's own network-level
-  // failure — the message is what separates the two.
-  if (err.name === "TypeError") {
-    return /fetch failed|network|ECONN|ENOTFOUND|EAI_AGAIN|socket hang up/i.test(err.message);
-  }
-  const code = (err as { code?: unknown }).code;
-  if (typeof code === "string") {
-    if (
-      /^(ECONN|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EPIPE)$/.test(code)
-    )
-      return true;
-    // A 5xx surfaced as a KinetexError is the upstream service, not us.
-    if (/^EHTTP_5/.test(code)) return true;
-  }
-  return /\b(502|503|504)\b|upstream|bad gateway|service unavailable|gateway timeout/i.test(
-    err.message,
-  );
 }
 
 /**

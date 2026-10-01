@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { kinetex } from "../src/mod.ts";
 import { HTTPStatusError, KinetexError, SizeLimitError, TimeoutError } from "../src/types.ts";
 import { encodeMultipart, NodeHTTP2Transport } from "../src/core.ts";
+import { isUpstreamFlake, isUpstreamStatusDrift } from "./upstream.ts";
 
 let passed = 0,
   failed = 0;
@@ -18,22 +19,6 @@ const failures: Array<{ name: string; err: unknown }> = [];
 // the 30s client timeout — or forever, if the timeout itself regressed. A
 // test that overruns is a failure, never a silent stall.
 const TEST_BUDGET_MS = 45_000;
-
-/**
- * True when httpbin answered with a status its own front end produces —
- * 429 while rate-limiting, 502/503/504 when degraded — rather than the one
- * `/status/N` was asked for. The request never reached the endpoint, so
- * asserting on the status (or on an attempt count that depends on it) would
- * be measuring the outage rather than the client under test.
- *
- * Only these four statuses count. A 404 or a 422 back from `/status/503` is a
- * real failure and must still fail the run.
- */
-function isUpstreamStatusDrift(status: number, expected: number): boolean {
-  return (
-    status !== expected && (status === 429 || status === 502 || status === 503 || status === 504)
-  );
-}
 
 /**
  * Skip the rest of the current test when `status` is an upstream failure
@@ -47,6 +32,20 @@ function skipOnUpstreamDrift(name: string, status: number, expected: number): bo
   );
   return true;
 }
+
+/**
+ * Almost every test in this file talks to live httpbin, so an outage arrives as
+ * a failure that says nothing about the client — `HTTP 502 Bad Gateway` on a
+ * POST that should have echoed its body. Handled one test at a time it is
+ * whack-a-mole: the run that failed tonight would have been a different POST.
+ *
+ * `isUpstreamFlake` is applied to every test in the file, not opted into per
+ * test, because the point is to survive an outage rather than to whitelist known
+ * flakiness. Its discrimination is deliberately narrow and an AssertionError is
+ * never excused, so it cannot convert a real failure into green. It lives in
+ * `tests/upstream.ts`, shared with the other live suites, and is pinned by
+ * `tests/upstream-drift.test.mts`.
+ */
 
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
   const started = Date.now();
@@ -64,6 +63,11 @@ async function test(name: string, fn: () => Promise<void>): Promise<void> {
     console.log(`  ✅  ${name}`);
     passed++;
   } catch (err) {
+    if (isUpstreamFlake(err)) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(`  ⚠️  ${name} — inconclusive (third party misbehaved): ${msg}`);
+      return;
+    }
     const msg = err instanceof Error ? err.message : String(err);
     console.log(`  ❌  ${name}: ${msg}`);
     failures.push({ name, err });
