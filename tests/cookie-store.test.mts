@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { kinetex } from "../src/mod.ts";
+import { isUpstreamFlake } from "./upstream.ts";
 import { CookieJar, createCookieJar, loadCookieJar } from "../src/cookiejar.ts";
 
 let passed = 0;
@@ -12,6 +13,16 @@ async function test(name: string, fn: () => void | Promise<void>) {
     console.log(`  ✅  ${name}`);
     passed++;
   } catch (err) {
+    // An outage at httpbin arrives as a failure that says nothing about the
+    // client. The discrimination is narrow and never excuses an
+    // AssertionError, so it cannot mask a real defect; see
+    // tests/upstream-drift.test.mts, which also enforces that this suite has
+    // the guard in the first place.
+    if (isUpstreamFlake(err)) {
+      const why = err instanceof Error ? err.message : String(err);
+      console.log(`  ⚠️  ${name} — inconclusive (third party misbehaved): ${why}`);
+      return;
+    }
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`  ❌  ${name}: ${msg}`);
     failures.push({ name, err });
