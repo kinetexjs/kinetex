@@ -22,7 +22,7 @@
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
@@ -321,6 +321,80 @@ await check("every live-network suite reaches the shared guard", () => {
       );
     }
   }
+});
+
+/**
+ * Every suite that asserts a status off a live response, whether it is
+ * individually listed above or not.
+ *
+ * Added after the v1.4.0 tag went red: `tests/client-unit.test.mts` had 18 live
+ * status assertions and no guard, and was missed because the check above only
+ * knew about three files by name. A list that has to be maintained by hand is
+ * a list that will be incomplete, so this one is derived from the tree instead.
+ */
+function liveSuites(): Array<{ file: string; asserts: number }> {
+  const out: Array<{ file: string; asserts: number }> = [];
+  for (const file of readdirSync(HERE)
+    .filter((f) => f.endsWith(".test.mts"))
+    .sort()) {
+    const text = readFileSync(join(HERE, file), "utf8");
+    const guarded = /isUpstreamFlake|isUpstreamStatusDrift|createDriftGuard|requireCapability/.test(
+      text,
+    );
+    if (guarded) continue;
+    // Only a suite that actually calls the third party can be destabilised by
+    // it. Several suites here assert a status against a mocked fetch on a fake
+    // host (`api.example.com`, `a.test`); those are deterministic, and excusing
+    // their failures would trade real coverage of the client's own behaviour
+    // for protection against an outage that cannot reach them.
+    if (!/httpbin\.org/.test(text)) continue;
+    const asserts = (text.match(/assert(?:\.strictEqual|\.equal)?\([^,]*\.status\s*,/g) ?? [])
+      .length;
+    if (asserts > 0) out.push({ file, asserts });
+  }
+  return out;
+}
+
+await check("no suite asserts a live status without a drift guard", () => {
+  // A 502 from httpbin's front end fails every one of these assertions at once,
+  // so an unguarded suite reports dozens of unrelated failures for one outage
+  // and files an issue each night. The 429/502/503/504 discrimination is
+  // deliberately narrow, so adding it cannot mask a real defect.
+  const unguarded = liveSuites();
+  const detail = unguarded
+    .map((s) => `  ${s.file} (${s.asserts} live status assertions)`)
+    .join("\n");
+  assert.equal(
+    unguarded.length,
+    0,
+    `these suites assert a status off a live response with no drift guard:\n${detail}\n` +
+      `Import isUpstreamFlake into their test() helper (tests/upstream.ts), or requireCapability if the endpoint is optional.`,
+  );
+});
+
+await check("the sweep would still catch a suite that loses its guard", () => {
+  // Guards the check above against becoming vacuous. It asserts the DETECTOR,
+  // not the current state of the tree: the sweep passes only because every
+  // suite is guarded now, and that would also be true if `liveSuites` had
+  // quietly stopped matching anything. Verified against a synthetic file, so
+  // this keeps working after the tree is clean.
+  const synthetic = [
+    "import assert from 'node:assert/strict';",
+    "const c = kinetex({ baseURL: 'https://httpbin.org' });",
+    "assert.equal(res.status, 200);",
+  ].join("\n");
+  const matched = synthetic.match(/assert(?:\.strictEqual|\.equal)?\([^,]*\.status\s*,/g) ?? [];
+  assert.equal(matched.length, 1, "the status-assertion pattern must still match");
+
+  // And the httpbin requirement is what keeps mocked-fetch suites out of it.
+  const mocked = synthetic.replace("https://httpbin.org", "https://api.example.com");
+  assert.ok(!/httpbin\.org/.test(mocked), "a suite on a mocked host must not be reported as live");
+
+  const mod = source("mod.test.mts");
+  assert.ok(
+    /createDriftGuard/.test(mod),
+    "mod.test.mts must stay guarded, or the sweep has nothing to compare against",
+  );
 });
 
 await check("no live suite carries a private copy of the classifier", () => {

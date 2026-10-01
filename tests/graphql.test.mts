@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { isUpstreamFlake } from "./upstream.ts";
 import { kinetex } from "../src/mod.ts";
 import {
   GraphQLClient,
@@ -168,6 +169,16 @@ async function t(name: string, fn: () => void | Promise<void>) {
     passed++;
     console.log(`  ✅  ${name}`);
   } catch (err) {
+    // An outage at httpbin arrives as a failure that says nothing about the
+    // client. The discrimination is narrow and never excuses an
+    // AssertionError, so it cannot mask a real defect; see
+    // tests/upstream-drift.test.mts, which also enforces that this suite has
+    // the guard in the first place.
+    if (isUpstreamFlake(err)) {
+      const why = err instanceof Error ? err.message : String(err);
+      console.log(`  ⚠️  ${name} — inconclusive (third party misbehaved): ${why}`);
+      return;
+    }
     const m = err instanceof Error ? err.message : String(err);
     failed++;
     console.error(`  ❌  ${name}: ${m}`);
