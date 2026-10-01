@@ -91,8 +91,16 @@ export class ProgressTracker {
   private readonly smoothing: number;
   private _done = false;
 
-  // Throttle state
-  private lastEmitMs = 0;
+  // Throttle state.
+  //
+  // `-Infinity` rather than 0: the gate is `now - lastEmitMs >= minIntervalMs`
+  // and `now` comes from `performance.now()`, which is time since *process*
+  // start. With a 0 baseline the very first update passes only once the
+  // process has been alive for a full interval, so for the first second of
+  // any CLI or serverless invocation **no progress event was emitted at all**.
+  // A transfer starting at t=200 ms and finishing at t=800 ms reported
+  // nothing but the forced final snapshot — a progress bar that never moves.
+  private lastEmitMs = -Infinity;
   private readonly minIntervalMs: number;
   private readonly onProgress: ((s: ProgressSnapshot) => void) | null;
 
@@ -172,9 +180,14 @@ export class ProgressTracker {
       this.lastLoaded = this.loaded;
     }
 
+    // Clamped at BOTH ends. The upper clamp was there; a negative chunk — a
+    // caller bug, or a Content-Length revised downward mid-transfer — put
+    // `percent` below zero and every progress line rendered "(-50.0%)". A
+    // running total of transferred bytes cannot be meaningfully negative, so
+    // the ratio is bounded to [0, 100].
     const percent =
       this.total !== null && this.total > 0
-        ? Math.min(100, (this.loaded / this.total) * 100)
+        ? Math.min(100, Math.max(0, (this.loaded / this.total) * 100))
         : null;
 
     const eta =
@@ -283,6 +296,13 @@ export function withUploadProgress(
   // demand, so backpressure reaches the source.
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let onUploadAbort: (() => void) | null = null;
+  // Distinguishes an end-of-stream from a cancellation, which a pending
+  // `read()` reports identically. `withDownloadProgress` already kept this
+  // flag; without it here, aborting an upload ran the `done` branch below —
+  // `tracker.complete()` and `controller.close()` — on the path that was
+  // aborting, so the transfer was still announced as finished and 100% done
+  // even after removing the `complete()` from the abort handler itself.
+  let aborted = false;
 
   const detach = (): void => {
     if (onUploadAbort) {
@@ -300,10 +320,18 @@ export function withUploadProgress(
       }
       reader = source.getReader();
       onUploadAbort = () => {
+        if (aborted) return;
+        aborted = true;
         const r = reader;
         reader = null;
         void r?.cancel("aborted").catch(() => {});
-        tracker.complete();
+        // The tracker is deliberately NOT completed here. `complete()` reports
+        // `done: true` and, because `done` is what forces the final percent,
+        // `percent: 100`: an upload aborted 10 bytes into a 100-byte body was
+        // announced to every `onProgress` listener as a finished, 100%-complete
+        // transfer. The caller learns the real outcome from the AbortError the
+        // stream is errored with, which is the same contract
+        // `withDownloadProgress` already followed on abort.
         controller.error(new DOMException("Upload aborted", "AbortError"));
       };
       // Removed in detach() on close/cancel/error so repeated uploads sharing
@@ -311,22 +339,32 @@ export function withUploadProgress(
       options.signal?.addEventListener("abort", onUploadAbort, { once: true });
     },
     async pull(controller) {
-      if (!reader) return;
+      // Captured once, before the await. The abort handler nulls the shared
+      // `reader` while a read is pending, and re-reading the variable after
+      // the await meant `releaseLock()` below dereferenced `null`.
+      const r = reader;
+      if (!r) return;
       try {
-        const { done, value } = await reader.read();
+        const { done, value } = await r.read();
         if (done) {
           detach();
-          reader.releaseLock();
-          reader = null;
-          tracker.complete();
-          controller.close();
+          if (reader === r) reader = null;
+          r.releaseLock();
+          // `done` here can just as well mean "cancelled by the abort
+          // handler", in which case the stream is already errored and the
+          // transfer must not be reported as a completed one.
+          if (!aborted) {
+            tracker.complete();
+            controller.close();
+          }
           return;
         }
         tracker.update(value.byteLength);
         controller.enqueue(value);
       } catch (err) {
         detach();
-        tracker.complete();
+        if (reader === r) reader = null;
+        if (!aborted) tracker.complete();
         controller.error(err);
       }
     },
@@ -414,14 +452,20 @@ export function withDownloadProgress(
       options.signal?.addEventListener("abort", onAbort, { once: true });
     },
     async pull(controller) {
-      if (!reader) return;
+      // Captured before the await, for the same reason as the upload wrapper:
+      // the abort handler nulls the shared `reader` while a read is pending.
+      const r = reader;
+      if (!r) return;
       try {
-        const { done, value } = await reader.read();
+        const { done, value } = await r.read();
         if (done) {
           detach();
-          reader.releaseLock();
-          reader = null;
-          tracker.complete();
+          if (reader === r) reader = null;
+          r.releaseLock();
+          // Ensure tracker is marked as complete even on error
+          if (!aborted) {
+            tracker.complete();
+          }
           controller.close();
           return;
         }
@@ -429,6 +473,7 @@ export function withDownloadProgress(
         controller.enqueue(value);
       } catch (err) {
         detach();
+        if (reader === r) reader = null;
         // Ensure tracker is marked as complete even on error
         if (!aborted) {
           tracker.complete();
@@ -534,11 +579,25 @@ export async function collectStream(
   // Handle already-aborted signal
   if (options.signal?.aborted) {
     reader.cancel("aborted").catch(() => {});
+    reader.releaseLock();
     throw new DOMException("Stream aborted", "AbortError");
   }
 
+  // An abort has to REJECT, not merely stop the reads.
+  //
+  // `reader.cancel()` resolves the pending `read()` with `{ done: true }`,
+  // which is indistinguishable from an ordinary end-of-stream: the loop broke
+  // out, `tracker.complete()` ran, and the truncated buffer was returned as a
+  // successful result. A caller collecting a 100-byte body under an abort that
+  // arrived after 3 bytes got `data: 3 bytes, isDone: true` and no error, so
+  // the partial body was stored as if it were the whole one. The sibling API
+  // `streamWithProgress` throws `AbortError` for exactly this case, so the two
+  // disagreed about the same event.
+  let aborted = false;
+
   // Register abort handler (removed in the finally below — leak fix)
   const abortHandler = () => {
+    aborted = true;
     reader.cancel("aborted").catch(() => {});
   };
   if (options.signal) {
@@ -548,10 +607,15 @@ export async function collectStream(
   try {
     while (true) {
       const { done, value } = await reader.read();
+      // Once the abort handler has cancelled the reader, this read — including
+      // one already in flight — resolves `{ done: true }`, so the loop always
+      // breaks and the check below is reached. There is no path that skips it.
       if (done) break;
       chunks.push(value);
       tracker.update(value.byteLength);
     }
+    // `done` above can equally mean "cancelled by the abort handler".
+    if (aborted) throw new DOMException("Stream aborted", "AbortError");
   } finally {
     reader.releaseLock();
     options.signal?.removeEventListener("abort", abortHandler);
@@ -621,6 +685,17 @@ export class MultiPartProgressAggregator {
     partSize: number,
     options: ProgressOptions = {},
   ): ProgressTracker {
+    // "Create or retrieve", as this method documents itself. It always
+    // created: a second call for the same index built a fresh tracker and
+    // overwrote the stored one, so the bytes already recorded for that part
+    // were silently discarded and the aggregate fell back to 0 — a caller
+    // re-acquiring a tracker it had lost a handle to erased the part's
+    // progress rather than recovering it. The first call's `partSize` wins,
+    // because changing it would restate a total the bytes were counted
+    // against.
+    const existing = this.trackers.get(partIndex);
+    if (existing) return existing;
+
     this.totals.set(partIndex, partSize);
 
     const tracker = new ProgressTracker(partSize, {
@@ -668,7 +743,13 @@ export class MultiPartProgressAggregator {
     }
 
     const hasTotal = totalBytes > 0;
-    const percent = hasTotal ? Math.min(100, (totalLoaded / totalBytes) * 100) : null;
+    // Bounded at BOTH ends, for the same reason `ProgressTracker._snapshot`
+    // bounds its own: a negative chunk — a caller bug, or a `Content-Length`
+    // revised downward mid-transfer — put the aggregate below zero and
+    // rendered "(-50.0%)". The tracker was clamped in an earlier round and
+    // the aggregate that sums the same snapshots was not, so the overall view
+    // was the one place the fix did not reach.
+    const percent = hasTotal ? Math.max(0, Math.min(100, (totalLoaded / totalBytes) * 100)) : null;
     const eta =
       hasTotal && totalRate > 0
         ? Math.max(0, ((totalBytes - totalLoaded) / totalRate) * 1000)
@@ -804,6 +885,24 @@ export function xhrFetch(
       return;
     }
 
+    // `XHRResult.body` is a string, but `responseType` is typed with the whole
+    // XHR enum — and everything outside "" / "text" hands back a parsed value
+    // rather than text. `String(xhr.response)` turned an ArrayBuffer, a Blob
+    // and a parsed JSON object alike into the literal string
+    // "[object Object]", which is indistinguishable from a body and is not one:
+    // the upload path is the reason this function exists, and a binary
+    // response came back as seven characters of nothing. Refused here, before
+    // anything is constructed, so the request is never opened.
+    if (options.responseType && options.responseType !== "text") {
+      reject(
+        new TypeError(
+          `xhrFetch: responseType "${options.responseType}" cannot produce a text body. ` +
+            `XHRResult.body is a string — use "text", or omit responseType.`,
+        ),
+      );
+      return;
+    }
+
     const xhr = new _XHR!();
     const uploadTracker = new ProgressTracker(null, {
       ...(options.onUploadProgress !== undefined ? { onProgress: options.onUploadProgress } : {}),
@@ -879,11 +978,30 @@ export function xhrFetch(
       // Parse response headers
       const rawHeaders = xhr.getAllResponseHeaders();
       const headers: Record<string, string> = {};
-      for (const line of rawHeaders.trim().split(/[\r\n]+/)) {
-        const idx = line.indexOf(": ");
-        if (idx !== -1) {
-          headers[line.slice(0, idx).toLowerCase()] = line.slice(idx + 2);
+      for (const line of rawHeaders.split(/[\r\n]+/)) {
+        // Split on the colon, not on `": "`. The separator is the *last* space
+        // before the value, so `trim()` first stripped the single space of an
+        // empty value — `"X-Empty: \r\n"` became `"X-Empty:"`, the search
+        // for `": "` missed it, and the header was dropped. A response whose
+        // headers were all empty-valued normalized to `{}`.
+        const idx = line.indexOf(":");
+        if (idx <= 0) continue;
+        const name = line.slice(0, idx).trim().toLowerCase();
+        if (name === "") continue;
+        const value = line.slice(idx + 1).trim();
+        // `__proto__` is a legal header name; a [[Set]] would send it to the
+        // inherited setter, which ignores a primitive, and the header would
+        // vanish rather than overwrite anything.
+        if (name === "__proto__") {
+          Object.defineProperty(headers, name, {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
+          continue;
         }
+        headers[name] = value;
       }
 
       resolve({
@@ -910,7 +1028,19 @@ export function xhrFetch(
       reject(new DOMException("Request aborted", "AbortError"));
     });
 
-    xhr.send(options.body ?? null);
+    try {
+      xhr.send(options.body ?? null);
+    } catch (err) {
+      // A body the implementation refuses — an invalid state, a type it will
+      // not put on the wire — throws straight out of the executor. The promise
+      // rejects with it, so the caller sees an error, but every handler above
+      // had already been wired and none of them runs on this path: the
+      // signal's `abort` listener stayed attached, holding this XHR and these
+      // closures alive for as long as the caller keeps the signal. The detach
+      // that every other exit performs happens here too.
+      detach();
+      throw err;
+    }
   });
 }
 
@@ -929,12 +1059,22 @@ const UNITS = ["B", "KB", "MB", "GB", "TB"];
  * @returns Formatted string (e.g. "1.18 MB").
  */
 export function formatBytes(bytes: number, decimals = 2): string {
+  if (Number.isNaN(bytes)) return "NaN B";
+  if (bytes === Infinity) return "∞";
+  if (bytes === -Infinity) return "-∞";
   if (bytes === 0) return "0 B";
   const k = 1024;
   const dm = Math.max(0, decimals);
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  const unit = UNITS[Math.min(i, UNITS.length - 1)];
-  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${unit}`;
+  const sign = bytes < 0 ? "-" : "";
+  const mag = Math.abs(bytes);
+  // Clamp the unit index into range. Math.log(0.5) / Math.log(1024) floors to
+  // -1, and Math.log of a negative or NaN is NaN — either one indexed past the
+  // end of UNITS and rendered "512 undefined" or "NaN undefined". A transfer
+  // rate below 1 byte/s is ordinary on a slow link, so formatRate — and with
+  // it every progress line — was affected.
+  const i = Math.min(Math.max(0, Math.floor(Math.log(mag) / Math.log(k))), UNITS.length - 1);
+  const unit = UNITS[i]!;
+  return `${sign}${parseFloat((mag / Math.pow(k, i)).toFixed(dm))} ${unit}`;
 }
 
 /**
@@ -971,7 +1111,7 @@ export function formatETA(ms: number): string {
  * Build a human-readable progress string.
  *
  * Output format: "{loaded} / {total} ({percent}) @ {rate} ETA {eta}"
- * Example: "4.56 MB / 10.00 MB (45.6%) at 1.00 MB/s ETA 5s"
+ * Example: "488.28 KB / 976.56 KB (50.0%) @ 97.66 KB/s ETA 5s"
  *
  * @param snap Progress snapshot
  * @returns Formatted progress string
@@ -1019,7 +1159,10 @@ export function throttleProgress(
   hz = 10,
 ): (snap: ProgressSnapshot) => void {
   const minInterval = hz > 0 ? 1000 / hz : 0;
-  let lastCall = 0;
+  // See ProgressTracker.lastEmitMs: a 0 baseline measures against process
+  // start, so the first call was dropped for the first interval of the
+  // process's life.
+  let lastCall = -Infinity;
 
   return (snap: ProgressSnapshot) => {
     const now = perfNow();

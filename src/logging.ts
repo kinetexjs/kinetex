@@ -270,6 +270,18 @@ const DEFAULT_REDACT_PARAMS = [
  * Requests/responses with other content-types will have their body replaced
  * with a short indicator (e.g. "[binary]") instead of being logged verbatim.
  */
+/**
+ * Is this a JSON media type?
+ *
+ * `application/json` and every `+json` structured suffix, case-insensitively
+ * and ignoring parameters, because RFC 9110 makes media types
+ * case-insensitive and `application/JSON; charset=utf-8` is the same type.
+ */
+function isJSONContentType(contentType: string): boolean {
+  const type = contentType.split(";", 1)[0]!.trim().toLowerCase();
+  return type === "application/json" || type === "text/json" || type.endsWith("+json");
+}
+
 const DEFAULT_ALLOWED_BODY_TYPES = [
   "application/json",
   "application/x-www-form-urlencoded",
@@ -298,8 +310,16 @@ export interface ConsoleTransportOptions {
   useColors?: boolean;
   /** Which stream to write to. Currently unused. */
   stream?: "stdout" | "stderr";
-  /** Callback that receives the formatted output string. Default: console.log */
-  onWrite: (output: string) => void;
+  /**
+   * Callback that receives the formatted output string. Defaults to `console.log`.
+   *
+   * Optional: it used to be required by the type, but the constructor's default
+   * parameter only supplied it when the whole options object was omitted, so
+   * `new ConsoleTransport({})` — or any options object built at runtime — left
+   * `onWrite` undefined and threw `this.onWrite is not a function` on the first
+   * write.
+   */
+  onWrite?: (output: string) => void;
 }
 
 /**
@@ -315,14 +335,14 @@ export class ConsoleTransport implements LogTransport {
   /**
    * @param opts - Console transport options
    */
-  constructor(
-    opts: ConsoleTransportOptions = {
-      pretty: false,
-      onWrite: (output: string) => console.log(output),
-    },
-  ) {
+  constructor(opts: ConsoleTransportOptions = {}) {
+    // `pretty` resolves the same way whether the caller passed nothing, `{}`, or
+    // a full options object. The old default parameter hard-coded `pretty: false`
+    // for the no-argument form only, so `new ConsoleTransport()` emitted JSON
+    // while `new ConsoleTransport({ onWrite })` emitted pretty output outside
+    // production — the opposite of the documented default.
     this.pretty = opts.pretty ?? getNodeEnv() !== "production";
-    this.onWrite = opts.onWrite;
+    this.onWrite = opts.onWrite ?? ((output: string) => console.log(output));
     // useColors reserved for future ANSI colorization
     void opts.useColors;
   }
@@ -450,6 +470,16 @@ export class BatchingTransport implements LogTransport {
 
   /** Internal flush — sends all buffered entries to inner transport. */
   private _flush(): void {
+    // A size-triggered flush has to disarm the pending timer as well. Leaving
+    // it armed meant `write()`'s `if (!this.timer)` guard stayed false for the
+    // next entry, so nothing scheduled a fresh interval: entries written after
+    // a full batch waited out the remainder of the previous batch's timer, and a
+    // process that hit `maxBatch` and then went quiet held the interval for the
+    // whole `flushMs` with an empty buffer.
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
     if (this.buffer.length === 0) return;
     const batch = this.buffer.splice(0);
     for (const entry of batch) this.inner.write(entry);
@@ -511,6 +541,12 @@ export class RemoteTransport implements LogTransport {
 
   /** Fire-and-forget flush with error handling. */
   private _flush(): void {
+    // Same disarming as BatchingTransport: a size-triggered flush must not
+    // leave the next entry without a timer of its own.
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
     this._flushAsync().catch(
       this.options.onError ?? ((err) => console.error("[logging] Flush error:", err)),
     );
@@ -689,7 +725,16 @@ export class Redactor {
     return out;
   }
 
-  /** Redact sensitive query parameters from a URL. */
+  /**
+   * Redact sensitive query parameters from a URL.
+   *
+   * Absolute URLs go through `URL`, which also normalises the result. A URL the
+   * `URL` constructor rejects — every relative form, and relative forms are what
+   * `HTTPLogger.child`'s own example logs — used to be returned untouched, so
+   * `logRequest(id, "GET", "/users?token=abc", ...)` wrote the token in clear
+   * while the absolute spelling of the same request redacted it. Those fall back
+   * to a textual scan of the query string below.
+   */
   redactURL(url: string): string {
     try {
       const u = new URL(url);
@@ -700,8 +745,37 @@ export class Redactor {
       }
       return u.toString();
     } catch {
-      return url;
+      return this._redactRelativeQuery(url);
     }
+  }
+
+  /** Redact the query string of a URL the `URL` constructor cannot parse. */
+  private _redactRelativeQuery(url: string): string {
+    const q = url.indexOf("?");
+    if (q === -1) return url;
+    const base = url.slice(0, q);
+    const rest = url.slice(q + 1);
+    const hash = rest.indexOf("#");
+    const fragment = hash === -1 ? "" : rest.slice(hash);
+    const query = hash === -1 ? rest : rest.slice(0, hash);
+
+    const params = query.split("&").map((pair) => {
+      if (pair === "") return pair;
+      const eq = pair.indexOf("=");
+      const name = eq === -1 ? pair : pair.slice(0, eq);
+      let decoded = name;
+      try {
+        decoded = decodeURIComponent(name);
+      } catch {
+        /* keep the raw name if it is not valid percent-encoding */
+      }
+      if (!this.paramSet.has(decoded.toLowerCase())) return pair;
+      // A valueless parameter (`?token`) is redacted to `token=***` so the
+      // redaction is visible rather than leaving the bare name behind.
+      return eq === -1 ? `${name}=***` : `${name}=***`;
+    });
+
+    return `${base}?${params.join("&")}${fragment}`;
   }
 
   /**
@@ -732,6 +806,13 @@ export class Redactor {
       return { body: `[${ct || "binary"}]`, size: body ? bodySize(body) : null };
     }
 
+    // The size of the body *as received*, measured before any lossy decoding.
+    // Two invalid UTF-8 bytes decode to two U+FFFD characters that re-encode to
+    // 6 bytes, and reporting 6 for a 2-byte body is a size of nothing the caller
+    // sent. `maxBodyLength` is applied to the re-encoded form below, which is
+    // what actually gets written out.
+    const size = bodySize(body);
+
     let str: string;
     if (body instanceof Uint8Array) {
       try {
@@ -743,10 +824,14 @@ export class Redactor {
       str = body;
     }
 
-    const size = str.length;
-
-    // Redact body fields (JSON)
-    if (ct.includes("application/json") && this.bodyFields.length > 0) {
+    // Redact body fields (JSON). The test has to be at least as wide as the
+    // `allowedBodyTypes` gate above: that one uses `startsWith` on a
+    // caller-configured list, so a config of `["application/"]` lets a
+    // `application/vnd.api+json` body through — and this narrower
+    // `includes("application/json")` then logged its `password` field in the
+    // clear. `+json` is the registered suffix form (RFC 6839) and this library
+    // already parses it as JSON elsewhere, so the redactor has to agree.
+    if (isJSONContentType(ct) && this.bodyFields.length > 0) {
       try {
         // FIX (H6): log bodies are untrusted — sanitize before mutation so a
         // crafted payload cannot smuggle __proto__ paths into redaction writes.
@@ -763,9 +848,12 @@ export class Redactor {
       str = str.replace(pattern, "***");
     }
 
-    // Truncate
-    if (str.length > this.maxBody) {
-      str = str.slice(0, this.maxBody) + `... [truncated ${str.length - this.maxBody} bytes]`;
+    // Truncate by UTF-8 bytes, which is the unit `maxBodyLength` is documented
+    // in, and never split a multi-byte character in half.
+    const afterRedaction = bodySize(str);
+    if (afterRedaction > this.maxBody) {
+      const cut = truncateToBytes(str, this.maxBody);
+      str = `${cut.text}... [truncated ${cut.removed} bytes]`;
     }
 
     return { body: str, size };
@@ -775,6 +863,14 @@ export class Redactor {
 /** Redact a specific dot-path field within a parsed JSON object, replacing its value with "***". */
 function redactObjectPath(obj: unknown, path: string[]): void {
   if (!obj || typeof obj !== "object" || path.length === 0) return;
+  // A JSON array was skipped outright: `bodyFields: ["password"]` only ever
+  // matched a top-level key, so a bulk payload — `[{"password":"…"}]`, the
+  // shape of most collection endpoints — logged its secrets in clear while
+  // the identical object form was redacted. Apply the path to every element.
+  if (Array.isArray(obj)) {
+    for (const item of obj) redactObjectPath(item, path);
+    return;
+  }
   const [head, ...rest] = path;
   if (head === undefined) return;
   // FIX (H6): never traverse or write through prototype-pollution keys.
@@ -934,6 +1030,14 @@ export class HTTPLogger {
     const method = active?.method ?? "GET";
     const url = active?.url ?? "";
 
+    // The active ID is released before the filter runs, not after. A response
+    // dropped by `statuses` / `level` / `excludeURLs` / sampling returned early
+    // and left its entry in `activeIds` forever: the only cleanup is a
+    // size-triggered sweep inside `logRequest`, so a service logging with a
+    // narrow status filter accumulated one dead entry per request until it
+    // reached 10000 and started evicting live ones.
+    this.activeIds.delete(requestId);
+
     if (!this._shouldLog("INFO", method, url, status)) return;
 
     const ct = headers["content-type"] ?? headers["Content-Type"] ?? null;
@@ -959,7 +1063,6 @@ export class HTTPLogger {
       meta: { ...this.cfg.context, ...meta },
     };
 
-    this.activeIds.delete(requestId);
     this._write(entry);
   }
 
@@ -984,6 +1087,9 @@ export class HTTPLogger {
     const method = active?.method ?? "GET";
     const url = active?.url ?? "";
 
+    // Released before the filter, for the same reason as `logResponse`.
+    this.activeIds.delete(requestId);
+
     if (!this._shouldLog("ERROR", method, url)) return;
 
     const entry: ErrorLogEntry = {
@@ -1001,7 +1107,6 @@ export class HTTPLogger {
       meta: { ...this.cfg.context, ...meta },
     };
 
-    this.activeIds.delete(requestId);
     this._write(entry);
   }
 
@@ -1158,7 +1263,60 @@ function serializeError(err: unknown): SerializedError {
       ...(errStack !== undefined ? { stack: errStack } : {}),
     };
   }
+  // Anything else was `String(err)`, which for a rejected object — the shape a
+  // custom fetch, a GraphQL client or a worker produces — is literally
+  // "[object Object]". The entry recorded no message and no `code`, so the log
+  // said only that something had failed. An error-shaped object keeps its
+  // `name`, `message`, `code` and `stack`; anything else is stringified
+  // structurally.
+  if (err !== null && typeof err === "object") {
+    const o = err as { name?: unknown; message?: unknown; code?: unknown; stack?: unknown };
+    const out: SerializedError = {
+      name: typeof o.name === "string" && o.name !== "" ? o.name : "Error",
+      message: typeof o.message === "string" ? o.message : safeStringify(err),
+    };
+    if (typeof o.code === "string" || typeof o.code === "number") out.code = String(o.code);
+    if (typeof o.stack === "string") out.stack = o.stack;
+    return out;
+  }
   return { name: "Error", message: String(err) };
+}
+
+/** `JSON.stringify` that never throws — falls back for circular values. */
+function safeStringify(value: unknown): string {
+  try {
+    const seen = new WeakSet<object>();
+    return (
+      JSON.stringify(value, (_k, v) => {
+        if (v !== null && typeof v === "object") {
+          if (seen.has(v as object)) return "[circular]";
+          seen.add(v as object);
+        }
+        return v;
+      }) ?? String(value)
+    );
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * Truncate a string to at most `maxBytes` UTF-8 bytes, never splitting a
+ * character, and report how many bytes were actually removed.
+ */
+function truncateToBytes(str: string, maxBytes: number): { text: string; removed: number } {
+  const enc = new TextEncoder();
+  const total = enc.encode(str).byteLength;
+  if (total <= maxBytes) return { text: str, removed: 0 };
+  let used = 0;
+  let end = 0;
+  for (const ch of str) {
+    const width = enc.encode(ch).byteLength;
+    if (used + width > maxBytes) break;
+    used += width;
+    end += ch.length;
+  }
+  return { text: str.slice(0, end), removed: total - used };
 }
 
 /** Cross-runtime high-resolution timer. Falls back to Date.now() when performance.now() is unavailable. */

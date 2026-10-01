@@ -22,6 +22,10 @@
  *  - URL diff
  */
 
+// The only import in a module that otherwise has none: base64-encoding a
+// UTF-8 payload is not something to reimplement per file.
+import { uint8ArrayToBase64 } from "./utils.ts";
+
 // ============================================================================
 // §1  TYPES
 // ============================================================================
@@ -204,9 +208,7 @@ export function stringifyQuery(
 
     if (Array.isArray(value)) {
       const filtered = value.filter((v) => v !== null && v !== undefined) as (
-        | string
-        | number
-        | boolean
+        string | number | boolean
       )[];
       if (filtered.length === 0) continue;
 
@@ -244,19 +246,42 @@ export function parseQuery(qs: string): Record<string, string | string[]> {
   const result: Record<string, string | string[]> = {};
   if (!str) return result;
 
+  // `result` is a plain object, so `result["__proto__"]` reads
+  // `Object.prototype` rather than "nothing here yet". A query string of
+  // `__proto__=x&__proto__=y` therefore took the "already have a value"
+  // branch and assigned an *array* through the inherited `__proto__` setter,
+  // which re-prototypes the object being returned to the caller. The read is
+  // now an own-property check, and the write for that one key is a define,
+  // so it lands as data instead of going through a setter.
+  const own = (o: object, k: string): boolean => Object.prototype.hasOwnProperty.call(o, k);
+  const put = (k: string, v: string | string[]): void => {
+    if (k === "__proto__") {
+      Object.defineProperty(result, k, {
+        value: v,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    } else {
+      result[k] = v;
+    }
+  };
+
   for (const pair of str.split("&")) {
     if (!pair) continue;
     const eq = pair.indexOf("=");
     const key = percentDecode(eq === -1 ? pair : pair.slice(0, eq));
     const val = eq === -1 ? "" : percentDecode(pair.slice(eq + 1));
 
-    const existing = result[key];
-    if (existing === undefined) {
-      result[key] = val;
-    } else if (Array.isArray(existing)) {
-      existing.push(val);
+    if (!own(result, key)) {
+      put(key, val);
     } else {
-      result[key] = [existing, val];
+      const existing = result[key]!;
+      if (Array.isArray(existing)) {
+        existing.push(val);
+      } else {
+        put(key, [existing, val]);
+      }
     }
   }
 
@@ -971,28 +996,45 @@ export interface URLPatternMatch {
  *  "/files/**"                 → matches "/files/a/b/c", wildcards: ["a","b","c"]
  *  "/items/:id(\\d+)"          → matches "/items/99" only if id is numeric
  */
+function escapeRegexLiteral(text: string): string {
+  return text.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+}
+
 export function compilePattern(pattern: string): URLPattern {
-  const paramNames: string[] = [];
-  const wildcardCount = { n: 0 };
-  const regexStr = pattern
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&") // escape regex chars (except /)
-    .replace(/\\\*/g, "*") // restore our * wildcards
-    .replace(/\*\*/g, () => {
-      // wildcard: matches any path segments (non-greedy due to anchors)
-      return "(.+?)";
-    })
-    .replace(/\*(?!\*)/g, () => {
-      // single wildcard
-      wildcardCount.n++;
-      return "([^/]+)";
-    })
-    .replace(
-      /:([A-Za-z_][A-Za-z0-9_]*)(?:\(([^)]+)\))?/g,
-      (_, name: string, constraint: string | undefined) => {
-        paramNames.push(name);
-        return `(${constraint ?? "[^/]+"})`;
-      },
-    );
+  // Captures are numbered in the order they appear in the pattern, and the
+  // match is read back by index — so which capture is a named parameter and
+  // which is a wildcard has to be recorded as the pattern is compiled.
+  // Assuming the named parameters come first is wrong for `/*/:id`, and it
+  // was also why `groups` was documented as "all capture groups" and was
+  // always empty: nothing ever wrote to it.
+  type Capture = { kind: "param"; name: string } | { kind: "wildcard"; greedy: boolean };
+  const captures: Capture[] = [];
+
+  // One tokenising pass, so that a constraint is recognised as a constraint.
+  // The old order escaped the whole pattern first, which turned the `(` of
+  // `:id(\d+)` into `\(`, after which the parameter form could never match
+  // and the documented constrained syntax was dead: `/items/:id(\d+)` matched
+  // `/items/anything`.
+  const TOKEN = /:([A-Za-z_][A-Za-z0-9_]*)(?:\(([^)]+)\))?|\*\*|\*/g;
+  let regexStr = "";
+  let last = 0;
+  for (const m of pattern.matchAll(TOKEN)) {
+    regexStr += escapeRegexLiteral(pattern.slice(last, m.index));
+    last = m.index + m[0].length;
+    if (m[1] !== undefined) {
+      // The constraint is a regex and is deliberately NOT escaped; the
+      // literal text around it is.
+      captures.push({ kind: "param", name: m[1] });
+      regexStr += `(${m[2] ?? "[^/]+"})`;
+    } else if (m[0] === "**") {
+      captures.push({ kind: "wildcard", greedy: true });
+      regexStr += "(.+?)";
+    } else {
+      captures.push({ kind: "wildcard", greedy: false });
+      regexStr += "([^/]+)";
+    }
+  }
+  regexStr += escapeRegexLiteral(pattern.slice(last));
 
   const regex = new RegExp(`^${regexStr}\\/?$`);
 
@@ -1006,13 +1048,27 @@ export function compilePattern(pattern: string): URLPattern {
       const wildcards: string[] = [];
       const groups: Record<string, string> = {};
 
-      let captureIdx = 1;
-      for (const name of paramNames) {
-        params[name] = percentDecode(m[captureIdx++] ?? "");
-      }
-      while (captureIdx <= m.length - 1) {
-        const val = m[captureIdx++] ?? "";
-        wildcards.push(...val.split("/").filter(Boolean).map(percentDecode));
+      for (let i = 0; i < captures.length; i++) {
+        const capture = captures[i]!;
+        const raw = m[i + 1] ?? "";
+        if (capture.kind === "param") {
+          const value = percentDecode(raw);
+          params[capture.name] = value;
+          groups[capture.name] = value;
+          continue;
+        }
+        // A greedy `**` spans segments, so it yields one entry per segment;
+        // a single `*` is one segment by definition.
+        if (capture.greedy) {
+          for (const part of raw.split("/").filter(Boolean)) {
+            wildcards.push(percentDecode(part));
+          }
+        } else {
+          wildcards.push(percentDecode(raw));
+        }
+        // Unnamed captures are keyed by their 1-based index, so `groups` is
+        // a complete record of the match.
+        groups[String(i + 1)] = percentDecode(raw);
       }
 
       return { params, wildcards, groups };
@@ -1157,6 +1213,18 @@ export function relativeURL(url: string, base: string): string | null {
     const b = new URL(base);
     if (u.origin !== b.origin) return null;
     if (!u.pathname.startsWith(b.pathname)) return null;
+    // A string prefix is not containment. With the base `/posts`, the path
+    // `/posts-admin/secret` starts with it, so the function reported the
+    // relative URL `-admin/secret` — a value the caller then resolves against
+    // `/posts` to reach a sibling resource it was never scoped to. The base
+    // has to end on a segment boundary, unless it already ends in a slash.
+    if (
+      u.pathname.length > b.pathname.length &&
+      !b.pathname.endsWith("/") &&
+      u.pathname[b.pathname.length] !== "/"
+    ) {
+      return null;
+    }
     return u.pathname.slice(b.pathname.length) + u.search + u.hash;
   } catch {
     return null;
@@ -1289,12 +1357,35 @@ export interface DataURLParts {
  * @returns Parsed DataURLParts, or null if not a valid data URL.
  */
 export function parseDataURL(url: string): DataURLParts | null {
-  const m = url.match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
-  if (!m) return null;
+  // RFC 2397: `data:[<mediatype>][;base64],<data>`, where `<mediatype>` is a
+  // type/subtype followed by any number of `;parameter` pairs. The old regex
+  // stopped the media type at the first `;` and then demanded a comma, so
+  // `data:text/plain;charset=utf-8,hi` — an entirely ordinary data URL — did
+  // not parse at all.
+  if (!url.startsWith("data:")) return null;
+  const comma = url.indexOf(",");
+  if (comma === -1) return null;
+  let head = url.slice(5, comma);
+  const data = url.slice(comma + 1);
+  // `;base64` is only an encoding marker when it is the LAST parameter, and
+  // it is the only parameter that is not part of the media type.
+  const semi = head.lastIndexOf(";");
+  let isBase64 = false;
+  if (semi !== -1 && head.slice(semi + 1).toLowerCase() === "base64") {
+    isBase64 = true;
+    head = head.slice(0, semi);
+  }
+  // A URL that carries parameters but no type (`data:;charset=utf-8,hi`) has
+  // an omitted media type, which RFC 2397 defaults to text/plain. A type is
+  // `type/subtype`, so a head with no slash in it is parameters only --
+  // keeping it as the media type would report the string "charset=utf-8" as
+  // a MIME type. The parameters are kept either way, so nothing is lost.
+  head = head.replace(/^;+/, "");
+  const mediaType = head.includes("/") ? head : head === "" ? "text/plain" : `text/plain;${head}`;
   return {
-    mediaType: m[1] ?? "text/plain",
-    isBase64: !!m[2],
-    data: m[3] ?? "",
+    mediaType,
+    isBase64,
+    data,
   };
 }
 
@@ -1307,16 +1398,27 @@ export function parseDataURL(url: string): DataURLParts | null {
  * @returns A data: URL string.
  */
 export function buildDataURL(data: string | Uint8Array, mediaType: string, base64 = true): string {
+  // `,` and `;` are the data URL's own delimiters. A media type carrying one
+  // is not a media type -- `text/plain;base64` written here produces
+  // `data:text/plain;base64,x`, which every parser then reads as a BASE64
+  // payload whether or not the caller asked for that.
+  if (/[,;]/.test(mediaType)) {
+    throw new URLValidationError(
+      `Invalid media type for a data URL: ${JSON.stringify(mediaType)} (it must not contain "," or ";")`,
+    );
+  }
   if (typeof data === "string") {
     if (base64) {
-      return `data:${mediaType};base64,${btoa(data)}`;
+      // `btoa` is Latin-1 only and throws InvalidCharacterError above U+00FF,
+      // so "café" -- exactly the payload base64 exists for -- could not be
+      // encoded at all. Encode the UTF-8 bytes instead, the same way the
+      // Uint8Array path already did.
+      return `data:${mediaType};base64,${uint8ArrayToBase64(new TextEncoder().encode(data))}`;
     }
     return `data:${mediaType},${encodeURIComponent(data)}`;
   }
   // Uint8Array → base64 (chunked to avoid memory issues with large data)
-  // Use TextDecoder for efficient Uint8Array to string conversion
-  const binary = new TextDecoder("iso-8859-1").decode(data);
-  return `data:${mediaType};base64,${btoa(binary)}`;
+  return `data:${mediaType};base64,${uint8ArrayToBase64(data)}`;
 }
 
 // ============================================================================
@@ -1430,7 +1532,15 @@ export function withoutTrailingSlash(url: string): string {
  * @returns URL without hash fragment.
  */
 export function stripHash(url: string): string {
-  return URLBuilder.from(url).removeHash().toString();
+  try {
+    return URLBuilder.from(url).removeHash().toString();
+  } catch {
+    // Same contract as `stripQuery` below: a URL we cannot parse is returned
+    // unchanged rather than turned into an exception. The two are used
+    // together on the same input, and only one of them being total meant a
+    // malformed URL was safe to strip a query from and fatal to strip a hash.
+    return url;
+  }
 }
 
 /**
@@ -1490,7 +1600,45 @@ export function urlFilename(url: string): string {
  * @returns URL with sensitive param values replaced with "REDACTED".
  */
 export function redactURL(url: string, ...sensitiveParams: string[]): string {
-  return URLBuilder.from(url)
-    .redactParams(...sensitiveParams)
-    .toString();
+  try {
+    return URLBuilder.from(url)
+      .redactParams(...sensitiveParams)
+      .toString();
+  } catch {
+    // This function exists to be called from a logger. `URLBuilder.from`
+    // throws on anything `new URL()` rejects — a relative path, a truncated
+    // string from a bad config — so the one helper that must never take a
+    // process down on malformed input was the one that threw. The parameters
+    // are masked on the raw string instead, and only if there is a query to
+    // mask them in.
+    return redactUnparsedURL(url, sensitiveParams);
+  }
+}
+
+/**
+ * Redact sensitive parameters in a string that is not a parseable URL.
+ *
+ * Splits on the delimiters rather than pattern-matching the key, so a key
+ * containing regex metacharacters is matched literally.
+ */
+function redactUnparsedURL(url: string, sensitiveParams: string[]): string {
+  if (sensitiveParams.length === 0) return url;
+  const hashAt = url.indexOf("#");
+  const beforeHash = hashAt === -1 ? url : url.slice(0, hashAt);
+  const hash = hashAt === -1 ? "" : url.slice(hashAt);
+  const q = beforeHash.indexOf("?");
+  if (q === -1) return url;
+  const path = beforeHash.slice(0, q);
+  const pairs = beforeHash
+    .slice(q + 1)
+    .split("&")
+    .map((pair) => {
+      const eq = pair.indexOf("=");
+      const key = eq === -1 ? pair : pair.slice(0, eq);
+      if (sensitiveParams.includes(key) || sensitiveParams.includes(percentDecode(key))) {
+        return `${key}=REDACTED`;
+      }
+      return pair;
+    });
+  return `${path}?${pairs.join("&")}${hash}`;
 }

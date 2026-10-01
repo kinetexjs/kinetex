@@ -18,7 +18,7 @@
  */
 
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { describe, it as nodeIt } from "node:test";
 
 import { isSafeURL, randomBytes, sanitizeParsedJSON } from "../src/utils.ts";
 import { Kinetex } from "../src/client.ts";
@@ -26,6 +26,18 @@ import { jsonSSE, parseSSEText, SSERouter } from "../src/sse.ts";
 import { deserializePaginationState, serializePaginationState } from "../src/pagination.ts";
 import { Redactor } from "../src/logging.ts";
 import { CookieJar } from "../src/cookie-store.ts";
+
+/**
+ * A hung test must fail rather than stall the runner: node:test's default
+ * budget is infinite, so a promise that never settles leaves the whole file
+ * hanging with no diagnostic. 45 s is far above any real case here and still
+ * bounded.
+ */
+const TEST_BUDGET_MS = 45_000;
+
+function it(name: string, fn: () => unknown): void {
+  nodeIt(name, { timeout: TEST_BUDGET_MS }, fn as () => void | Promise<void>);
+}
 
 // ── sanitizeParsedJSON core ───────────────────────────────────────────────────
 
@@ -116,27 +128,69 @@ describe("SSE JSON battle", () => {
 // ── Pagination state ──────────────────────────────────────────────────────────
 
 describe("deserializePaginationState battle", () => {
+  // A state the deserializer should accept has to be a real PaginationState:
+  // the loader checks the shape, so a two-field stub is no longer a fixture
+  // for "legitimate input" but for "malformed input".
+  const valid = {
+    strategy: "cursor",
+    page: 2,
+    offset: 20,
+    cursor: "abc",
+    prevCursor: null,
+    token: null,
+    done: false,
+    totalFetched: 20,
+  };
+
   it("round-trips legitimate state", () => {
-    const state = { cursor: "abc", page: 2, hasMore: true } as any;
-    const rt = deserializePaginationState(serializePaginationState(state)) as any;
-    assert.equal(rt.cursor, "abc");
-    assert.equal(rt.page, 2);
+    const rt = deserializePaginationState(serializePaginationState(valid as any));
+    assert.deepEqual(rt, valid);
+  });
+
+  it("round-trips a cursor that is not Latin-1", () => {
+    // btoa() throws above U+00FF, so serialising an ordinary opaque cursor
+    // failed outright and the paginator could not be resumed.
+    const unicode = { ...valid, cursor: "curseur-é-☃-🎉", prevCursor: "p-é" };
+    assert.deepEqual(deserializePaginationState(serializePaginationState(unicode as any)), unicode);
   });
 
   it("strips pollution keys from hostile serialized state", () => {
-    const b64 = Buffer.from(
-      JSON.stringify({ cursor: "a", __proto__: { evil: 1 }, constructor: 2 }),
-    ).toString("base64");
+    // A well-formed state carrying pollution keys: the shape check passes, so
+    // this exercises the strip itself rather than the rejection.
+    const hostile = { ...valid, __proto__: { evil: 1 }, constructor: 2, prototype: 3 };
+    const b64 = Buffer.from(JSON.stringify(hostile)).toString("base64");
     const state = deserializePaginationState(b64) as any;
     assert.equal(Object.hasOwn(state, "__proto__"), false);
     assert.equal(Object.hasOwn(state, "constructor"), false);
-    assert.equal(state.cursor, "a");
+    assert.equal(Object.hasOwn(state, "prototype"), false);
+    assert.equal(state.cursor, "abc");
+    assert.equal(Object.getPrototypeOf(state), Object.prototype);
     const probe: Record<string, unknown> = {};
     assert.equal((probe as any).evil, undefined);
   });
 
   it("rejects garbage with the documented error", () => {
     assert.throws(() => deserializePaginationState("!!!not-base64!!!"), /Invalid pagination state/);
+  });
+
+  it("rejects valid JSON that is not a pagination state", () => {
+    // atob() and JSON.parse() succeeding says nothing about the shape; these
+    // used to come back typed as a PaginationState.
+    for (const junk of [
+      { hello: "world" },
+      [1, 2, 3],
+      "a string",
+      null,
+      42,
+      { strategy: "page", done: false },
+      { strategy: "page", done: false, page: "3", offset: 0 },
+    ]) {
+      assert.throws(
+        () => deserializePaginationState(Buffer.from(JSON.stringify(junk)).toString("base64")),
+        /Invalid pagination state/,
+        `${JSON.stringify(junk)} must be refused`,
+      );
+    }
   });
 });
 
@@ -179,6 +233,10 @@ describe("Redactor battle", () => {
 describe("CookieJar.toJSON/fromJSON battle", () => {
   it("round-trips cookies and drops expired ones", () => {
     const jar = new CookieJar();
+    // `sameSite` is a closed union — `"Lax"`, not `"lax"`. A value outside it
+    // is a fixture the library can never produce, and it silently disables the
+    // cookie (see the normalizeSameSite regression below), so a count-only
+    // assertion here would have passed over a jar that sends nothing.
     jar.putCookie({
       name: "sid",
       value: "abc",
@@ -188,7 +246,7 @@ describe("CookieJar.toJSON/fromJSON battle", () => {
       maxAge: null,
       secure: true,
       httpOnly: true,
-      sameSite: "lax",
+      sameSite: "Lax",
       createdAt: Date.now(),
       lastAccessed: Date.now(),
       hostOnly: true,
@@ -197,6 +255,30 @@ describe("CookieJar.toJSON/fromJSON battle", () => {
     assert.equal(json.length, 1);
     const jar2 = CookieJar.fromJSON(JSON.stringify(json));
     assert.equal(jar2.count, 1);
+    // The property that matters is not "stored" but "still sent": a
+    // round-tripped session cookie has to come back out of getCookies.
+    const back = jar2.getCookies({ url: "https://example.com/", sameSiteContext: "lax" });
+    assert.equal(back.length, 1, "a reloaded cookie must still be emitted");
+    assert.equal(back[0]!.name, "sid");
+    assert.equal(back[0]!.value, "abc");
+    assert.equal(back[0]!.secure, true);
+    assert.equal(back[0]!.hostOnly, true);
+    assert.equal(back[0]!.sameSite, "Lax");
+    // `Infinity` does not survive JSON.stringify — it becomes null — so the
+    // session cookie has to be rehydrated as non-expiring, not as expired.
+    assert.equal(back[0]!.expires, Infinity);
+
+    // Expired cookies are still dropped on the way in.
+    const stale = CookieJar.fromJSON(
+      JSON.stringify([
+        {
+          ...json[0]!,
+          name: "old",
+          expires: Date.now() - 1000,
+        },
+      ]),
+    );
+    assert.equal(stale.count, 0);
   });
 
   it("fromJSON is not a prototype-pollution vector", () => {
@@ -647,8 +729,10 @@ describe("CookieJar __Host-/__Secure- retrieval battle", () => {
         hostOnly: false,
       },
     ]);
+    // An explicit SameSite context, so this exercises the __Host- rule rather
+    // than the same-site filter in front of it.
     const names = jar
-      .getCookies({ url: "https://example.com/" })
+      .getCookies({ url: "https://example.com/", sameSiteContext: "none" })
       .map((c) => c.name)
       .sort();
     assert.deepEqual(names, ["__Host-session"]);
@@ -796,6 +880,195 @@ describe("GraphQL upload leaf path guard", () => {
         ]),
       /Invalid upload path|reserved key/,
     );
+  });
+});
+
+// ── Regressions (hardening round) ────────────────────────────────────────────
+//
+// Four defects the assertions above could not see, because each one produced
+// a jar / a log line / a request that looked fine at the surface:
+//
+//   1. `fromJSON` copied `sameSite` through verbatim. `sameSiteAllows` switches
+//      on `"Strict" | "Lax" | "Unset" | "None"` and returns `undefined` for
+//      anything else, and `getCookies` filters on that result — so a persisted
+//      `"lax"`, or a store that omitted the field, gave a jar whose `count`
+//      was 1 and whose cookie was never sent to anything.
+//   2. The redactor's JSON test was narrower than the gate above it, so a
+//      `+json` body logged its `password` field in the clear.
+//   3. `maxRequestSize` estimated multipart bodies with a per-part constant
+//      smaller than the framing it stood in for, and then sent more bytes
+//      than the limit it had just approved.
+//   4. A `__proto__` header was silently eaten on the raw Node path.
+
+describe("Regressions (hardening round)", () => {
+  it("regression: an unrecognised persisted sameSite still yields a usable cookie", () => {
+    // Every one of these used to produce `count === 1` and zero cookies.
+    for (const stored of ["lax", "LAX", "  lax  ", undefined, null, 42, "bogus"]) {
+      const entry: Record<string, unknown> = {
+        name: "sid",
+        value: "abc",
+        domain: "example.com",
+        path: "/",
+        expires: null,
+        secure: true,
+        httpOnly: true,
+        hostOnly: true,
+        createdAt: Date.now(),
+        lastAccessed: Date.now(),
+      };
+      if (stored !== undefined) entry.sameSite = stored;
+
+      const jar = CookieJar.fromJSON(JSON.stringify([entry]));
+      assert.equal(jar.count, 1, `stored=${JSON.stringify(stored)}`);
+      const sameSite = jar.getCookies({
+        url: "https://example.com/",
+        sameSiteContext: "lax",
+      });
+      assert.equal(
+        sameSite.length,
+        1,
+        `stored=${JSON.stringify(stored)} produced a jar that sends nothing`,
+      );
+      assert.equal(sameSite[0]!.value, "abc");
+      // The fail-closed half of the contract survives: "cannot tell" must not
+      // become "send everywhere".
+      assert.equal(
+        jar.getCookies({ url: "https://example.com/", sameSiteContext: "cross-site" }).length,
+        0,
+        `stored=${JSON.stringify(stored)} leaked onto a cross-site request`,
+      );
+    }
+  });
+
+  it("regression: a recognised persisted sameSite keeps its exact meaning", () => {
+    // Normalising must not flatten the three distinguishable behaviours:
+    // Strict refuses a lax context, Lax refuses a cross-site one, and None
+    // refuses neither. `strict` is a subset of `lax`, so Lax *is* allowed in
+    // a strict context — the two are separated by the lax and cross-site
+    // contexts instead.
+    const count = (sameSite: string, context: "strict" | "lax" | "none" | "cross-site") =>
+      CookieJar.fromJSON(
+        JSON.stringify([
+          {
+            name: "sid",
+            value: "v",
+            domain: "example.com",
+            path: "/",
+            expires: null,
+            secure: true,
+            hostOnly: true,
+            createdAt: 0,
+            lastAccessed: 0,
+            sameSite,
+          },
+        ]),
+      ).getCookies({ url: "https://example.com/", sameSiteContext: context }).length;
+
+    for (const [canonical, lowercase] of [
+      ["Lax", "lax"],
+      ["Strict", "strict"],
+      ["None", "none"],
+    ] as const) {
+      assert.equal(
+        count(lowercase, "lax"),
+        count(canonical, "lax"),
+        `${canonical} in a lax context`,
+      );
+      assert.equal(
+        count(lowercase, "cross-site"),
+        count(canonical, "cross-site"),
+        `${canonical} in a cross-site context`,
+      );
+    }
+    assert.equal(count("Strict", "lax"), 0, "Strict must refuse a lax context");
+    assert.equal(count("strict", "lax"), 0);
+    assert.equal(count("Lax", "cross-site"), 0, "Lax must refuse a cross-site context");
+    assert.equal(count("lax", "cross-site"), 0);
+    assert.equal(count("None", "cross-site"), 1, "None rides every context");
+    assert.equal(count("none", "cross-site"), 1);
+  });
+
+  it("regression: a +json body still has its configured fields redacted", () => {
+    // The gate that decides whether a body is logged is `allowedBodyTypes`,
+    // matched with `startsWith`; the gate that decided whether its *fields*
+    // were redacted was `includes("application/json")`. Any config wide enough
+    // to let a `+json` body through therefore logged its secrets.
+    const r = new Redactor({
+      bodyFields: ["password"],
+      logRequestBody: true,
+      allowedBodyTypes: ["application/"],
+    });
+    const check = (redactor: Redactor, ct: string) => {
+      const out = redactor.redactBody('{"password":"hunter2","user":"a"}', ct, false);
+      const parsed = JSON.parse(out.body as string) as Record<string, unknown>;
+      assert.equal(parsed.password, "***", `${ct} leaked the password field`);
+      assert.equal(parsed.user, "a", `${ct} must not disturb the rest`);
+    };
+    for (const ct of [
+      "application/json",
+      "application/vnd.api+json",
+      "application/hal+json",
+      "application/problem+json; charset=utf-8",
+      "application/JSON",
+      "application/JSON; charset=utf-8",
+    ]) {
+      check(r, ct);
+    }
+    // `text/json` needs a config that actually lets a text/* body through;
+    // under `["application/"]` it never reaches the field stage at all.
+    check(
+      new Redactor({
+        bodyFields: ["password"],
+        logRequestBody: true,
+        allowedBodyTypes: ["text/"],
+      }),
+      "text/json",
+    );
+    // A non-JSON body under the same wide config is still not JSON-parsed.
+    const notJson = r.redactBody("password=hunter2", "application/x-www-form-urlencoded", false);
+    assert.equal(notJson.body, "password=hunter2");
+  });
+
+  it("regression: maxRequestSize measures the real multipart bytes", async () => {
+    const { encodeMultipart } = await import("../src/core.ts");
+    const fd = new FormData();
+    fd.append("a", "value");
+    fd.append("file", new Blob([new Uint8Array(64)]), "f.bin");
+    const { bytes } = await encodeMultipart(fd);
+    const real = bytes.byteLength;
+
+    const stub = () => {
+      const seen: number[] = [];
+      const fetchFn = (async (_u: unknown, init?: { body?: unknown }) => {
+        const b = init?.body;
+        seen.push(b instanceof Uint8Array ? b.byteLength : -1);
+        return new Response("{}", { headers: { "content-type": "application/json" } });
+      }) as unknown as typeof fetch;
+      return { seen, fetchFn };
+    };
+
+    // Exactly at the real size: allowed, and exactly that many bytes go out.
+    const ok = stub();
+    const c1 = new Kinetex({
+      baseURL: "https://api.example.com",
+      fetch: ok.fetchFn,
+      maxRequestSize: real,
+    });
+    await c1.post("/x", fd);
+    assert.deepEqual(ok.seen, [real], "the guard must measure what is actually sent");
+    c1.destroy();
+
+    // One byte under: refused. The old per-part estimate was ~45 bytes per
+    // part below the real framing, so this used to sail straight through.
+    const bad = stub();
+    const c2 = new Kinetex({
+      baseURL: "https://api.example.com",
+      fetch: bad.fetchFn,
+      maxRequestSize: real - 1,
+    });
+    await assert.rejects(() => c2.post("/x", fd), /exceeds limit/);
+    assert.deepEqual(bad.seen, [], "nothing may be sent once the limit is exceeded");
+    c2.destroy();
   });
 });
 

@@ -14,6 +14,7 @@ import { mkdirSync, rmSync, existsSync, writeFileSync, readFileSync } from "node
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 import process from "node:process";
+import { nodeExternals } from "./node-externals.ts";
 
 const ROOT = process.cwd();
 const isWindows = process.platform === "win32";
@@ -43,17 +44,9 @@ const distDir = join(ROOT, "dist");
 if (existsSync(distDir)) rmSync(distDir, { recursive: true });
 ["esm", "cjs", "types", "browser"].forEach((d) => mkdirSync(join(distDir, d), { recursive: true }));
 
-const NODE_EXT = [
-  "node:http2",
-  "node:https",
-  "node:http",
-  "node:stream",
-  "node:net",
-  "node:process",
-  "node:buffer",
-  "node:crypto",
-  "node:zlib",
-]
+// Discovered from `src/` rather than listed by hand: see ./node-externals.ts for
+// why a hand-written list kept failing the release build.
+const NODE_EXT = nodeExternals(join(ROOT, "src"))
   .map((m) => `--external:${m}`)
   .join(" ");
 

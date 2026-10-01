@@ -4,12 +4,9 @@
 
 // Dynamic imports for cross-runtime compatibility
 // Use globalThis to avoid static imports that fail in edge runtimes
-// deno-disable-next-line no-process-global
 type NodeProcess = typeof globalThis extends { process: infer P } ? P : never;
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 let _process: NodeProcess | undefined;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 let _Buffer: { isBuffer: (arg: unknown) => boolean } | undefined;
 
 // Check globalThis.process for Node.js runtime detection (no dynamic import needed)
@@ -91,7 +88,16 @@ export function safeJSONParse<T = unknown>(
   text: string,
   options: SafeJSONParseOptions = {},
 ): SafeJSONParseResult<T> {
-  const limits = { ...DEFAULT_LIMITS, ...options };
+  // `{ ...DEFAULT_LIMITS, ...options }` copies an *explicitly present*
+  // `undefined` straight over a real limit, and every comparison this file
+  // makes is `<=` / `>` against a number — so `{ maxDepth: undefined }` did not
+  // mean "use the default", it meant "there is no depth limit", silently. That
+  // is the shape config plumbing produces (`{ maxDepth: env.MAX_DEPTH }`), and
+  // the `Required<>` on `limits` says the opposite. Only defined values merge.
+  const limits: Required<SafeJSONParseOptions> = { ...DEFAULT_LIMITS };
+  for (const [key, value] of Object.entries(options)) {
+    if (value !== undefined) (limits as Record<string, unknown>)[key] = value;
+  }
 
   // Check string length first
   if (text.length > limits.maxStringLength) {
@@ -305,6 +311,46 @@ export function parseUntrustedJSON<T = unknown>(text: string): SafeJSONParseResu
 // ============================================================================
 
 /**
+ * Exact brand test for a platform type.
+ *
+ * `instanceof` is authoritative in the current realm and — unlike a
+ * constructor-name check — survives subclasses, so `new File()` is still a
+ * `Blob`. It fails across realms (an `iframe`'s `Headers` is a different
+ * constructor), so the platform's own `Symbol.toStringTag` is consulted as a
+ * fallback: that is the tag the runtime sets on the real object, and the one
+ * thing a `Map` or a `Set` does not carry.
+ *
+ * The previous guards duck-typed on a *single* method name, which made the
+ * most common built-ins in the language pass for types they are not:
+ * `Map` and `Set` both have `has`, `FormData` has `forEach`, so
+ * `isURLSearchParams(new Map())`, `isURLSearchParams(new Set())` and
+ * `isHeaders(new FormData())` were all `true`. Meanwhile `isBlob` compared
+ * `constructor.name === "Blob"` and rejected every `File`, which is a `Blob`.
+ */
+function hasBrand(
+  value: unknown,
+  ctor: unknown,
+  tag: string,
+  required: readonly string[],
+): boolean {
+  if (value === null || typeof value !== "object") return false;
+  if (typeof ctor === "function") {
+    try {
+      if (value instanceof (ctor as new (...args: never[]) => object)) return true;
+    } catch {
+      // A Proxy with a hostile getPrototypeOf — fall through to the brand.
+    }
+  }
+  // Cross-realm: the runtime's own brand, plus the methods that make the
+  // value usable as the type. The brand alone is one getter away from
+  // anything, and a guard whose whole job is to route a value to the right
+  // code path is not one that should hand it out on a say-so.
+  if (Object.prototype.toString.call(value) !== `[object ${tag}]`) return false;
+  const obj = value as Record<string, unknown>;
+  return required.every((m) => typeof obj[m] === "function");
+}
+
+/**
  * Type guard for Uint8Array.
  *
  * @param value - The value to check
@@ -331,12 +377,7 @@ export function isArrayBuffer(value: unknown): value is ArrayBuffer {
  * @returns True if the value is a ReadableStream.
  */
 export function isReadableStream(value: unknown): value is ReadableStream<Uint8Array> {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    "getReader" in value &&
-    typeof (value as { getReader: () => unknown }).getReader === "function"
-  );
+  return hasBrand(value, globalThis.ReadableStream, "ReadableStream", ["getReader", "cancel"]);
 }
 
 /**
@@ -346,12 +387,7 @@ export function isReadableStream(value: unknown): value is ReadableStream<Uint8A
  * @returns True if the value is a Headers instance.
  */
 export function isHeaders(value: unknown): value is Headers {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    "forEach" in value &&
-    typeof (value as { forEach: () => unknown }).forEach === "function"
-  );
+  return hasBrand(value, globalThis.Headers, "Headers", ["get", "set", "append", "forEach"]);
 }
 
 /**
@@ -361,12 +397,10 @@ export function isHeaders(value: unknown): value is Headers {
  * @returns True if the value is an AbortSignal.
  */
 export function isAbortSignal(value: unknown): value is AbortSignal {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    "aborted" in value &&
-    typeof (value as { aborted: boolean }).aborted === "boolean"
-  );
+  return hasBrand(value, globalThis.AbortSignal, "AbortSignal", [
+    "addEventListener",
+    "removeEventListener",
+  ]);
 }
 
 /**
@@ -376,11 +410,16 @@ export function isAbortSignal(value: unknown): value is AbortSignal {
  * @returns True if the value is a plain Object.
  */
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    Object.prototype.toString.call(value) === "[object Object]"
-  );
+  if (value === null || typeof value !== "object") return false;
+  // `Object.prototype.toString.call(x) === "[object Object]"` is the classic
+  // wrong way to write this: it is true for *every* object whose class does
+  // not override Symbol.toStringTag, so `new (class { constructor() { this.a = 1 } })()`
+  // passed — which is the opposite of what "plain" means, and the reason the
+  // guard cannot be trusted for the copy/merge decisions its name invites.
+  // What makes an object plain is its prototype: Object.prototype, or none at
+  // all (a null-prototype object is a dictionary, and still plain).
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
 /**
@@ -390,11 +429,7 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
  * @returns True if the value is a FormData instance.
  */
 export function isFormData(value: unknown): value is FormData {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    (value as FormData).constructor?.name === "FormData"
-  );
+  return hasBrand(value, globalThis.FormData, "FormData", ["append", "get", "getAll", "set"]);
 }
 
 /**
@@ -404,9 +439,10 @@ export function isFormData(value: unknown): value is FormData {
  * @returns True if the value is a Blob instance.
  */
 export function isBlob(value: unknown): value is Blob {
-  return (
-    value !== null && typeof value === "object" && (value as Blob).constructor?.name === "Blob"
-  );
+  // File extends Blob, and its own brand is "[object File]", so this is
+  // `instanceof`-first on purpose: a constructor-name check rejected every
+  // File, which is the single most common Blob-shaped value in a browser.
+  return hasBrand(value, globalThis.Blob, "Blob", ["arrayBuffer", "slice", "text", "stream"]);
 }
 
 /**
@@ -416,12 +452,12 @@ export function isBlob(value: unknown): value is Blob {
  * @returns True if the value is a URLSearchParams instance.
  */
 export function isURLSearchParams(value: unknown): value is URLSearchParams {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    "has" in value &&
-    typeof (value as { has: () => boolean }).has === "function"
-  );
+  return hasBrand(value, globalThis.URLSearchParams, "URLSearchParams", [
+    "append",
+    "get",
+    "getAll",
+    "sort",
+  ]);
 }
 
 // ============================================================================
@@ -451,13 +487,20 @@ export function isValidHeaderName(name: string): boolean {
 export function isValidHeaderValue(value: unknown): boolean {
   if (typeof value !== "string") return false;
   if (value.length > 8192) return false; // Reasonable length limit
-  // Header values can contain any ASCII except CTLs and CRLF (header injection)
-  // Per RFC 7230, HT (0x09) is allowed in header values
+  // RFC 9110 §5.5: field-value is VCHAR / SP / HTAB / obs-text, where obs-text
+  // is %x80-FF. So a value may hold the Latin-1 range and nothing above it —
+  // there is no upper bound in the loop, which accepted an emoji and then let
+  // the very next `new Headers({ "X-A": "\u{1F600}" })` throw
+  // "Cannot convert argument to a ByteString because the character at index 0
+  // has a value of 55357". This guard is what a caller checks first, so a
+  // "valid" verdict that the runtime then refuses is worse than no verdict.
   for (let i = 0; i < value.length; i++) {
     const code = value.charCodeAt(i);
-    // No control characters (0-31 except 9=HT), 127
-    // No CRLF (13 = \r, 10 = \n) - prevents header injection
-    if ((code < 32 && code !== 9) || code === 127 || code === 13 || code === 10) return false;
+    // No control characters (0-31 except 9=HT) and no DEL — CR and LF are
+    // inside that range, so this is also the header-injection guard.
+    if ((code < 32 && code !== 9) || code === 127) return false;
+    // Above obs-text: a code point no ByteString header value can carry.
+    if (code > 0xff) return false;
   }
   return true;
 }
@@ -651,11 +694,7 @@ function isBlockedIPv6(b: Uint8Array): boolean {
   if (b[0] === 0x20 && b[1] === 0x01 && b[2] === 0x0d && b[3] === 0xb8) return true;
 
   // ::ffff:0:0/96 — IPv4-mapped → apply the IPv4 checks to the tail
-  if (
-    b.slice(0, 10).every((x) => x === 0) &&
-    b[10] === 0xff &&
-    b[11] === 0xff
-  ) {
+  if (b.slice(0, 10).every((x) => x === 0) && b[10] === 0xff && b[11] === 0xff) {
     return isBlockedIPv4(read32(12));
   }
   // ::/96 — deprecated IPv4-compatible → apply the IPv4 checks to the tail
@@ -794,7 +833,25 @@ export function deepClone<T>(value: T): T {
     value.forEach((v) => cloned.add(deepClone(v)));
     return cloned as T;
   }
-  const cloned: Record<string, unknown> = {};
+  // A class instance is rebuilt on *its own* prototype. The walk below
+  // produced a bare `{}` for every object that was not a plain one, so
+  // `deepClone(new (class { m() { return 1 } })())` came back as an `Object`
+  // with `m` gone — the clone was no longer the thing it was cloned from, and
+  // the failure was silent until something called a method. `new (proto)()` is
+  // not generally callable, so the instance is created with its prototype
+  // attached and its own properties copied across.
+  //
+  // A *host* object — RegExp, URL, a typed array, an Error — is not: those
+  // carry internal slots that `Object.create` cannot produce, and
+  // `Object.create(RegExp.prototype)` satisfies `instanceof` while throwing
+  // "called on non-RegExp object" the moment a getter is touched. The brand is
+  // the discriminator, and it is exact: a class instance reports the plain
+  // `[object Object]`, because the brand comes from the runtime, not the
+  // constructor. Those keep the dictionary form they always had.
+  const proto = Object.getPrototypeOf(value);
+  const isClassInstance = Object.prototype.toString.call(value) === "[object Object]";
+  const cloned: Record<string, unknown> =
+    proto === Object.prototype || proto === null || !isClassInstance ? {} : Object.create(proto);
   for (const key in value) {
     // Prototype-pollution guard: never copy __proto__ / constructor / prototype
     if (key === "__proto__" || key === "constructor" || key === "prototype") continue;
@@ -852,7 +909,27 @@ export function createStructuredError(
   context: ErrorContext,
 ): Error & ErrorContext {
   const error = new Error(message) as Error & ErrorContext;
-  Object.assign(error, context);
+  // `Object.assign` writes through [[Set]], so a context carrying an *own*
+  // `__proto__` key — which is exactly what `JSON.parse('{"__proto\u003a…}')`
+  // produces, and what a caller forwarding a remote error payload hands over —
+  // did not add a field. It reached the inherited `__proto__` setter and
+  // replaced the error's prototype, so the attacker-supplied object sat in the
+  // prototype chain of every error the client then went on to format, log or
+  // inspect. The one key that has to be expressible is written as a data
+  // property, which is what was meant.
+  for (const key of Object.keys(context)) {
+    const value = (context as Record<string, unknown>)[key];
+    if (key === "__proto__") {
+      Object.defineProperty(error, key, {
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+      continue;
+    }
+    (error as unknown as Record<string, unknown>)[key] = value;
+  }
   return error;
 }
 
@@ -869,10 +946,39 @@ export function formatError(error: unknown): string {
         context[key] = value;
       }
     }
-    const contextStr = Object.keys(context).length > 0 ? ` | ${JSON.stringify(context)}` : "";
+    const contextStr = Object.keys(context).length > 0 ? ` | ${safeStringify(context)}` : "";
     return `${error.name}: ${error.message}${contextStr}`;
   }
   return String(error);
+}
+
+/**
+ * `JSON.stringify` for a log line, on a value that is very likely to be
+ * hostile.
+ *
+ * The context attached by {@link createStructuredError} is whatever the failing
+ * call had in hand — a `request`, a `response`, a `cause` — and all three
+ * routinely point back at each other. `JSON.stringify` answers that with a
+ * thrown `TypeError: Converting circular structure to JSON`, and a BigInt with
+ * another, so the function whose entire job is to turn an error into a string
+ * threw instead, taking the `catch` that was logging it down with it.
+ */
+function safeStringify(value: unknown): string {
+  const seen = new Set<object>();
+  try {
+    return (
+      JSON.stringify(value, (_key, v: unknown) => {
+        if (typeof v === "bigint") return v.toString();
+        if (typeof v === "object" && v !== null) {
+          if (seen.has(v)) return "[Circular]";
+          seen.add(v);
+        }
+        return v;
+      }) ?? String(value)
+    );
+  } catch {
+    return String(value);
+  }
 }
 
 // ============================================================================
@@ -986,8 +1092,14 @@ export function concatUint8Arrays(chunks: Uint8Array[]): Uint8Array {
  * @returns Uint8Array or null if unsupported type
  */
 export function toUint8Array(data: string | Uint8Array | ArrayBuffer | unknown): Uint8Array | null {
+  // Both branches copy. The Uint8Array branch sliced but the ArrayBuffer
+  // branch wrapped, so the same call handed back a copy for one input type and
+  // a live view for the other: writing to the result of
+  // `toUint8Array(buffer)` wrote through to the caller's buffer, and two calls
+  // given the same buffer shared it. A function whose output is "the bytes" has
+  // to be the same kind of thing whichever type it was handed.
   if (data instanceof Uint8Array) return data.slice();
-  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (data instanceof ArrayBuffer) return new Uint8Array(data.slice(0));
   const b = getBuffer();
   if (b && b.isBuffer(data)) {
     return new Uint8Array(data as unknown as ArrayBufferLike);
@@ -1055,11 +1167,37 @@ export function mergeSignals(
 
   if (validSignals.length === 1) return validSignals[0]!;
 
-  // Check if any signal is already aborted
-  if (validSignals.some((s) => s.aborted)) {
+  // Check if any signal is already aborted.
+  //
+  // `controller.abort()` with no argument installs the platform's generic
+  // `AbortError: This operation was aborted`, which threw away *why* the call
+  // was aborted. The two-live-signal branch below preserves the reason, and so
+  // does the `AbortSignal.any` path this function prefers on every current
+  // runtime — so the one case a caller is most likely to hit (a signal that
+  // already fired, e.g. `AbortSignal.timeout()`) was the only one that lost
+  // it. `interceptors.ts` re-aborts with `existing.reason` when merging, and
+  // anything reading the merged signal's reason saw a bare AbortError where it
+  // should have seen the caller's TimeoutError or their own Error.
+  const preAborted = validSignals.find((s) => s.aborted);
+  if (preAborted) {
     const controller = new AbortController();
-    controller.abort();
+    controller.abort(preAborted.reason);
     return controller.signal;
+  }
+
+  // The platform primitive, where it exists. The hand-rolled version below
+  // attached an `abort` listener to every input and only ever removed it when
+  // one of those inputs fired — so merging a long-lived caller signal (a
+  // request-scoped controller is the usual one) accumulated one listener per
+  // merge, forever, and tripped Node's MaxListenersExceededWarning at 11.
+  // The "9.11" self-cleanup that was supposed to release them could not run:
+  // the merged controller is never handed out, so nothing but the inputs can
+  // ever abort it. `AbortSignal.any` holds its inputs weakly and adds nothing
+  // observable to them. Node 20.3+, Deno, Bun and current browsers have it;
+  // the manual path remains for Node 18 and older.
+  const nativeAny = (AbortSignal as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  if (typeof nativeAny === "function") {
+    return nativeAny.call(AbortSignal, validSignals);
   }
 
   const controller = new AbortController();
@@ -1069,16 +1207,6 @@ export function mergeSignals(
     for (const s of validSignals) s.removeEventListener("abort", abort);
     controller.abort(_abortError());
   };
-
-  // 9.11: when the merged signal itself aborts (e.g. from another path), also clean up.
-  // This prevents listener accumulation when callers abort the controller externally.
-  controller.signal.addEventListener(
-    "abort",
-    () => {
-      for (const s of validSignals) s.removeEventListener("abort", abort);
-    },
-    { once: true },
-  );
 
   for (const s of validSignals) s.addEventListener("abort", abort, { once: true });
 
@@ -1229,7 +1357,33 @@ export function hasNativeFetch(): boolean {
 export function normalizeHeaders(headers: Headers): Record<string, string> {
   const result: Record<string, string> = {};
   headers.forEach((value, key) => {
-    result[key.toLowerCase()] = value;
+    const name = key.toLowerCase();
+    // `__proto__` is a legal header name — it is made of token characters — and
+    // `result[name] = value` is a [[Set]], so a response carrying it went
+    // through the inherited setter, which ignores a primitive. The header did
+    // not overwrite anything; it simply disappeared, and the caller reading the
+    // normalized record never learned the response had sent it.
+    if (name === "__proto__") {
+      Object.defineProperty(result, name, {
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+      return;
+    }
+    // `Set-Cookie` is the one header the Fetch spec does NOT combine: it
+    // yields each cookie as a separate `forEach` entry, while every other
+    // repeated header arrives already joined with ", ". Assigning therefore
+    // overwrote: a response setting two cookies normalized to the last one
+    // only, and the first vanished with no error anywhere. `Headers.get()`
+    // reports them combined as "a=1, b=2", so accumulate to match it — the
+    // cookie jar splits this form back apart with `splitSetCookieHeaders`.
+    if (name === "set-cookie" && Object.hasOwn(result, name)) {
+      result[name] = `${result[name]}, ${value}`;
+      return;
+    }
+    result[name] = value;
   });
   return result;
 }

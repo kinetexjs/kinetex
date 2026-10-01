@@ -13,12 +13,16 @@
  *     the deno CLI is not installed — CI runs them on the release PR)
  *  4. Commits the version bump on a release branch `release/vX.Y.Z`
  *  5. Pushes the branch and opens a PR titled `chore: release vX.Y.Z`
- *  6. Optionally (--merge): waits for required checks, squash-merges the PR,
- *     tags the commit that landed on main and pushes the tag — which triggers
- *     the publish pipelines (npm, JSR, GitHub Release)
+ *  6. Waits for required checks, squash-merges the PR, tags the commit that
+ *     landed on main and pushes the tag — which triggers the publish
+ *     pipelines (npm, JSR, GitHub Release)
+ *
+ * One command ships a release end to end. The only manual step anywhere in
+ * the flow is the version bump itself, which this script owns: it is never
+ * hand-edited in `package.json` or `deno.json`.
  *
  * Re-runnability: if the current branch is already an open release PR branch,
- * `--merge` skips straight to step 6 (useful after checks went green).
+ * the script skips straight to step 6 (useful after checks went green).
  *
  * Usage:
  *   npm run release              # patch bump (1.2.0 → 1.2.1)
@@ -28,10 +32,10 @@
  *
  * Flags:
  *   --no-pr      Stop after committing locally (no push, no PR)
- *   --merge      Wait for required checks, squash-merge, tag and push the tag.
- *                Requires the GitHub CLI (gh) and repo-review rights.
- *                Default: open the PR and stop (a human approves/merges).
- *   --draft      Open the release PR as a draft
+ *   --no-merge   Open the release PR and stop, without waiting for checks,
+ *                merging or pushing the tag. A human finishes it. The tag
+ *                step is then re-run by re-running this script on the branch.
+ *   --draft      Open the release PR as a draft (implies waiting for a human)
  */
 
 import { execSync } from "node:child_process";
@@ -59,9 +63,17 @@ const runSilent = (cmd: string): string => {
 
 const runSilentAllowFail = (cmd: string): string => {
   try {
-    return runSilent(cmd);
-  } catch {
-    return "";
+    return execSync(cmd, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  } catch (err) {
+    // A non-zero exit is a normal answer here — `gh pr checks` exits 8 as
+    // soon as one check has failed, and its report is still on stdout.
+    // Discarding it made every caller read a *failing* run as one that had
+    // not started yet, which is how a release sat waiting for checks that
+    // were already reporting a failure.
+    return (err as { stdout?: Buffer }).stdout?.toString().trim() ?? "";
   }
 };
 
@@ -103,14 +115,24 @@ interface Cli {
 
 function parseArgs(argv: string[]): Cli {
   const bumpParts: string[] = [];
-  const cli: Cli = { bump: "patch", noPr: false, merge: false, draft: false };
+  // `--merge` is the DEFAULT. One command ships a release end to end: bump,
+  // verify, commit, push, open the PR, wait for checks, merge, tag, push the
+  // tag. Stopping halfway is the opt-in (`--no-merge`), because a half-run
+  // release that has to be finished by hand is the state that leaves the
+  // repository with an unreleased version bump sitting on a branch.
+  const cli: Cli = { bump: "patch", noPr: false, merge: true, draft: false };
   for (const a of argv) {
     if (a === "--no-pr") cli.noPr = true;
+    else if (a === "--no-merge") cli.merge = false;
     else if (a === "--merge") cli.merge = true;
     else if (a === "--draft") cli.draft = true;
     else bumpParts.push(a);
   }
   if (bumpParts.length > 0) cli.bump = bumpParts[0]!;
+  // A draft PR cannot be merged, so asking for one means a human is going to
+  // finish this release. Merging is then skipped rather than attempted and
+  // failed at the `gh pr merge` step.
+  if (cli.draft) cli.merge = false;
   return cli;
 }
 
@@ -134,7 +156,7 @@ function releasePrBody(oldVersion: string, newVersion: string): string {
     "",
     "Tag push triggers: release.yml (GitHub Release), publish.yml (npm + JSR), docs.yml (TypeDoc).",
     "",
-    `Or re-run \`npm run release -- --merge\` on this branch to merge + tag automatically.`,
+    `Or re-run \`npm run release ${newVersion}\` on this branch to wait for checks, merge and tag automatically.`,
   ]
     .filter((l) => l !== "")
     .join("\n");
@@ -160,7 +182,7 @@ const sleepSync = (ms: number): void => {
  * Treating that as a failure aborted the very first release run with
  * "Required checks failed" before a single check had started.
  */
-function waitForChecks(branch: string, timeoutMs = 180_000): boolean {
+function waitForChecks(branch: string, timeoutMs = 600_000): boolean {
   const deadline = Date.now() + timeoutMs;
   let announced = false;
   while (Date.now() < deadline) {
@@ -179,7 +201,7 @@ function mergeAndTag(newVersion: string, branch: string): void {
   console.log("\n[merge] Waiting for required checks...");
   if (!waitForChecks(branch)) {
     console.error(
-      "❌ No checks were registered for this PR within 180s — not merging.\n" +
+      "❌ No checks were registered for this PR within 600s — not merging.\n" +
         `   Inspect with: gh pr checks ${branch}`,
     );
     process.exit(1);
@@ -252,21 +274,32 @@ async function main() {
     process.exit(1);
   }
   // gh auth only matters when a PR will actually be opened or merged.
-  if (hasGh && !cli.noPr) runSilent("gh auth status"); // throws with gh's own message if unauthenticated
+  // Probe with a real API call rather than `gh auth status`: the latter asks
+  // about the *account* behind the credential, which a repository-scoped
+  // GitHub App installation token has none of. It answers "not logged into
+  // any GitHub hosts" for a token that is perfectly able to open a PR on this
+  // repository, so it is a false negative that aborts the release before it
+  // starts. Asking the repo whether it can see us is the question that
+  // actually matters.
+  if (hasGh && !cli.noPr) {
+    runSilent("gh api repos/{owner}/{repo} --jq .name");
+  }
   if (!hasDeno) {
     console.log(
       "  ℹ deno CLI not found — skipping local deno check/lint (CI runs both on the release PR).",
     );
   }
 
-  // Re-run support: already on an open release PR branch + --merge → merge now.
+  // Re-run support: already on an open release PR branch → go straight to
+  // the merge + tag phase. This is the default, so a re-run finishes a
+  // release that was opened with `--no-merge`.
   const onReleaseBranch = /^release\/v(\d+\.\d+\.\d+)$/.exec(startBranch);
   if (onReleaseBranch) {
     const version = onReleaseBranch[1]!;
     if (!cli.merge) {
       console.log(
         `\nℹ Branch ${startBranch} already has (or is meant for) the release PR.\n` +
-          `  Re-run with --merge to wait for checks, merge and tag v${version}.`,
+          `  Re-run without --no-merge to wait for checks, merge and tag v${version}.`,
       );
       return;
     }
@@ -274,7 +307,7 @@ async function main() {
     if (prState !== "OPEN") {
       console.error(
         `❌ No open PR found for ${startBranch} (state: ${prState || "none"}).` +
-          `${prState === "MERGED" ? " If it was merged, delete this branch and re-run --merge from main — the tag step is safe to redo." : ""}`,
+          `${prState === "MERGED" ? " If it was merged, delete this branch and re-run from a branch off main — the tag step is safe to redo." : ""}`,
       );
       process.exit(1);
     }
@@ -289,14 +322,36 @@ async function main() {
   runSilent("git fetch origin main --tags");
   const head = runSilent("git rev-parse --short HEAD");
   const originMain = runSilent("git rev-parse --short origin/main");
-  if (head !== originMain) {
-    console.error(
-      `❌ This branch (${head}) is not level with origin/main (${originMain}).\n` +
-        "   Rebase or merge main first — releases must be cut from latest main.",
-    );
+  // Releases must be cut from a base that CONTAINS origin/main, not from one
+  // that equals it. Requiring `HEAD === origin/main` meant the work being
+  // released had to already be on origin — which is a manual push of exactly
+  // the code this script exists to ship, and a push straight to main is
+  // refused outright. So a branch carrying unreleased commits is the normal
+  // case; only a base that has fallen behind main (or diverged from it) is
+  // an error.
+  try {
+    runSilent("git merge-base --is-ancestor origin/main HEAD");
+  } catch {
+    const behind = runSilentAllowFail("git rev-list --count HEAD..origin/main");
+    if (behind && Number(behind) > 0) {
+      console.error(
+        `❌ ${head} is ${behind} commit(s) behind origin/main (${originMain}).\n` +
+          "   Merge or rebase main first — a release must not be cut from a stale base.",
+      );
+    } else {
+      console.error(
+        `❌ ${head} has diverged from origin/main (${originMain}).\n` +
+          "   Merge or rebase main first — a release must not be cut from a divergent base.",
+      );
+    }
     process.exit(1);
   }
-  console.log("  ✓ Level with origin/main");
+  const ahead = runSilentAllowFail("git rev-list --count origin/main..HEAD");
+  console.log(
+    ahead && Number(ahead) > 0
+      ? `  ✓ Contains origin/main, with ${ahead} commit(s) to release`
+      : "  ✓ Level with origin/main",
+  );
 
   // ── Version bump ─────────────────────────────────────────────────────────
   console.log("\n[2/6] Bumping version...");
@@ -388,11 +443,12 @@ async function main() {
   if (!cli.merge) {
     banner(newVersion, [
       `PR opened: ${prUrl}`,
-      "Next (a human approves + merges), then tag the squash commit:",
+      "Stopped before merging (--no-merge). To finish it with one command:",
+      `  git checkout ${branch} && npm run release ${newVersion}`,
+      "Otherwise, by hand, once the PR is merged:",
       "  git fetch origin main --tags",
       `  git tag -a v${newVersion} -m "Release v${newVersion}" origin/main`,
       `  git push origin v${newVersion}   ← triggers npm/JSR/GitHub Release`,
-      `Or, while on branch ${branch}: npm run release -- --merge`,
     ]);
     return;
   }

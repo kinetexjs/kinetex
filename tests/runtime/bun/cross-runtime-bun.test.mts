@@ -127,6 +127,26 @@ async function main() {
     assert.ok(t instanceof FetchTransport);
   });
 
+  // The HTTP/2 session pool is Node-native. On Bun the transport is always
+  // FetchTransport, so `sessionPool` has nothing to tune — but it must be
+  // accepted and silently ignored, not throw and not change transport
+  // selection. Sockets here belong to Bun's own fetch, not to kinetex.
+  await test("sessionPool is accepted and ignored on Bun", () => {
+    const t = createTransport(undefined, true, { maxSessions: 4, sessionTTLMs: 1234 });
+    assert.ok(
+      t instanceof FetchTransport,
+      "session options must not pull Bun onto the Node HTTP/2 transport",
+    );
+    assert.ok(!(t instanceof NodeHTTP2Transport));
+  });
+
+  await test("a client with sessionPool builds a FetchTransport", async () => {
+    const client = new Kinetex({ sessionPool: { maxSessions: 2, http1KeepAlive: false } });
+    const t = (client as unknown as { transport: unknown }).transport;
+    assert.ok(t instanceof FetchTransport);
+    await client.destroy();
+  });
+
   suite("Kinetex client in Bun");
 
   await test("GET to httpbin returns 200", async () => {

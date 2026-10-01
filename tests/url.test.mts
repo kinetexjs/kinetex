@@ -51,6 +51,7 @@ import {
   redactURL,
   kinetex,
 } from "../src/mod.ts";
+import { URLValidationError } from "../src/url.ts";
 
 let passed = 0,
   failed = 0;
@@ -58,7 +59,13 @@ const failures: Array<{ name: string; err: unknown }> = [];
 
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
   try {
-    await fn();
+    // Almost every test here makes a live call to httpbin or jsonplaceholder.
+    // The clients carry a 30s timeout, so a hung socket fails on its own --
+    // but a test that never settles for another reason (a promise nobody
+    // resolves) would park the whole file with no output at all, which is
+    // indistinguishable from a slow machine. 45s leaves headroom over the
+    // client timeout so a genuine network failure is still reported as that.
+    await withTimeout(Promise.resolve().then(fn), 45_000, name);
     console.log(`  ✅  ${name}`);
     passed++;
   } catch (err) {
@@ -71,6 +78,26 @@ async function test(name: string, fn: () => Promise<void>): Promise<void> {
 
 function suite(name: string): void {
   console.log(`\n── ${name}`);
+}
+
+/** Reject with a timeout error if `p` does not settle within `ms`. */
+function withTimeout<T>(p: Promise<T>, ms: number, name: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`test "${name}" timed out after ${ms}ms`)), ms);
+    if (typeof (t as unknown as { unref?: () => void }).unref === "function") {
+      (t as unknown as { unref: () => void }).unref();
+    }
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
 }
 
 const T = 30_000;
@@ -293,21 +320,46 @@ await test("joinPath constructs valid path — verified via kinetex", async () =
 
   try {
     const r = await json.get(path);
-    console.log("    Status:", r.status);
     assert.equal(r.status, 200);
-  } catch {
-    // Network flakiness - skip assert on real API
-    console.log("    (network issue, skipping assertion)");
+  } catch (e) {
+    // This catch encloses its own `assert.equal`, so the bare `catch {}` it
+    // replaced could swallow a *failing assertion* as readily as a flaky
+    // network — reporting a pass for a broken joinPath. Only a genuine
+    // transport failure may be tolerated.
+    const why = `${(e as { name?: string })?.name ?? ""}: ${(e as { message?: string })?.message ?? String(e)}`;
+    assert.ok(
+      /fetch failed|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|ECONNRESET|EAI_AGAIN|timeout|network|socket/i.test(
+        why,
+      ),
+      `joinPath verification failed for a non-network reason and must not be skipped: ${why}`,
+    );
+    console.log(`    → upstream unavailable, skipping: ${why}`);
   }
 });
 
-await test("normalizePath removes extra slashes — verified via kinetex", async () => {
-  const path = normalizePath("//users///1////posts");
-  console.log("    normalized path:", path);
-
-  const r = await json.get("/users/1/posts");
-  console.log("    Status:", r.status);
-  assert.strictEqual(r.status, 200);
+await test("normalizePath removes extra slashes", async () => {
+  // The old version built the path, printed it, and then fetched a
+  // hard-coded "/users/1/posts" -- so normalizePath's own output was never
+  // checked by anything in this file.
+  assert.equal(normalizePath("//users///1////posts"), "/users/1/posts");
+  // Dot segments resolved.
+  assert.equal(normalizePath("/a/./b/../c"), "/a/c");
+  // `..` cannot climb above the root.
+  assert.equal(normalizePath("/../../etc/passwd"), "/etc/passwd");
+  // A relative path comes back rooted, and the root itself is stable.
+  assert.equal(normalizePath("users/1"), "/users/1");
+  assert.equal(normalizePath("/"), "/");
+  assert.equal(normalizePath(""), "/");
+  // The trailing-slash policy, which the default only ever "preserves".
+  assert.equal(normalizePath("/a/b"), "/a/b");
+  assert.equal(normalizePath("/a/b/"), "/a/b/");
+  assert.equal(normalizePath("/a/b", { trailingSlash: "add" }), "/a/b/");
+  assert.equal(normalizePath("/a/b/", { trailingSlash: "remove" }), "/a/b");
+  // ...and the root is exempt from both.
+  assert.equal(normalizePath("/", { trailingSlash: "add" }), "/");
+  assert.equal(normalizePath("/", { trailingSlash: "remove" }), "/");
+  // ...and from "preserve" too, which is the one that used to double it.
+  assert.equal(normalizePath("//"), "/");
 });
 
 await test("fillPathParams substitution — verified via kinetex", async () => {
@@ -317,7 +369,6 @@ await test("fillPathParams substitution — verified via kinetex", async () => {
 
   const r = await json.get(path);
   const data = r.data as { id: number; title: string };
-  console.log("    Real API response:", JSON.stringify(data));
   assert.equal(data.id, 1);
   assert.strictEqual(data.title.length > 0, true);
 });
@@ -387,105 +438,119 @@ await test("Real API: normalizeURL on httpbin response URL", async () => {
 
 suite("URLBuilder fluent API");
 
-await test("URLBuilder withProtocol — verified via kinetex", async () => {
+await test("URLBuilder withProtocol", async () => {
   const url = URLBuilder.from("https://httpbin.org/get").withProtocol("http").toString();
-  console.log("    Protocol changed:", url);
-
-  const r = await bin.get(url.replace("https://httpbin.org", ""));
-  assert.equal(r.status, 200);
+  // The old version asserted only that a request to "/get" returned 200,
+  // which says nothing about the protocol the builder produced.
+  assert.equal(url, "http://httpbin.org/get");
+  assert.equal(new URL(url).protocol, "http:");
 });
 
-await test("URLBuilder withHostname — verified via kinetex", async () => {
+await test("URLBuilder withHostname", async () => {
   const url = URLBuilder.http("httpbin.org", "/get").toString();
-  console.log("    HTTP URL:", url);
-
-  const r = await bin.get(url.replace("https://httpbin.org", ""));
+  assert.equal(url, "http://httpbin.org/get");
+  // ...and the round trip the old test meant to check: a URL built by the
+  // builder is one this client can actually fetch.
+  const r = await bin.get(
+    URLBuilder.http("httpbin.org", "/get").toString().replace("http://httpbin.org", ""),
+  );
   assert.equal(r.status, 200);
 });
 
-await test("URLBuilder withPort — verified via kinetex", async () => {
-  const baseUrl = URLBuilder.from("https://httpbin.org/get");
-  console.log("    Base URL:", baseUrl.toString());
-
-  const r = await bin.get("/get");
-  assert.equal(r.status, 200);
+await test("URLBuilder withPort", async () => {
+  // `withPort` was never called here at all -- the test built a base URL,
+  // printed it, and then fetched a hard-coded "/get".
+  assert.equal(
+    URLBuilder.from("https://example.com").withPort(8080).toString(),
+    "https://example.com:8080/",
+  );
+  assert.equal(
+    new URL(URLBuilder.from("https://example.com/a").withPort(8080).toString()).port,
+    "8080",
+  );
+  // A default port is normalised away by the URL itself, not re-added.
+  assert.equal(new URL(URLBuilder.from("https://example.com/a").withPort(443).toString()).port, "");
 });
 
-await test("URLBuilder.setParam — verified via kinetex", async () => {
+await test("URLBuilder.setParam", async () => {
   const url = URLBuilder.from("https://httpbin.org/get")
     .setParam("page", "1")
     .setParam("limit", "10")
     .toString();
-  console.log("    URL with params:", url);
-
-  const r = await bin.get("/get", { params: { page: "1", limit: "10" } });
-  const args = (r.data as { args: Record<string, string> }).args;
-  console.log("    Server received:", JSON.stringify(args));
-  assert.equal(args.page, "1");
-  assert.equal(args.limit, "10");
+  assert.equal(url, "https://httpbin.org/get?page=1&limit=10");
+  // `set` replaces rather than appends.
+  assert.equal(
+    URLBuilder.from("https://example.com/?a=1").setParam("a", "2").toString(),
+    "https://example.com/?a=2",
+  );
 });
 
-await test("URLBuilder.appendParam — verified via kinetex", async () => {
+await test("URLBuilder.appendParam", async () => {
   const url = URLBuilder.from("https://httpbin.org/get")
     .appendParam("tag", "a")
     .appendParam("tag", "b")
     .toString();
-  console.log("    URL with repeated:", url);
-
-  const r = await bin.get("/get", { params: { tag: ["a", "b"] } });
-  const args = (r.data as { args: Record<string, string | string[]> }).args;
-  console.log("    Server received tags:", JSON.stringify(args.tag));
-  const tags = Array.isArray(args.tag) ? args.tag : [args.tag];
-  assert.strictEqual(url.includes("tag=a") && url.includes("tag=b"), true);
+  // Two entries with the same name, in order -- `includes("tag=a") && ...`
+  // also passed for a single `tag=ab`.
+  assert.equal(url, "https://httpbin.org/get?tag=a&tag=b");
+  assert.deepStrictEqual(new URL(url).searchParams.getAll("tag"), ["a", "b"]);
+  // A nullish value is a no-op rather than a literal "null".
+  assert.equal(
+    URLBuilder.from("https://example.com/?a=1")
+      .appendParam("b", null as unknown as string)
+      .toString(),
+    "https://example.com/?a=1",
+  );
 });
 
-await test("URLBuilder.deleteParam — verified via kinetex", async () => {
+await test("URLBuilder.deleteParam", async () => {
   const base = URLBuilder.from("https://httpbin.org/get?a=1&b=2&c=3");
-  const modified = base.deleteParam("b");
-  const url = modified.toString();
-  console.log("    URL after delete:", url);
-
-  const r = await bin.get("/get", { params: { a: "1", c: "3" } });
-  const args = (r.data as { args: Record<string, string> }).args;
-  console.log("    Server received:", JSON.stringify(args));
-  assert.equal(args.a, "1");
-  assert.equal(args.c, "3");
+  const url = base.deleteParam("b").toString();
+  assert.equal(url, "https://httpbin.org/get?a=1&c=3");
+  // Every occurrence goes, and an absent key is a no-op.
+  assert.equal(
+    URLBuilder.from("https://example.com/?t=a&t=b").deleteParam("t").toString(),
+    "https://example.com/",
+  );
+  assert.equal(base.deleteParam("zzz").toString(), "https://httpbin.org/get?a=1&b=2&c=3");
 });
 
-await test("URLBuilder.query — verified via kinetex", async () => {
+await test("URLBuilder.query", async () => {
   const url = URLBuilder.from("https://httpbin.org/get?existing=1")
     .query({ added: "2", existing: null })
     .toString();
-  console.log("    URL after query merge:", url);
-
-  const r = await bin.get("/get", { params: { added: "2" } });
-  const args = (r.data as { args: Record<string, string> }).args;
-  console.log("    Server received:", JSON.stringify(args));
-  assert.equal(args.added, "2");
+  // Merged in, and a null value DELETED -- the old test only checked the
+  // echo of `{ added: "2" }, which the builder's `existing` handling could
+  // have got entirely wrong.
+  assert.equal(url, "https://httpbin.org/get?added=2");
+  // An array becomes repeated keys, in order.
+  assert.equal(
+    URLBuilder.from("https://example.com/")
+      .query({ t: ["a", "b"] })
+      .toString(),
+    "https://example.com/?t=a&t=b",
+  );
 });
 
-await test("URLBuilder.pickParams — verified via kinetex", async () => {
+await test("URLBuilder.pickParams", async () => {
   const url = URLBuilder.from("https://httpbin.org/get?a=1&b=2&c=3")
     .pickParams("a", "c")
     .toString();
-  console.log("    URL with picked params:", url);
-
-  const r = await bin.get("/get", { params: { a: "1", c: "3" } });
-  const args = (r.data as { args: Record<string, string> }).args;
-  console.log("    Server received:", JSON.stringify(args));
-  assert.equal(args.a, "1");
-  assert.equal(args.c, "3");
+  assert.equal(url, "https://httpbin.org/get?a=1&c=3");
+  assert.equal(
+    URLBuilder.from("https://example.com/?a=1").pickParams("zzz").toString(),
+    "https://example.com/",
+  );
 });
 
-await test("URLBuilder.omitParams — verified via kinetex", async () => {
+await test("URLBuilder.omitParams", async () => {
   const url = URLBuilder.from("https://httpbin.org/get?a=1&b=2&c=3").omitParams("b").toString();
-  console.log("    URL with omitted:", url);
-
-  const r = await bin.get("/get", { params: { a: "1", c: "3" } });
-  const args = (r.data as { args: Record<string, string> }).args;
-  console.log("    Server received:", JSON.stringify(args));
-  assert.equal(args.a, "1");
-  assert.strictEqual("b" in args, false);
+  assert.equal(url, "https://httpbin.org/get?a=1&c=3");
+  // Omitting several, and omitting an absent key.
+  assert.equal(
+    URLBuilder.from("https://example.com/?a=1&b=2&c=3").omitParams("a", "c", "zzz").toString(),
+    "https://example.com/?b=2",
+  );
 });
 
 await test("URLBuilder.sortParams — verified via kinetex", async () => {
@@ -522,7 +587,6 @@ await test("Real API: URLBuilder constructs full request for jsonplaceholder", a
 
   const r = await json.get("/posts/1");
   const data = r.data as { id: number; title: string };
-  console.log("    Real API response:", JSON.stringify(data));
   assert.equal(data.id, 1);
   assert.strictEqual(data.title.length > 0, true);
 });
@@ -685,7 +749,6 @@ await test("resolveURL used in kinetex request", async () => {
 
   const r = await json.get(path.replace(base, ""));
   const data = r.data as { id: number };
-  console.log("    Real API response:", JSON.stringify(data));
   assert.equal(data.id, 1);
 });
 
@@ -852,7 +915,14 @@ await test("Real API: diffURLs between actual kinetex request URLs", async () =>
 
   const diff = diffURLs(url1, url2);
   console.log("    Diff:", JSON.stringify(diff, null, 2));
-  assert.strictEqual(diff.changedParams.b !== undefined || diff.search !== undefined, true);
+  // "b" went from 2 to 3 and "a" went away. Pinned exactly: the disjunction
+  // this replaces ("changedParams.b is set OR search is set") was satisfied
+  // by any diff whatsoever, including one that found nothing.
+  assert.deepStrictEqual(diff.changedParams, { b: ["2", "3"] });
+  assert.deepStrictEqual(diff.removedParams, { a: "1" });
+  assert.deepStrictEqual(diff.addedParams, { c: "4" });
+  assert.strictEqual(diff.search, undefined, "a param diff must not also report a search diff");
+  assert.strictEqual(diff.pathname, undefined);
 });
 
 // ============================================================================
@@ -1075,21 +1145,41 @@ await test("Real API: jsonplaceholder complete CRUD with kinetex", async () => {
 suite("Error handling edge cases");
 
 await test("resolveURL throws on invalid base", async () => {
-  try {
-    resolveURL("path", "://invalid");
-    assert.fail("Should throw");
-  } catch (e) {
-    console.log("    Throws:", (e as Error).message);
-  }
+  // `assert.fail` throws an AssertionError, which the surrounding `catch`
+  // caught and logged — so this passed whether or not `resolveURL` threw.
+  // `assert.throws` cannot be caught by the code under test.
+  assert.throws(
+    () => resolveURL("path", "://invalid"),
+    (err: unknown) => {
+      assert.ok(err instanceof TypeError, `expected a TypeError, got ${String(err)}`);
+      // The message must name both operands: "cannot resolve" against which
+      // base is the whole diagnostic.
+      assert.equal(err.message, 'Cannot resolve "path" against base "://invalid"');
+      return true;
+    },
+  );
 });
 
 await test("fillPathParams throws on missing param", async () => {
-  try {
-    fillPathParams("/users/:id/:name", { id: "1" });
-    assert.fail("Should throw");
-  } catch (e) {
-    console.log("    Throws:", (e as Error).message);
-  }
+  assert.throws(
+    () => fillPathParams("/users/:id/:name", { id: "1" }),
+    (err: unknown) => {
+      assert.ok(err instanceof URLValidationError, `got ${String(err)}`);
+      // The *specific* missing param is named -- with two placeholders, the
+      // difference between a message naming "name" and one naming "id" is
+      // the difference between a useful error and a wrong one.
+      assert.equal(err.message, 'Missing path param: "name"');
+      return true;
+    },
+  );
+  // The first placeholder is named when it is the one missing.
+  assert.throws(
+    () => fillPathParams("/users/:id", {}),
+    (err: unknown) => {
+      assert.equal((err as URLValidationError).message, 'Missing path param: "id"');
+      return true;
+    },
+  );
 });
 
 await test("relativeURL returns null for cross-origin", async () => {
@@ -1138,12 +1228,21 @@ await test("buildDataURL string with base64=true", async () => {
 });
 
 await test("diffURLs search string changed without param diffs", async () => {
+  // The same parameters in a different order: no added, removed or changed
+  // param, but the raw search string differs. A disjunction here ("search is
+  // defined OR something else is") would pass for any diff at all.
   const url1 = "https://httpbin.org/get?a=1&b=2";
   const url2 = "https://httpbin.org/get?b=2&a=1";
-  await bin.get("/get", { params: { a: "1", b: "2" } });
   const diff = diffURLs(url1, url2);
-  console.log("    Search diff:", JSON.stringify(diff.search));
-  assert.strictEqual(diff.search !== undefined, true);
+  assert.deepStrictEqual(diff.search, ["?a=1&b=2", "?b=2&a=1"]);
+  assert.deepStrictEqual(diff.addedParams, {});
+  assert.deepStrictEqual(diff.removedParams, {});
+  assert.deepStrictEqual(diff.changedParams, {});
+  // ...and nothing else changed, which is what makes it a *search* diff.
+  assert.strictEqual(diff.pathname, undefined);
+  assert.strictEqual(diff.protocol, undefined);
+  assert.strictEqual(diff.hostname, undefined);
+  assert.strictEqual(diff.hash, undefined);
 });
 
 await test("relativeURL throws on invalid path (catch block)", async () => {
@@ -1194,30 +1293,39 @@ await test("Space encoded as %20 — verified via kinetex", async () => {
 });
 
 await test("Unicode encoded — verified via kinetex", async () => {
-  const tests = [
-    { input: "日本語", desc: "Japanese" },
-    { input: "émoji", desc: "French" },
-    { input: "中文", desc: "Chinese" },
+  const tests: Array<[string, string]> = [
+    ["日本語", "%E6%97%A5%E6%9C%AC%E8%AA%9E"],
+    ["émoji", "%C3%A9moji"],
+    ["中文", "%E4%B8%AD%E6%96%87"],
   ];
 
-  for (const { input, desc } of tests) {
+  for (const [input, expected] of tests) {
     const result = percentEncode(input);
-    console.log(`    ${desc} "${input}" encoded:`, result);
+    console.log(`    "${input}" encoded:`, result);
 
+    // The exact UTF-8 bytes, not `startsWith("%")` -- which the old version
+    // asserted, and which a function returning a single "%" satisfied.
+    assert.equal(result, expected);
+    // And the round-trip: the server decodes what we sent.
     const r = await bin.get("/get", { params: { text: result } });
     const args = (r.data as { args: Record<string, string> }).args;
-    assert.equal(result.slice(0, 1), "%");
+    assert.equal(args.text, result);
+    assert.equal(percentDecode(args.text), input);
   }
 });
 
 await test("Surrogate pairs (emoji) encoded — verified via kinetex", async () => {
+  // One code point above U+FFFF becomes four UTF-8 bytes, so a lone surrogate
+  // half or a dropped pair would be invisible to `startsWith("%")`.
   const result = percentEncode("😀🎉🚀");
   console.log("    Emoji encoded:", result);
+  assert.equal(result, "%F0%9F%98%80%F0%9F%8E%89%F0%9F%9A%80");
+  assert.equal(percentDecode(result), "😀🎉🚀");
 
   const r = await bin.get("/get", { params: { emoji: result } });
   const args = (r.data as { args: Record<string, string> }).args;
   console.log("    Server received emoji:", args.emoji);
-  assert.equal(result.slice(0, 1), "%");
+  assert.equal(args.emoji, result);
 });
 
 // ============================================================================
@@ -1345,25 +1453,38 @@ await test("expandTemplate with ; operator", async () => {
 });
 
 await test("expandTemplate array with kinetex", async () => {
-  const template = "{?ids}";
-  const result = expandTemplate(template, { ids: ["1", "2", "3"] });
-  console.log("    Array expansion:", result);
+  const result = expandTemplate("{?ids}", { ids: ["1", "2", "3"] });
+  assert.equal(result, "?ids=1,2,3", "an array must join with commas in order");
 
   const r = await bin.get("/get", { params: { ids: ["1", "2", "3"] } });
+  assert.equal(r.status, 200, "the echoed request must succeed");
   const args = (r.data as { args: Record<string, string | string[]> }).args;
-  console.log("    Server received ids:", JSON.stringify(args.ids));
+  // httpbin echoes a repeated query parameter as a JSON array; the point is
+  // that all three values survive the round-trip in order.
+  assert.deepEqual(
+    Array.isArray(args.ids) ? args.ids : [args.ids],
+    ["1", "2", "3"],
+    "every array element must reach the server, in order",
+  );
 });
 
-await test("expandTemplate object explode — verified via kinetex", async () => {
-  const template = "{?params*}";
-  const result = expandTemplate(template, { params: { a: "1", b: "2" } });
-  console.log("    Object explode:", result);
+await test("expandTemplate object explode", async () => {
+  // RFC 6570 §3.2.8: `{?params*}` flattens the object into one pair per key.
+  assert.equal(expandTemplate("{?params*}", { params: { a: "1", b: "2" } }), "?a=1&b=2");
+  // A space is percent-encoded in a query expansion, unlike in `{+path}`.
+  assert.equal(expandTemplate("{?params*}", { params: { q: "a b" } }), "?q=a%20b");
+  // ...and an empty object expands to nothing at all.
+  assert.equal(expandTemplate("{?params*}", { params: {} }), "");
+});
 
-  const r = await bin.get("/get", { params: { a: "1", b: "2" } });
-  const args = (r.data as { args: Record<string, string> }).args;
-  console.log("    Server received:", JSON.stringify(args));
-  assert.equal(args.a, "1");
-  assert.equal(args.b, "2");
+await test("expandTemplate object forms", async () => {
+  // RFC 6570 §3.2.7: without `*`, the object becomes one comma-joined value
+  // under its own name.
+  assert.equal(expandTemplate("{?coords}", { coords: { x: "1", y: "2" } }), "?coords=x,1,y,2");
+  // The same shape in the path operator, which uses a prefix instead of "?".
+  assert.equal(expandTemplate("{/coords*}", { coords: { x: "1", y: "2" } }), "/x=1/y=2");
+  // The label operator carries no names, so the members join with commas.
+  assert.equal(expandTemplate("{.coords}", { coords: { x: "1", y: "2" } }), ".x,1,y,2");
 });
 
 await test("expandTemplate maxLength — verified via kinetex", async () => {
@@ -1376,83 +1497,111 @@ await test("expandTemplate maxLength — verified via kinetex", async () => {
     const args = (r.data as { args: Record<string, string> }).args;
     console.log("    Server received:", args.name);
     assert.equal(args.name, "abcde");
-  } catch {
-    // Network flakiness
-    console.log("    (network issue, skipping)");
+  } catch (e) {
+    // This catch encloses `assert.equal`, so a bare `catch {}` reported a pass
+    // for a wrong maxLength expansion. Only a transport failure may skip.
+    const why = `${(e as { name?: string })?.name ?? ""}: ${(e as { message?: string })?.message ?? String(e)}`;
+    assert.ok(
+      /fetch failed|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|ECONNRESET|EAI_AGAIN|timeout|network|socket/i.test(
+        why,
+      ),
+      `maxLength verification failed for a non-network reason and must not be skipped: ${why}`,
+    );
+    console.log(`    → upstream unavailable, skipping: ${why}`);
   }
 });
 
-await test("expandTemplate skips null/undefined — verified via kinetex", async () => {
-  const template = "/anything/{name}";
-  const result = expandTemplate(template, { name: 42 });
-  console.log("    Null/undefined skipped:", result);
-
-  const r = await bin.get("/get", { params: { name: "42" } });
-  console.log("    Server received:", (r.data as { url: string }).url);
-  assert.equal(r.status, 200);
+await test("expandTemplate skips null/undefined", async () => {
+  // The old version expanded `{name}` with the number 42 and asserted nothing
+  // about the result -- the kinetex call it made used a hand-written
+  // `params: { name: "42" }` and so checked the test, not the function.
+  // RFC 6570: an undefined variable expands to the empty string, and the
+  // surrounding text is kept.
+  assert.equal(expandTemplate("/anything/{name}", { name: "x" }), "/anything/x");
+  assert.equal(expandTemplate("/anything/{name}", {} as Record<string, string>), "/anything/");
+  assert.equal(
+    expandTemplate("/anything/{name}", { name: undefined as unknown as string }),
+    "/anything/",
+  );
+  // A number is expanded, not skipped.
+  assert.equal(expandTemplate("/anything/{name}", { name: 42 }), "/anything/42");
+  // ...and a nullish variable inside a multi-variable expression is left out
+  // entirely rather than emitting an empty `name=`.
+  assert.equal(expandTemplate("{?a,b}", { a: "1" }), "?a=1");
+  assert.equal(expandTemplate("{?a,b}", { b: "2" }), "?b=2");
+  assert.equal(expandTemplate("{?a,b}", {} as Record<string, string>), "");
 });
 
-await test("expandTemplate object non-explode — verified via kinetex", async () => {
-  const template = "{?coords}";
-  const result = expandTemplate(template, { coords: { x: "1", y: "2" } });
-  console.log("    Object non-explode result:", result);
-
-  const r = await bin.get("/get", { params: { coords: "x,1,y,2" } });
-  console.log("    Server received:", (r.data as { args: Record<string, string> }).args);
-  assert.equal(r.status, 200);
+await test("URLBuilder.setParam null/undefined deletes", async () => {
+  // Pinned on the URL, and percent-encoded on the way out: a value with a
+  // space or an ampersand must not become a second parameter.
+  assert.equal(
+    URLBuilder.from("https://httpbin.org/get?a=1&b=2")
+      .setParam("b", null as unknown as string)
+      .toString(),
+    "https://httpbin.org/get?a=1",
+  );
+  assert.equal(
+    URLBuilder.from("https://example.com/?a=1")
+      .setParam("b", undefined as unknown as string)
+      .toString(),
+    "https://example.com/?a=1",
+  );
+  assert.equal(
+    URLBuilder.from("https://example.com/").setParam("q", "a b&c=d").toString(),
+    "https://example.com/?q=a+b%26c%3Dd",
+  );
 });
 
-await test("URLBuilder.setParam null/undefined deletes — verified via kinetex", async () => {
-  const url = URLBuilder.from("https://httpbin.org/get?a=1&b=2")
-    .setParam("b", null as unknown as string)
-    .toString();
-  console.log("    URL after null setParam:", url);
-
-  const r = await bin.get("/get", { params: { a: "1" } });
-  const args = (r.data as { args: Record<string, string> }).args;
-  console.log("    Server received:", JSON.stringify(args));
-  assert.equal(args.a, "1");
-  assert.strictEqual("b" in args, false);
-});
-
-await test("URLBuilder.setQuery clears and replaces — verified via kinetex", async () => {
+await test("URLBuilder.setQuery clears and replaces", async () => {
   const url = URLBuilder.from("https://httpbin.org/get?old=1")
     .setQuery({ x: "1", y: "2" })
     .toString();
-  console.log("    URL after setQuery:", url);
-
-  const r = await bin.get("/get", { params: { x: "1", y: "2" } });
-  const args = (r.data as { args: Record<string, string> }).args;
-  console.log("    Server received:", JSON.stringify(args));
-  assert.equal(args.x, "1");
-  assert.equal(args.y, "2");
+  // `old=1` is gone: setQuery replaces rather than merges.
+  assert.equal(url, "https://httpbin.org/get?x=1&y=2");
+  // An empty object clears the query entirely.
+  assert.equal(
+    URLBuilder.from("https://example.com/?a=1").setQuery({}).toString(),
+    "https://example.com/",
+  );
 });
 
-await test("URLBuilder.path joins segments — verified via kinetex", async () => {
+await test("URLBuilder.path joins segments", async () => {
   const url = URLBuilder.from("https://httpbin.org").path("anything", "test").toString();
-  console.log("    URL after path():", url);
-
-  const r = await bin.get("/anything/test");
-  console.log("    Status:", r.status);
-  assert.equal(r.status, 200);
+  assert.equal(url, "https://httpbin.org/anything/test");
+  // `appendPath` is the accumulating form; `path` replaces what was there.
+  assert.equal(
+    URLBuilder.from("https://httpbin.org/old").path("a", "b").toString(),
+    "https://httpbin.org/a/b",
+  );
+  assert.equal(
+    URLBuilder.from("https://httpbin.org/old").appendPath("a").appendPath("b").toString(),
+    "https://httpbin.org/old/a/b",
+  );
 });
 
-await test("URLBuilder.withUsername — verified via kinetex", async () => {
+await test("URLBuilder.withUsername", async () => {
   const url = URLBuilder.from("https://httpbin.org/get").withUsername("testuser").toString();
-  console.log("    URL with username:", url);
-
-  const r = await bin.get("/get", { params: { user: "testuser" } });
-  console.log("    Status:", r.status);
-  assert.equal(r.status, 200);
+  assert.equal(url, "https://testuser@httpbin.org/get");
+  assert.equal(new URL(url).username, "testuser");
+  // Encoded on the way out, so a username with `@` in it cannot forge a host.
+  assert.equal(
+    new URL(URLBuilder.from("https://example.com/").withUsername("a@b").toString()).username,
+    "a%40b",
+  );
 });
 
-await test("URLBuilder.withPassword — verified via kinetex", async () => {
+await test("URLBuilder.withPassword", async () => {
   const url = URLBuilder.from("https://httpbin.org/get").withPassword("secret123").toString();
-  console.log("    URL with password:", url);
-
-  const r = await bin.get("/get", { params: { pass: "secret123" } });
-  console.log("    Status:", r.status);
-  assert.equal(r.status, 200);
+  assert.equal(url, "https://:secret123@httpbin.org/get");
+  assert.equal(new URL(url).password, "secret123");
+  // A password is not a substitute for a username: with an empty username the
+  // userinfo is still `:` + the secret, not just the secret.
+  assert.equal(
+    new URL(URLBuilder.from("https://example.com/").withUsername("u").withPassword("p").toString())
+      .href,
+    "https://u:p@example.com/",
+  );
 });
 
 await test("compilePattern single wildcard — verified via kinetex", async () => {
@@ -1610,6 +1759,264 @@ await test("urlExtension no extension returns empty", async () => {
 await test("urlFilename from URL path", async () => {
   assert.equal(urlFilename("https://example.com/path/file.txt"), "file.txt");
   assert.equal(urlFilename("https://example.com/"), "");
+});
+
+// ============================================================================
+// §20  REGRESSIONS
+// ============================================================================
+//
+// Eight defects surfaced by auditing what this file asserted against what the
+// functions actually return. Each test below passed at the time its defect
+// was live.
+
+suite("Regressions");
+
+await test("buildDataURL base64-encodes text above U+00FF", async () => {
+  // Defect: `btoa` is Latin-1 only and throws InvalidCharacterError above
+  // U+00FF, so `buildDataURL("café", "text/plain", true)` threw — which is
+  // precisely the payload the base64 form exists for. The test file only
+  // ever passed "hello".
+  const url = buildDataURL("café ☕", "text/plain", true);
+  assert.equal(url, "data:text/plain;base64,Y2Fmw6kg4piV");
+  const parsed = parseDataURL(url);
+  assert.equal(parsed!.isBase64, true);
+  assert.equal(
+    new TextDecoder().decode(Uint8Array.from(atob(parsed!.data), (c) => c.charCodeAt(0))),
+    "café ☕",
+  );
+  // The non-base64 form percent-encodes instead, and round-trips too.
+  assert.equal(buildDataURL("café", "text/plain", false), "data:text/plain,caf%C3%A9");
+  // A string and the equivalent bytes must produce the same URL.
+  const bytes = new TextEncoder().encode("café ☕");
+  assert.equal(buildDataURL(bytes, "text/plain", true), url);
+  // ASCII is unchanged by any of this.
+  assert.equal(buildDataURL("hello", "text/plain", true), "data:text/plain;base64,aGVsbG8=");
+});
+
+await test("parseDataURL accepts a media type with parameters", async () => {
+  // Defect: the old regex stopped the media type at the first `;` and then
+  // required a comma, so `data:text/plain;charset=utf-8,hi` — an ordinary
+  // RFC 2397 data URL — did not parse at all.
+  assert.deepStrictEqual(parseDataURL("data:text/plain;charset=utf-8,hi"), {
+    mediaType: "text/plain;charset=utf-8",
+    isBase64: false,
+    data: "hi",
+  });
+  // `;base64` is only an encoding marker as the LAST parameter.
+  assert.deepStrictEqual(parseDataURL("data:text/plain;charset=utf-8;base64,aGk="), {
+    mediaType: "text/plain;charset=utf-8",
+    isBase64: true,
+    data: "aGk=",
+  });
+  // A parameter that merely contains the word is not one.
+  assert.deepStrictEqual(parseDataURL("data:text/plain;base64x,hi"), {
+    mediaType: "text/plain;base64x",
+    isBase64: false,
+    data: "hi",
+  });
+  // An omitted type with parameters present still defaults to text/plain,
+  // and keeps the parameters.
+  assert.deepStrictEqual(parseDataURL("data:;charset=utf-8,hi"), {
+    mediaType: "text/plain;charset=utf-8",
+    isBase64: false,
+    data: "hi",
+  });
+  // The forms that already worked.
+  assert.deepStrictEqual(parseDataURL("data:text/plain,hello"), {
+    mediaType: "text/plain",
+    isBase64: false,
+    data: "hello",
+  });
+  assert.deepStrictEqual(parseDataURL("data:,x"), {
+    mediaType: "text/plain",
+    isBase64: false,
+    data: "x",
+  });
+  assert.equal(parseDataURL("data:"), null, "no comma, no data URL");
+  assert.equal(parseDataURL(""), null);
+  assert.equal(parseDataURL("https://example.com"), null);
+  // A comma inside the payload is data, not a second delimiter.
+  assert.deepStrictEqual(parseDataURL("data:text/plain,a,b"), {
+    mediaType: "text/plain",
+    isBase64: false,
+    data: "a,b",
+  });
+});
+
+await test("buildDataURL refuses a media type that carries its own delimiters", async () => {
+  // Defect: `,` and `;` are the data URL's delimiters, and the media type was
+  // interpolated unescaped. `buildDataURL("x", "text/plain;base64", false)`
+  // emitted `data:text/plain;base64,x`, which every parser then reads as a
+  // base64 payload — the opposite of what the caller asked for.
+  assert.throws(
+    () => buildDataURL("x", "text/plain;base64", false),
+    (err: unknown) => {
+      assert.ok(err instanceof URLValidationError, `got ${String(err)}`);
+      assert.match(err.message, /media type/i);
+      return true;
+    },
+  );
+  assert.throws(() => buildDataURL("x", "a,b", false), URLValidationError);
+  // A media type with a parameter is legal in a data URL, but it has to be
+  // passed already encoded by the caller into a value this function accepts
+  // — so the honest answer is to refuse it rather than emit a URL that means
+  // something else.
+  assert.equal(buildDataURL("x", "text/plain", false), "data:text/plain,x");
+  assert.equal(buildDataURL("x", "image/svg+xml", false), "data:image/svg+xml,x");
+});
+
+await test("redactURL never throws, on any input", async () => {
+  // Defect: this function exists to be called from a logger, and
+  // `URLBuilder.from` throws on anything `new URL()` rejects — so the one
+  // helper that must not take a process down on malformed input was the one
+  // that did.
+  assert.equal(redactURL("not a url", "token"), "not a url");
+  assert.doesNotThrow(() => redactURL("", "token"));
+  assert.doesNotThrow(() => redactURL("/relative/path", "token"));
+  assert.doesNotThrow(() => redactURL("://bad", "a", "b"));
+  // ...and on a relative URL that does have a query, the parameter is still
+  // masked rather than leaked into the log.
+  assert.equal(
+    redactURL("/path?token=secret&public=data", "token"),
+    "/path?token=REDACTED&public=data",
+  );
+  assert.equal(redactURL("/path?a=1&t=2#frag", "t"), "/path?a=1&t=REDACTED#frag");
+  // A key that is not present leaves the URL alone.
+  assert.equal(redactURL("/path?a=1", "token"), "/path?a=1");
+  // No keys at all is a no-op on both paths.
+  assert.equal(redactURL("https://x/?a=1"), "https://x/?a=1");
+  assert.equal(redactURL("/path?a=1"), "/path?a=1");
+  // The parseable case still goes through the builder, and still redacts.
+  assert.equal(
+    redactURL("https://httpbin.org/get?token=secret&public=data", "token"),
+    "https://httpbin.org/get?token=REDACTED&public=data",
+  );
+});
+
+await test("stripHash tolerates an unparseable URL, as stripQuery does", async () => {
+  // Defect: the pair is used together on the same input, and only one of the
+  // two was total — so a malformed URL was safe to strip a query from and
+  // fatal to strip a hash from.
+  assert.equal(stripHash("not a url"), "not a url");
+  assert.equal(stripQuery("not a url"), "not a url");
+  assert.equal(stripHash(""), "");
+  assert.equal(stripHash("/relative#frag"), "/relative#frag");
+  // ...and both still do their job on a real URL.
+  assert.equal(stripHash("https://example.com/p#a"), "https://example.com/p");
+  assert.equal(stripQuery("https://example.com/p?a=1"), "https://example.com/p");
+  // A hash containing a `?` is a hash, not a query.
+  assert.equal(stripHash("https://example.com/p#a?b=1"), "https://example.com/p");
+});
+
+await test("relativeURL requires the base to end on a segment boundary", async () => {
+  // Defect: containment was a raw string prefix. With the base `/posts`, the
+  // path `/posts-admin/secret` starts with it, so the function returned
+  // `-admin/secret` — which the caller then resolves against `/posts` to
+  // reach a sibling resource it was never scoped to.
+  assert.equal(
+    relativeURL("https://example.com/posts-admin/secret", "https://example.com/posts"),
+    null,
+  );
+  assert.equal(relativeURL("https://example.com/posts2", "https://example.com/posts"), null);
+  // The real relationships still work. The separator is kept, so the result
+  // is a usable relative reference rather than a bare segment.
+  assert.equal(relativeURL("https://example.com/posts/1", "https://example.com/posts"), "/1");
+  assert.equal(
+    relativeURL("https://example.com/posts/1/comments", "https://example.com/posts"),
+    "/1/comments",
+  );
+  assert.equal(
+    relativeURL("https://example.com/posts/1?q=2#f", "https://example.com/posts"),
+    "/1?q=2#f",
+  );
+  // A base that already ends in a slash is unambiguous.
+  assert.equal(relativeURL("https://example.com/posts/1", "https://example.com/posts/"), "1");
+  // An exact match is the empty string, as before.
+  assert.equal(relativeURL("https://example.com/posts/1", "https://example.com/posts/1"), "");
+  // A different origin, or a shorter path, is still out of scope.
+  assert.equal(relativeURL("https://other.com/posts/1", "https://example.com/posts"), null);
+  assert.equal(relativeURL("https://example.com/", "https://example.com/posts"), null);
+});
+
+await test("parseQuery cannot re-prototype the object it returns", async () => {
+  // Defect: `result` is a plain object, so `result["__proto__"]` read
+  // `Object.prototype` instead of "nothing here yet". The first
+  // `__proto__=x` therefore took the "already have a value" branch and
+  // assigned an *array* through the inherited `__proto__` setter — so
+  // `parseQuery("__proto__=x&__proto__=y")` returned an object whose
+  // prototype was attacker-influenced. parseQuery output is fed straight
+  // into request building.
+  const single = parseQuery("__proto__=x");
+  assert.deepStrictEqual(Object.keys(single), ["__proto__"]);
+  assert.equal(Object.getPrototypeOf(single), Object.prototype);
+  assert.equal(Object.getOwnPropertyDescriptor(single, "__proto__")?.value, "x");
+
+  const both = parseQuery("__proto__=x&__proto__=y");
+  assert.equal(Object.getPrototypeOf(both), Object.prototype, "the prototype must be untouched");
+  assert.deepStrictEqual(Object.getOwnPropertyDescriptor(both, "__proto__")?.value, ["x", "y"]);
+
+  // ...and the key is a normal key everywhere else: it round-trips, and it
+  // does not shadow the object's own methods.
+  assert.equal(typeof both.hasOwnProperty, "function");
+  assert.equal(Object.prototype.hasOwnProperty.call(both, "toString"), false);
+  assert.equal(
+    stringifyQuery(both as Record<string, string | string[]>),
+    "__proto__=x&__proto__=y",
+  );
+  // `constructor` was already an own property, and stays one.
+  const ctor = parseQuery("constructor=x");
+  assert.equal(Object.getPrototypeOf(ctor), Object.prototype);
+  assert.equal(ctor.constructor as unknown, "x");
+  // Ordinary keys are untouched by any of this.
+  assert.deepStrictEqual(parseQuery("a=1&b=2&b=3"), { a: "1", b: ["2", "3"] });
+});
+
+await test("compilePattern honours a parameter constraint", async () => {
+  // Defect: the pattern was regex-escaped before the `:name(...)` form was
+  // recognised, so the `(` became `\(` and the constraint branch could never
+  // fire. `/items/:id(\d+)` — documented as "matches /items/99 only if id is
+  // numeric" — matched every segment, and matched nothing at all.
+  const p = compilePattern("/items/:id(\\d+)");
+  assert.equal(p.test("https://example.com/items/99"), true);
+  assert.equal(p.test("https://example.com/items/abc"), false);
+  assert.equal(p.match("https://example.com/items/99")!.params.id, "99");
+  assert.equal(p.match("https://example.com/items/abc"), null);
+  // A constraint with alternatives, and one that is anchored.
+  assert.equal(compilePattern("/f/:v(a|b)").test("https://x.com/f/a"), true);
+  assert.equal(compilePattern("/f/:v(a|b)").test("https://x.com/f/c"), false);
+  // An unconstrained parameter still stops at a slash.
+  assert.equal(compilePattern("/items/:id").test("https://x.com/items/a/b"), false);
+});
+
+await test("compilePattern fills groups, and reads captures in source order", async () => {
+  // Defect: `URLPatternMatch.groups` is documented as "all capture groups
+  // including named params and wildcards" and was always `{}` — nothing ever
+  // wrote to it. And the capture index was assumed to run params first, so
+  // a wildcard written before a parameter in the pattern handed the
+  // wildcard's value to `params`.
+  assert.deepStrictEqual(compilePattern("/posts/:id").match("https://x.com/posts/42")!.groups, {
+    id: "42",
+  });
+  assert.deepStrictEqual(
+    compilePattern("/posts/*/comments/*").match("https://x.com/posts/5/comments/10")!.groups,
+    { "1": "5", "2": "10" },
+  );
+  // Wildcard BEFORE parameter: the named parameter gets its own value.
+  const mixed = compilePattern("/*/:id").match("https://x.com/seg/7");
+  assert.deepStrictEqual(mixed!.params, { id: "7" });
+  assert.deepStrictEqual(mixed!.wildcards, ["seg"]);
+  assert.deepStrictEqual(mixed!.groups, { "1": "seg", id: "7" });
+  // A greedy wildcard still yields one entry per segment, while `groups`
+  // records the single capture it came from.
+  const greedy = compilePattern("/files/**").match("https://x.com/files/a/b/c")!;
+  assert.deepStrictEqual(greedy.wildcards, ["a", "b", "c"]);
+  assert.deepStrictEqual(greedy.groups, { "1": "a/b/c" });
+  // Literal text is still escaped, so a pattern with a regex metacharacter
+  // in it matches the character and not a class.
+  assert.equal(compilePattern("/a.b/:id").test("https://x.com/a.b/1"), true);
+  assert.equal(compilePattern("/a.b/:id").test("https://x.com/axb/1"), false);
+  // ...and the single-star form is one segment, not many.
+  assert.deepStrictEqual(compilePattern("/a/*").match("https://x.com/a/b/c"), null);
 });
 
 // ============================================================================

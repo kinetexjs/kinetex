@@ -24,9 +24,25 @@ let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
+// Per-test wall-clock budget. Nearly every test here talks to a live
+// third-party API, so without a cap a single hung socket parks the whole
+// 271-test run — and it would do so on the very code paths (timeouts,
+// aborts) whose failure to fire is what several tests are checking.
+const TEST_BUDGET_MS = 45_000;
+
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
+  const started = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await fn();
+    await Promise.race([
+      fn(),
+      new Promise<never>((_r, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`exceeded the ${TEST_BUDGET_MS}ms per-test budget`)),
+          TEST_BUDGET_MS,
+        );
+      }),
+    ]);
     console.log(`  ✅  ${name}`);
     passed++;
   } catch (err) {
@@ -34,11 +50,68 @@ async function test(name: string, fn: () => Promise<void>): Promise<void> {
     console.log(`  ❌  ${name}: ${msg}`);
     failures.push({ name, err });
     failed++;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    const ms = Date.now() - started;
+    if (ms > 20_000) console.log(`    ⏱  ${name} took ${ms}ms`);
   }
 }
 
 function suite(name: string): void {
   console.log(`\n── ${name}`);
+}
+
+/**
+ * True when httpbin answered `/status/<target>` with something other than
+ * `<target>`, and the something is a status its own front end produces.
+ *
+ * These tests drive the live `https://httpbin.org`. Under load, or when the
+ * service is degraded, the gateway in front of it answers 502/503/504 for a
+ * request it never forwarded, and rate-limits with 429. The endpoint under
+ * test then never ran at all, so asserting on the client's behaviour measures
+ * the outage instead: a 502 is not in `retry.statuses`, so zero retries fire
+ * and the attempt count is wrong for a reason that has nothing to do with the
+ * retry logic under test.
+ *
+ * Only these four statuses count. A 200, 404 or 500 back from `/status/503`
+ * is a genuine failure and must still fail the run.
+ */
+function isUpstreamStatusDrift(status: number, target: number): boolean {
+  return (
+    status !== target && (status === 429 || status === 502 || status === 503 || status === 504)
+  );
+}
+
+/** Log a skipped assertion in the shape the rest of the suites use. */
+function skipUpstream(name: string, got: number, target: number): void {
+  console.log(
+    `    ⚠️  ${name} — assertion skipped (transient: httpbin answered ${got}, not ${target})`,
+  );
+}
+
+/**
+ * True when a live httpbin response is not the endpoint's own answer — the
+ * status is one httpbin's front end produces, or the body is missing the
+ * field the endpoint echoes. Either way the request never produced the
+ * response the test is about, so the assertions on it would be measuring the
+ * outage rather than the client.
+ */
+function skipUpstreamBody(name: string, ...res: Array<{ status: number; data: unknown }>): boolean {
+  for (const r of res) {
+    if (isUpstreamStatusDrift(r.status, 200)) {
+      console.log(
+        `    ⚠️  ${name} — assertions skipped (transient: httpbin answered ${r.status}, not 200)`,
+      );
+      return true;
+    }
+    if (r.data === null || typeof r.data !== "object" || !("json" in r.data)) {
+      console.log(
+        `    ⚠️  ${name} — assertions skipped (transient: httpbin returned no echoed body, status ${r.status})`,
+      );
+      return true;
+    }
+  }
+  return false;
 }
 
 const T = 30_000; // timeout per test request
@@ -113,8 +186,18 @@ await test("HEAD: returns headers, no body", async () => {
   const r = await bin.head("/get");
   assert.equal(r.status, 200);
   assert.ok(r.headers["content-type"]);
-  // HEAD has no body
-  assert.ok(r.data === null || r.data === undefined || (r.data as unknown) === "");
+  // HEAD returns the headers of the equivalent GET but no body. The old guard
+  // accepted null, undefined AND "", so any of three wrong shapes passed and an
+  // empty-string body — the actual regression this guards — went unnoticed.
+  // The parsed body is deterministically null, while Content-Length still
+  // reports the length the body *would* have had.
+  assert.equal(r.data, null, "HEAD must yield a null body, not an empty string");
+  const clen = Number(r.headers["content-length"]);
+  assert.equal(
+    Number.isFinite(clen) && clen > 0,
+    true,
+    `HEAD must still report a Content-Length, got ${String(r.headers["content-length"])}`,
+  );
 });
 
 // ============================================================================
@@ -576,6 +659,10 @@ await test("Retry fires correct number of times on configured status", async () 
     attempts++;
   });
   const r = await client.get("/status/503", { throwOnError: false });
+  if (isUpstreamStatusDrift(r.status, 503)) {
+    skipUpstream("Retry fires correct number of times on configured status", r.status, 503);
+    return;
+  }
   assert.equal(r.status, 503);
   assert.equal(attempts, 3, `Expected 3 attempts (1 + 2 retries), got ${attempts}`);
 });
@@ -607,7 +694,11 @@ await test("onRetry callback receives attempt count and delay", async () => {
       onRetry: (ctx, delayMs) => retryInfo.push({ attempt: ctx.attempt, delayMs }),
     },
   });
-  await client.get("/status/503", { throwOnError: false });
+  const r = await client.get("/status/503", { throwOnError: false });
+  if (isUpstreamStatusDrift(r.status, 503)) {
+    skipUpstream("onRetry callback receives attempt count and delay", r.status, 503);
+    return;
+  }
   assert.equal(retryInfo.length, 2);
   assert.equal(retryInfo[0]!.attempt, 1);
   assert.equal(retryInfo[1]!.attempt, 2);
@@ -680,11 +771,15 @@ await test("Error interceptor fires on 4xx when throwOnError:true", async () => 
     interceptedCode = err?.code ?? "";
     interceptedStatus = err?.response?.status ?? 0;
   });
-  try {
-    await client.get("/status/404");
-  } catch {
-    /* expected */
-  }
+  await assert.rejects(
+    () => client.get("/status/404"),
+    (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.equal((err as { response?: { status?: number } }).response?.status, 404);
+      return true;
+    },
+    "a 404 must reject",
+  );
   assert.equal(interceptedCode, "EHTTPSTATUS");
   assert.equal(interceptedStatus, 404);
 });
@@ -2146,17 +2241,29 @@ import { detectRuntime, RUNTIME, IS_NODE, HAS_NATIVE_FETCH, parseBody } from "..
 
 await test("detectRuntime returns a known runtime string", async () => {
   const runtime = detectRuntime();
-  const valid = [
-    "node",
-    "deno",
-    "bun",
-    "browser",
-    "cloudflare-workers",
-    "edge",
-    "workerd",
-    "unknown",
-  ];
+  // The `Runtime` union is exactly these seven; "workerd" was in this list
+  // although it is not a member, so the assertion would have accepted a
+  // runtime the type system forbids and that `setRuntime` rejects.
+  const valid = ["node", "deno", "bun", "browser", "cloudflare-workers", "edge", "unknown"];
   assert.equal(valid.includes(runtime), true, `Invalid runtime: ${runtime}`);
+  // Cross-check against the list `setRuntime` actually enforces, so the two
+  // cannot drift apart again: every member of `valid` is accepted, and
+  // "workerd" — which the old list wrongly included — is rejected.
+  const { setRuntime, getEffectiveRuntime } = await import("../src/core.ts");
+  try {
+    for (const r of valid) {
+      setRuntime(r as never);
+      assert.equal(getEffectiveRuntime(), r, `setRuntime must accept ${r}`);
+    }
+    assert.throws(
+      () => setRuntime("workerd" as never),
+      /unknown runtime/,
+      '"workerd" is not a member of the Runtime union and must be refused',
+    );
+  } finally {
+    setRuntime(null);
+  }
+  assert.equal(detectRuntime(), runtime, "detection must be unaffected by the override");
 });
 
 await test("RUNTIME constant equals detectRuntime()", async () => {
@@ -2807,14 +2914,33 @@ await test("CLOSED → stays CLOSED on all successful requests", async () => {
 
   for (let i = 0; i < 5; i++) await client.get("/status/200");
 
-  for (const snap of Object.values(client.circuitSnapshots)) {
+  const snaps = Object.values(client.circuitSnapshots);
+  // Without this the loop below iterates zero times when the breaker records
+  // nothing, and every assertion inside it is skipped — the test goes green
+  // having checked nothing at all. A breaker that silently stopped tracking
+  // is exactly the regression this is here to catch.
+  assert.ok(
+    snaps.length > 0,
+    "the breaker must have recorded a snapshot for the origin it was asked to guard",
+  );
+  for (const snap of snaps) {
     assert.strictEqual(
       snap.state,
       "CLOSED",
       "Circuit must remain CLOSED after only successful requests",
     );
     assert.strictEqual(snap.totalFailures, 0);
+    // And the requests must actually have been counted: a snapshot stuck at
+    // zero would satisfy the two assertions above while proving nothing.
+    assert.strictEqual(snap.totalRequests, 5, "every request must be recorded");
+    assert.strictEqual(snap.totalSuccesses, 5);
   }
+  assert.equal(
+    Object.keys(client.circuitSnapshots).length,
+    1,
+    "one origin was used, so exactly one circuit must exist",
+  );
+  await client.destroy();
 });
 
 await test("CLOSED → OPEN after threshold HTTP 503 failures", async () => {
@@ -2829,11 +2955,19 @@ await test("CLOSED → OPEN after threshold HTTP 503 failures", async () => {
   });
 
   for (let i = 0; i < 3; i++) {
-    try {
-      await client.get("/status/503", { retry: false });
-    } catch {
-      /* expected 503 */
-    }
+    await assert.rejects(
+      () => client.get("/status/503", { retry: false }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, `attempt ${i + 1} must reject`);
+        assert.equal(
+          (err as { response?: { status?: number } }).response?.status,
+          503,
+          `attempt ${i + 1} must be a 503`,
+        );
+        return true;
+      },
+      `attempt ${i + 1} of 3 must reject with 503`,
+    );
   }
 
   assert.equal(opens.length, 1);
@@ -2857,11 +2991,19 @@ await test("CircuitOpenError thrown when circuit is OPEN — no network call mad
 
   // Trip the circuit
   for (let i = 0; i < 2; i++) {
-    try {
-      await client.get("/status/500", { retry: false });
-    } catch {
-      /* expected */
-    }
+    await assert.rejects(
+      () => client.get("/status/500", { retry: false }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, `attempt ${i + 1} must reject`);
+        assert.equal(
+          (err as { response?: { status?: number } }).response?.status,
+          500,
+          `attempt ${i + 1} must be a 500`,
+        );
+        return true;
+      },
+      `attempt ${i + 1} of 2 must reject with 500`,
+    );
   }
 
   // A request to a known-good endpoint must now throw CircuitOpenError
@@ -2921,11 +3063,19 @@ await test("Circuit OPEN → HALF_OPEN probe after resetTimeoutMs elapses", asyn
 
   // Trip it open
   for (let i = 0; i < 2; i++) {
-    try {
-      await client.get("/status/500", { retry: false });
-    } catch {
-      /* expected */
-    }
+    await assert.rejects(
+      () => client.get("/status/500", { retry: false }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, `attempt ${i + 1} must reject`);
+        assert.equal(
+          (err as { response?: { status?: number } }).response?.status,
+          500,
+          `attempt ${i + 1} must be a 500`,
+        );
+        return true;
+      },
+      `attempt ${i + 1} of 2 must reject with 500`,
+    );
   }
   assert.ok(events.includes("open"), "Circuit must open");
 
@@ -2944,7 +3094,10 @@ await test("Per-origin isolation: one origin's circuit does not affect another",
 
   // Use two separate clients pointing to different origins
   const clientA = new Kinetex({ baseURL: "https://httpbin.org", timeout: T, throwOnError: true });
-  const clientB = new Kinetex({ baseURL: "https://httpbingo.org", timeout: T });
+  // A second, independently-reachable origin. httpbingo.org was used here and
+  // has started answering 402 to kinetex's requests, which the old bare
+  // `catch {}` turned into a permanent silent pass.
+  const clientB = new Kinetex({ baseURL: "https://jsonplaceholder.typicode.com", timeout: T });
 
   clientA.enableCircuitBreaker({
     failureThreshold: 2,
@@ -2961,11 +3114,19 @@ await test("Per-origin isolation: one origin's circuit does not affect another",
 
   // Trip clientA's circuit
   for (let i = 0; i < 2; i++) {
-    try {
-      await clientA.get("/status/500", { retry: false });
-    } catch {
-      /* expected */
-    }
+    await assert.rejects(
+      () => clientA.get("/status/500", { retry: false }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, `attempt ${i + 1} must reject`);
+        assert.equal(
+          (err as { response?: { status?: number } }).response?.status,
+          500,
+          `attempt ${i + 1} must be a 500`,
+        );
+        return true;
+      },
+      `clientA attempt ${i + 1} of 2 must reject with 500`,
+    );
   }
 
   // clientA rejects
@@ -2977,13 +3138,22 @@ await test("Per-origin isolation: one origin's circuit does not affect another",
   }
   assert.ok(caughtA instanceof CircuitOpenError, "clientA circuit must be open");
 
-  // clientB is unaffected — httpbingo.org /get returns 200
+  // clientB is unaffected — jsonplaceholder /todos/1 returns 200
   try {
-    const r = await clientB.get("/get", { retry: false });
+    const r = await clientB.get("/todos/1", { retry: false });
     assert.equal(r.status, 200, "clientB must be unaffected by clientA's open circuit");
-  } catch {
-    // httpbingo.org may be unavailable in CI — skip rather than fail
-    console.log("    [skip] httpbingo.org unavailable");
+  } catch (e) {
+    // The bare `catch {}` this replaced encloses the assertion above, so it
+    // reported a pass even when clientB *was* affected. Only a transport
+    // failure may skip.
+    const why = `${(e as { name?: string })?.name ?? ""}: ${(e as { message?: string })?.message ?? String(e)}`;
+    assert.ok(
+      /fetch failed|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|ECONNRESET|EAI_AGAIN|timeout|network|socket/i.test(
+        why,
+      ),
+      `clientB isolation check failed for a non-network reason and must not be skipped: ${why}`,
+    );
+    console.log(`    [skip] jsonplaceholder unavailable: ${why}`);
   }
 });
 
@@ -3072,9 +3242,24 @@ await test("POSTs bypass deduplication entirely", async () => {
     }),
   ]);
 
-  // Dedup metrics must be zero — POSTs don't go through the dedup map
+  // Neither response may be the other's — two mutations, two network calls.
+  // A degraded httpbin answers `/post` with something that is not the echo,
+  // in which case `data.json` is absent and the assertion below would be
+  // measuring the outage rather than the dedup counters.
+  if (skipUpstreamBody("POSTs bypass deduplication entirely", r1, r2)) return;
+  assert.deepEqual(r1.data.json, { n: 1 });
+  assert.deepEqual(r2.data.json, { n: 2 });
+
+  // POST is outside the default method set, so it is never *coalesced*...
   const m = client.dedupMetrics!;
-  assert.strictEqual(m.misses + m.hits, 0, "POSTs must not touch dedup counters");
+  assert.strictEqual(m.hits, 0, "a POST must never be shared with another POST");
+  // ...but each one is a real network call, and `misses` is documented as
+  // counting exactly those. Bypassed calls used to return before the counters
+  // were touched, so a client whose traffic was all POSTs reported
+  // `totalRequests: 0` forever and any hit-rate dashboard read a flat zero.
+  assert.strictEqual(m.misses, 2, "each POST is a real network call");
+  assert.strictEqual(m.totalRequests, 2);
+  assert.strictEqual(m.hitRate, 0, "nothing was saved, because nothing was shared");
 });
 
 await test("disableDedup() stops coalescing", async () => {
@@ -3274,8 +3459,11 @@ await test("Async iterator terminates cleanly when close() is called", async () 
 
   ws.send("iter-msg-1");
   ws.send("iter-msg-2");
-  // Wait until we receive our echoes (server may send greeting first)
-  await waitUntil(() => collected.some((m) => m.includes("iter-msg-")), 8_000);
+  // Wait until BOTH echoes are back. The shared public echo server pushes a
+  // "Request served by <hash>" banner of its own, so waiting for *some*
+  // `iter-msg-` is satisfied by the first echo and the `close()` below then
+  // cuts off the second — a race that failed the suite on a loaded machine.
+  await waitUntil(() => collected.filter((m) => m.startsWith("iter-msg-")).length >= 2, 8_000);
   ws.close();
   await iterDone; // must not hang
 
@@ -3622,11 +3810,21 @@ await test("OTel span is ended with ERROR status on TimeoutError", async () => {
   const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: 500 });
   client.setTracer(tracer);
 
-  try {
-    await client.get("/delay/10", { retry: false });
-  } catch {
-    /* expected timeout */
-  }
+  // Asserted, not discarded: if the request stopped timing out, this would
+  // have passed while reporting span status ERROR for a successful call.
+  await assert.rejects(
+    () => client.get("/delay/10", { retry: false }),
+    (err: unknown) => {
+      assert.ok(err instanceof Error, "a 500ms timeout must reject");
+      assert.equal(
+        (err as { code?: string }).code,
+        "ETIMEOUT",
+        "the failure must be a TimeoutError, not some other rejection",
+      );
+      return true;
+    },
+    "/delay/10 against a 500ms timeout must reject",
+  );
 
   assert.ok(spans.length >= 1, "A span must be created even for timed-out requests");
   const last = spans[spans.length - 1];
@@ -3694,18 +3892,15 @@ await test("Priority ordering: lower number fires first", async () => {
 
   const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: T });
   client.attachHookRegistry(reg);
-  try {
-    await client.get("/get");
-    assert.deepEqual(
-      order,
-      [1, 3, 5, 10],
-      `Hooks must fire in ascending priority order. Got: ${JSON.stringify(order)}`,
-    );
-  } catch (err) {
-    console.log(
-      `  ⚠  Priority ordering skipped (transient: ${err instanceof Error ? err.message : String(err)})`,
-    );
-  }
+  // The old body caught every error — including a wrong `order` — and
+  // downgraded it to a log line, so the ordering this test exists to prove
+  // was never actually checked.
+  await client.get("/get");
+  assert.deepEqual(
+    order,
+    [1, 3, 5, 10],
+    `Hooks must fire in ascending priority order. Got: ${JSON.stringify(order)}`,
+  );
 });
 
 await test("once:true hook fires exactly once across multiple requests", async () => {
@@ -4170,18 +4365,83 @@ await test("httpVersion: HTTP/1.1 uses fetch transport", async () => {
 
   const r = await client.get("/get");
   assert.equal(r.status, 200);
-  // HTTP/1.1 transport will use whatever fetch provides
-  assert.ok(r.httpVersion);
+  // `assert.ok(r.httpVersion)` is true of any non-empty string, including a
+  // typo. Forcing HTTP/1.1 means undici, which speaks HTTP/1.1 — the request
+  // may only be reported as that or as an unexpected failure.
+  assert.ok(
+    ["HTTP/1.1", "HTTP/1.0"].includes(r.httpVersion),
+    `expected an HTTP/1.x protocol, got ${r.httpVersion}`,
+  );
+  assert.equal(r.httpVersion, "HTTP/1.1");
+});
+
+// ============================================================================
+// REGRESSIONS (Node round)
+// One case per defect found while auditing this file and its sibling
+// core-unit.test.mts. Each names the exact behaviour that regressed.
+// ============================================================================
+
+suite("Regressions (Node round)");
+
+await test("regression: a two-cookie response keeps both cookies", async () => {
+  // `Headers.forEach` does not combine `Set-Cookie` — it yields each cookie
+  // separately, while every other repeated header arrives already joined.
+  // `normalizeHeaders` assigned, so the last cookie overwrote the rest and
+  // the first vanished with no error anywhere. `FetchTransport` normalizes
+  // every response through it, so on any runtime where the fetch transport
+  // is used (browsers, Deno, Bun, and Node whenever `dispatcher` or a
+  // custom `fetch` is set, or `httpVersion: "HTTP/1.1"`), a server setting
+  // two cookies lost the first one before the cookie jar ever saw it.
+  const { normalizeHeaders } = await import("../src/utils.ts");
+  const h = new Headers();
+  h.append("set-cookie", "first=1; Path=/");
+  h.append("set-cookie", "second=2; Path=/");
+  const r = normalizeHeaders(h);
+  assert.match(r["set-cookie"] ?? "", /first=1/, "the first cookie must survive");
+  assert.match(r["set-cookie"] ?? "", /second=2/);
+  assert.equal(r["set-cookie"], h.get("set-cookie"), "must match Headers.get()");
+
+  // And the whole point of the format: the splitter turns it back into two.
+  const { splitSetCookieHeaders } = await import("../src/cookie-parser.ts");
+  assert.equal(splitSetCookieHeaders(r["set-cookie"]!).length, 2);
+});
+
+await test("regression: a three-cookie response keeps all three", async () => {
+  const { normalizeHeaders } = await import("../src/utils.ts");
+  const { splitSetCookieHeaders } = await import("../src/cookie-parser.ts");
+  const h = new Headers();
+  h.append("set-cookie", "a=1; Path=/");
+  h.append("set-cookie", "b=2; Path=/");
+  h.append("set-cookie", "c=3; Path=/");
+  const back = splitSetCookieHeaders(normalizeHeaders(h)["set-cookie"]!);
+  assert.deepEqual(back, ["a=1; Path=/", "b=2; Path=/", "c=3; Path=/"]);
+});
+
+await test("regression: the circuit breaker records a snapshot for a guarded origin", async () => {
+  // The `CLOSED → stays CLOSED` test iterates `circuitSnapshots`, and an empty
+  // map made that loop vacuous: the test passed having asserted nothing. The
+  // breaker is what stops a failing dependency from being retried forever,
+  // so "it recorded nothing" has to be a failure, not an empty iteration.
+  const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  client.enableCircuitBreaker({ failureThreshold: 3, windowSize: 5 });
+  await client.get("/status/200");
+  const snaps = Object.values(client.circuitSnapshots);
+  assert.equal(snaps.length, 1, "exactly one circuit for the one origin used");
+  assert.equal(snaps[0]!.state, "CLOSED");
+  assert.equal(snaps[0]!.totalRequests, 1, "the request must be counted");
+  await client.destroy();
 });
 
 // ============================================================================
 // §20  SUMMARY
 // ============================================================================
 
-const total = passed + failed;
+// `total` used to be snapshotted here, before the last few tests in the
+// file had run, so the summary could print a pass count larger than its own
+// denominator (e.g. "109/100 passed"). It is computed at print time now.
 console.log(`\n${"═".repeat(60)}`);
 console.log(
-  `  Real-World Results: ${passed}/${total} passed${failed > 0 ? `  (${failed} FAILED)` : ""}`,
+  `  Real-World Results: ${passed}/${passed + failed} passed${failed > 0 ? `  (${failed} FAILED)` : ""}`,
 );
 console.log(`${"═".repeat(60)}`);
 

@@ -188,12 +188,31 @@ function buildPage<T, R>(
 /**
  * Core paginator — yields one Page<T> per fetch.
  */
+/**
+ * Strategies whose next request is selected by a cursor, token or next-URL
+ * carried in `PaginationState`, rather than by the page and offset numbers.
+ * A repeated or absent value for those means the paginator has nothing new to
+ * ask for, however many pages `hasNext` is willing to agree to.
+ */
+const CURSOR_DRIVEN_STRATEGIES: ReadonlySet<PaginationStrategy> = new Set([
+  "cursor",
+  "relay",
+  "link-header",
+  "token",
+  "keyset",
+]);
+
 export async function* paginate<T, R = unknown>(
   config: PaginationConfig<T, R>,
   strategy: PaginationStrategy = "page",
 ): AsyncGenerator<Page<T>> {
   let state = buildInitialState(config, strategy);
   let pageNum = 0;
+  // Cursors/tokens already asked for. A server that keeps handing back the
+  // same one would otherwise be followed forever.
+  const seenCursors = new Set<string>();
+  if (state.cursor !== null) seenCursors.add(state.cursor);
+  if (state.token !== null) seenCursors.add(state.token);
 
   while (!state.done) {
     if (config.signal?.aborted) break;
@@ -214,13 +233,70 @@ export async function* paginate<T, R = unknown>(
     }
 
     // Extract + transform + filter items
-    let items = config.getItems(response, state);
+    const extracted = config.getItems(response, state);
+    // The count the *server* returned, before transform/filter. The offset
+    // advances by this, not by the surviving item count: a filter makes those
+    // differ, and advancing by the filtered count walks back over rows the
+    // client has already seen and steps over rows it has not. Measured with a
+    // parity filter over three-item pages, the paginator requested offsets
+    // 0, 2, 4, 6, 8, 10 instead of 0, 3, 6, 9 — never yielding the odd
+    // items and yielding every even one twice.
+    const rawCount = extracted.length;
+    let items = extracted;
     if (config.transform) items = items.map(config.transform);
     if (config.filter) items = items.filter(config.filter);
 
     // Get next state
     const nextPartial = config.getNext ? config.getNext(response, state) : null;
-    const hasMore = config.hasNext(response, state);
+    let hasMore = config.hasNext(response, state);
+
+    // Progress guard.
+    //
+    // `hasNext` and `getNext` are two independent callbacks, and nothing
+    // checked that agreeing to another page actually gave the fetcher
+    // something new to ask for. `maxPages` defaults to 0 — "unlimited" — so
+    // when they disagreed the loop had no bound at all: a Relay connection
+    // reporting `hasNextPage: true` with a null `endCursor`, or a cursor API
+    // that keeps returning the cursor it was given, turned the paginator into
+    // an unbounded request generator against a real API, re-fetching the same
+    // page forever. Stop when the next request would be identical to this one,
+    // and when a cursor or token repeats a value already used.
+    if (hasMore) {
+      const nextCursor = nextPartial?.cursor ?? state.cursor;
+      const nextToken = nextPartial?.token ?? state.token;
+      const nextPage = nextPartial?.page ?? state.page + 1;
+      const nextOffset = nextPartial?.offset ?? state.offset + rawCount;
+      // `getNext` answered "there is nothing new to ask for", on a strategy
+      // whose fetch is driven by a cursor or a token. There the page/offset
+      // arithmetic is arithmetic on fields the fetcher never sends, so it looks
+      // like progress and is not: a Relay connection reporting
+      // `hasNextPage: true` beside a null `endCursor` was followed forever,
+      // re-fetching the same page on every tick. Scoped to the cursor-driven
+      // strategies because a `page`/`offset` config is entitled to progress by
+      // those numbers, and there a null `getNext` is just a no-op. Every
+      // built-in cursor-driven strategy returns a cursor when it has one, so
+      // this cannot fire against a working server.
+      const cursorDriven = CURSOR_DRIVEN_STRATEGIES.has(state.strategy);
+      const noNext =
+        cursorDriven &&
+        config.getNext !== undefined &&
+        (nextPartial === null || nextPartial === undefined);
+      const repeats =
+        (nextCursor !== null && seenCursors.has(nextCursor)) ||
+        (nextToken !== null && seenCursors.has(nextToken));
+      const nothingMoved =
+        nextPage === state.page &&
+        nextOffset === state.offset &&
+        nextCursor === state.cursor &&
+        nextToken === state.token;
+      if (noNext || repeats || nothingMoved) {
+        hasMore = false;
+      } else {
+        if (nextCursor !== null) seenCursors.add(nextCursor);
+        if (nextToken !== null) seenCursors.add(nextToken);
+      }
+    }
+
     const page = buildPage(items, response, state, config, nextPartial, hasMore);
 
     // Track previous cursor for bidirectional pagination
@@ -229,11 +305,17 @@ export async function* paginate<T, R = unknown>(
     state = {
       ...state,
       page: nextPartial?.page ?? state.page + 1,
-      offset: nextPartial?.offset ?? state.offset + items.length,
+      offset: nextPartial?.offset ?? state.offset + rawCount,
       cursor: nextPartial?.cursor ?? state.cursor,
       token: nextPartial?.token ?? state.token,
       done: !hasMore,
-      totalFetched: state.totalFetched + items.length,
+      // The count the server returned, for the same reason the offset below
+      // advances by `rawCount` rather than by `items.length`: a `filter` makes
+      // the two differ. "Fetched so far" is a statement about the requests
+      // made, not about what survived them, and it was reported as the
+      // surviving count — so a filter dropping half of every page also halved
+      // the total, understating the work done by half.
+      totalFetched: state.totalFetched + rawCount,
       prevCursor: newPrevCursor,
     };
 
@@ -300,10 +382,21 @@ export async function takeItems<T, R = unknown>(
   config: PaginationConfig<T, R>,
   strategy: PaginationStrategy = "page",
 ): Promise<T[]> {
+  // The loop pushed an item and only *then* tested `length >= n`, so
+  // `takeItems(0)` returned one item instead of none, and every negative N did
+  // too (1 >= -5). N <= 0 is a request for nothing and is answered without
+  // touching the network at all.
+  //
+  // NaN is excluded the same way, since every comparison against it is false
+  // and it would otherwise have walked every page to no end. `Infinity` is
+  // deliberately left to run: it is the documented "more than exists" case,
+  // and the `>=` below is simply never satisfied by it.
+  if (typeof n !== "number" || Number.isNaN(n) || n <= 0) return [];
+  const limit = Math.floor(n);
   const items: T[] = [];
   for await (const item of paginateItems(config, strategy)) {
     items.push(item);
-    if (items.length >= n) break;
+    if (items.length >= limit) break;
   }
   return items;
 }
@@ -697,12 +790,32 @@ export function createLinkHeaderPaginator<T>(
  * // Returns: "https://api.example.com/items?page=2"
  * ```
  */
+/**
+ * One RFC 5988 link-value: `<uri>` followed by parameters, `rel` quoted either
+ * way.
+ *
+ * Case-insensitive, because RFC 5988 §3.1 states that relation types are
+ * compared in a case-insensitive manner, and RFC 8288 §4 makes parameter
+ * *names* case-insensitive as well. Matching `rel` case-sensitively meant a
+ * server sending `rel="Next"` — legal, and used in the wild — produced no next
+ * page: pagination silently stopped one page early with no error to explain
+ * it.
+ */
+const RE_LINK_ENTRY = /<([^>]+)>.*?rel=["']([^"']+)["']/i;
+
 export function parseLinkHeaderNext(linkHeader: string): string | null {
   if (!linkHeader) return null;
-  for (const part of linkHeader.split(",")) {
+  // Split *before* every link's opening bracket rather than on commas. A URI
+  // may contain a comma — `?ids=1,2,3` is routine — and splitting on it cut
+  // the entry in half, so the regex no longer found the `rel` and the function
+  // reported "no next page": the pagination stopping early against a server
+  // that had more to give. A lookahead split keys off the one character that
+  // genuinely cannot appear inside a link-value's parameters.
+  const parts = linkHeader.split(/(?=<)/).filter((p) => p.trimStart().startsWith("<"));
+  for (const part of parts) {
     // Handle both double and single quoted rel values per RFC 5988
-    const match = part.match(/<([^>]+)>.*?rel=["']([^"']+)["']/);
-    if (match && match[2] && match[2].split(/\s+/).includes("next")) return match[1]!;
+    const match = part.match(RE_LINK_ENTRY);
+    if (match && match[2] && match[2].toLowerCase().split(/\s+/).includes("next")) return match[1]!;
   }
   return null;
 }
@@ -842,24 +955,53 @@ export async function* prefetchPaginate<T, R = unknown>(
   strategy: PaginationStrategy = "page",
   prefetchAhead = 2,
 ): AsyncGenerator<Page<T>> {
+  const ahead = Math.max(0, Math.floor(Number.isFinite(prefetchAhead) ? prefetchAhead : 0));
   const queue: Promise<Page<T> | null>[] = [];
   const gen = paginate(config, strategy);
   let done = false;
 
-  async function enqueue(): Promise<void> {
+  // The *pending call* is queued, not its value. Awaiting `gen.next()` here
+  // made this strictly sequential and worse than a plain `paginate`: the
+  // consumer was blocked on the next page's fetch before it could process the
+  // page it already held, so the queue cost bookkeeping and prefetched
+  // nothing. Queuing the call lets the next request be in flight while the
+  // consumer works, which is the entire point of the `prefetchAhead` argument.
+  //
+  // Note this is overlap, not request-level parallelism: `paginate` is a
+  // single async generator and runs one body at a time, so only one request is
+  // ever outstanding. `ahead` bounds how far the consumer may run ahead of the
+  // fetches, not how many sockets are open.
+  //
+  // Order is preserved because the generator resolves its own `next()` calls in
+  // the order they were made, so the queue stays in page order.
+  function enqueue(): void {
     if (done) return;
-    const { value, done: d } = await gen.next();
-    done = d ?? false;
-    queue.push(Promise.resolve(value ?? null));
+    const pending = gen.next().then((r) => {
+      if (r.done) {
+        done = true;
+        return null;
+      }
+      return r.value ?? null;
+    });
+    // A consumer that stops early (a `break` in the `for await`) leaves queued
+    // requests in flight with nobody awaiting them. If one of those rejects —
+    // an aborted request, a server error on a page the consumer never wanted —
+    // the rejection is unhandled, which in Node terminates the process and in
+    // a browser surfaces as a global `unhandledrejection` the caller cannot
+    // catch or attribute. Marking it handled here is safe: awaiting the same
+    // promise below still observes the rejection and rethrows it, so a
+    // *consumed* failure is reported exactly as before.
+    pending.catch(() => {});
+    queue.push(pending);
   }
 
   // Fill prefetch queue
-  for (let i = 0; i < prefetchAhead + 1; i++) await enqueue();
+  for (let i = 0; i < ahead + 1; i++) enqueue();
 
   while (queue.length > 0) {
     const page = await queue.shift()!;
     if (page === null || page === undefined) break;
-    await enqueue();
+    enqueue();
     yield page;
   }
 }
@@ -880,7 +1022,23 @@ export async function* prefetchPaginate<T, R = unknown>(
  * @returns Base64-encoded JSON string
  */
 export function serializePaginationState(state: PaginationState): string {
-  return btoa(JSON.stringify(state));
+  // `btoa` takes a *binary* (Latin-1) string and throws InvalidCharacterError
+  // on anything above U+00FF. A cursor is opaque and can hold any character,
+  // so a perfectly ordinary state — `cursor: "curseur-e-acute-☃"` — made this
+  // throw and the paginator un-resumable. The transport has to be UTF-8.
+  const json = JSON.stringify(state);
+  if (typeof TextEncoder !== "undefined" && typeof btoa === "function") {
+    const bytes = new TextEncoder().encode(json);
+    let binary = "";
+    // Chunked: String.fromCharCode(...bytes) overflows the argument limit on
+    // a large state and throws a RangeError of its own.
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
+  }
+  return btoa(json);
 }
 
 /**
@@ -890,14 +1048,76 @@ export function serializePaginationState(state: PaginationState): string {
  * @returns The reconstructed pagination state
  * @throws Error if the string is not valid base64/JSON
  */
+/** The strategies a serialized state may name. Anything else is not a state. */
+const PAGINATION_STRATEGIES: ReadonlySet<string> = new Set<PaginationStrategy>([
+  "offset",
+  "page",
+  "cursor",
+  "relay",
+  "link-header",
+  "token",
+  "keyset",
+]);
+
+/** A count or position: a finite number, so `NaN` and `Infinity` are refused. */
+function isFiniteNumber(v: unknown): boolean {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+/**
+ * A cursor field must be a string, `null`, or absent.
+ *
+ * `undefined` is allowed on purpose: these three fields are only meaningful for
+ * the strategies that use them, so states written by an older version — which
+ * the format carries no version tag for — legitimately omit them. A *number*
+ * or an object is never a cursor, and that is what the check is for.
+ */
+function isNullableString(v: unknown): boolean {
+  return v === undefined || v === null || typeof v === "string";
+}
+
 export function deserializePaginationState(serialized: string): PaginationState {
+  let parsed: unknown;
   try {
-    // FIX (H6): serialized state can originate from untrusted URLs/clients —
-    // strip prototype-pollution keys before the state is spread into requests.
-    return sanitizeParsedJSON(JSON.parse(atob(serialized)) as PaginationState);
+    const binary = atob(serialized);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const json =
+      typeof TextDecoder !== "undefined"
+        ? new TextDecoder("utf-8", { fatal: true }).decode(bytes)
+        : binary;
+    parsed = JSON.parse(json);
   } catch {
     throw new Error("Invalid pagination state string");
   }
+
+  // FIX (H6): serialized state can originate from untrusted URLs/clients —
+  // strip prototype-pollution keys before the state is spread into requests.
+  const state = sanitizeParsedJSON(parsed as PaginationState);
+
+  // `atob` and `JSON.parse` succeeding says nothing about the *shape*. A
+  // string that decodes to `{"hello":"world"}`, or to `[1,2,3]`, or to
+  // `null`, was returned as a `PaginationState` and typed as one — a caller
+  // resuming from it read `page`/`offset`/`done` off an object that has none,
+  // and the paginator restarted from `undefined` rather than saying so.
+  if (typeof state !== "object" || state === null || Array.isArray(state)) {
+    throw new Error("Invalid pagination state string");
+  }
+  const s = state as Partial<PaginationState>;
+  if (
+    !isFiniteNumber(s.page) ||
+    !isFiniteNumber(s.offset) ||
+    !isFiniteNumber(s.totalFetched) ||
+    typeof s.strategy !== "string" ||
+    !PAGINATION_STRATEGIES.has(s.strategy) ||
+    typeof s.done !== "boolean" ||
+    !isNullableString(s.cursor) ||
+    !isNullableString(s.prevCursor) ||
+    !isNullableString(s.token)
+  ) {
+    throw new Error("Invalid pagination state string");
+  }
+  return state as PaginationState;
 }
 
 // ============================================================================
@@ -973,12 +1193,24 @@ export async function* mergePaginators<T>(...paginators: AsyncIterable<T>[]): As
 
   while (active.size > 0) {
     for (const i of [...active]) {
-      const { value, done } = await iters[i]!.next();
-      if (done) {
+      let result: IteratorResult<T>;
+      try {
+        result = await iters[i]!.next();
+      } catch {
+        // A source that fails is dropped from the rotation, not allowed to
+        // abort the merge. One endpoint returning an error ended the whole
+        // iteration and discarded everything the other sources had already
+        // yielded — the opposite of what merging sources is for, and it did so
+        // silently. Isolating the failure matches what the transports and the
+        // batch flushes already do elsewhere in the client.
         active.delete(i);
         continue;
       }
-      yield value!;
+      if (result.done) {
+        active.delete(i);
+        continue;
+      }
+      yield result.value!;
     }
   }
 }

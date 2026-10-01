@@ -126,36 +126,58 @@ export class DedupMap<T = unknown> {
 
     // Handle abort signal (F-2): if signal is already aborted, don't dedupe
     if (effectiveSignal?.aborted) {
+      // Still a real network call. It used to return before the counters were
+      // touched, so a client whose method filter excluded everything reported
+      // totalRequests 0 and a hitRate of 0 after any number of real requests
+      // — and `misses` is documented as "requests that triggered a real
+      // network call". Both bypasses below now count.
+      this._misses++;
       return factory();
     }
 
     if (!this.methods.has(method.toUpperCase())) {
+      this._misses++;
       return factory();
     }
 
-    const key = this.keyFn(method, url, headers);
+    // The method is canonicalised before it reaches the key function. The
+    // methods filter has always been case-insensitive, but the key was built
+    // from the caller's spelling, so `execute("get", u)` and
+    // `execute("GET", u)` were two different keys and never coalesced — the
+    // one case a caller gets wrong most often, and one the library otherwise
+    // treats as equal everywhere.
+    const canonicalMethod = method.toUpperCase();
+    const key = this.keyFn(canonicalMethod, url, headers);
     const existing = this.inflight.get(key);
 
     if (existing) {
-      // Within window: return cached result
-      if (
-        existing.resolvedAt !== null &&
-        effectiveWindowMs > 0 &&
-        Date.now() - existing.resolvedAt <= effectiveWindowMs
-      ) {
-        this._hits++;
-        // Return the typed promise directly - preserves error type
-        return existing.promise;
-      }
-
-      // In-flight: share the promise
+      // In-flight: share the promise. This is coalescing, not caching, so it
+      // is not gated on the window.
       if (existing.resolvedAt === null) {
         this._hits++;
         return existing.promise;
       }
 
-      // Expired window — fall through to new request
-      this.inflight.delete(key);
+      // Within window: return cached result
+      if (effectiveWindowMs > 0 && Date.now() - existing.resolvedAt <= effectiveWindowMs) {
+        this._hits++;
+        // Return the typed promise directly - preserves error type
+        return existing.promise;
+      }
+
+      if (effectiveWindowMs > 0) {
+        // This caller's own window has lapsed — drop the stale entry and lead.
+        this.inflight.delete(key);
+      } else {
+        // This caller explicitly asked for no window, so it gets its own
+        // request. It used to fall through to `inflight.delete(key)` and lead
+        // as well, which destroyed a window some *other* caller had
+        // established and was still relying on: one `windowMs: 0` call was
+        // enough to empty the cache for everyone, and the next windowed caller
+        // had to go to the network for a result that was still in hand.
+        this._misses++;
+        return factory();
+      }
     }
 
     this._misses++;
@@ -193,6 +215,16 @@ export class DedupMap<T = unknown> {
       (result) => {
         entry.resolvedAt = Date.now();
         entry.result = result;
+        // This entry may have lost the key while the factory was running: an
+        // abort, a `clear()`, or an `invalidate()` all drop it, and a later
+        // caller for the same URL then becomes the leader. Registering a
+        // window timer here regardless re-inserted a timer for a key someone
+        // else now owns, and when it fired it deleted their still-in-flight
+        // entry — so the request after that started a third copy. The
+        // identity check is what makes "who owns this key" decidable.
+        if (this.inflight.get(key) !== entry) {
+          return result;
+        }
         if (effectiveWindowMs <= 0) {
           this.inflight.delete(key);
         } else {
@@ -216,7 +248,9 @@ export class DedupMap<T = unknown> {
       (err) => {
         entry.resolvedAt = Date.now();
         entry.error = err;
-        this.inflight.delete(key);
+        // Same ownership rule as the success path: an entry that has already
+        // been dropped must not delete the entry that replaced it.
+        if (this.inflight.get(key) === entry) this.inflight.delete(key);
         const existingTimeout = this.timeouts.get(key);
         if (existingTimeout !== undefined) {
           clearTimeout(existingTimeout);

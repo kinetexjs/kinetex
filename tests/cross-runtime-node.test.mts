@@ -21,9 +21,23 @@ let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
+// Several tests here talk to httpbin.org and several deliberately wait on a
+// timeout, so without a cap a single hung socket parks the whole file — on
+// exactly the code path whose failure to fire is under test.
+const TEST_BUDGET_MS = 45_000;
+
 async function test(name: string, fn: () => void | Promise<void>) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await fn();
+    await Promise.race([
+      Promise.resolve().then(fn),
+      new Promise<never>((_r, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`exceeded the ${TEST_BUDGET_MS}ms per-test budget`)),
+          TEST_BUDGET_MS,
+        );
+      }),
+    ]);
     console.log(`  \u2705  ${name}`);
     passed++;
   } catch (err) {
@@ -31,6 +45,8 @@ async function test(name: string, fn: () => void | Promise<void>) {
     console.log(`  \u274c  ${name}: ${msg}`);
     failures.push({ name, err });
     failed++;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -69,8 +85,15 @@ async function main() {
   await test("NodeHTTP2Transport can be constructed and destroyed", () => {
     const t = new NodeHTTP2Transport({ sessionTTLMs: 100, pingIntervalMs: 0 });
     assert.equal(t instanceof NodeHTTP2Transport, true);
+    // The options have to land, or they are decorative: this is the same
+    // class of bug as `maxSessions` being dropped on the floor.
+    const priv = t as unknown as Record<string, unknown>;
+    assert.equal(priv["sessionTTLMs"], 100, "sessionTTLMs must be stored");
+    assert.equal(priv["pingIntervalMs"], 0, "pingIntervalMs must be stored");
     t.destroy();
-    t.destroy();
+    // Idempotent: a second destroy must resolve rather than double-free.
+    assert.doesNotThrow(() => t.destroy());
+    assert.doesNotThrow(() => t.destroy());
   });
 
   await test("NodeHTTP2Transport sends real HTTP/2 request", async () => {
@@ -104,9 +127,24 @@ async function main() {
   });
 
   await test("createTransport returns a transport with .send()", () => {
+    // `notEqual(t, null)` is true of `undefined` too. On Node with no custom
+    // fetch and no dispatcher the transport must specifically be the HTTP/2
+    // one — that is the default this library ships, and the branch that
+    // decides it is what the next few tests depend on.
     const t = createTransport();
-    assert.notEqual(t, null);
-    assert.equal(typeof t.send, "function");
+    assert.ok(t, "a transport must be returned");
+    assert.equal(typeof (t as { send?: unknown }).send, "function");
+    assert.ok(
+      t instanceof NodeHTTP2Transport,
+      "Node defaults to the HTTP/2 transport when no fetch is supplied",
+    );
+    (t as { destroy?: () => void }).destroy?.();
+
+    // A custom fetch forces the fetch transport instead — the signature is
+    // (fetchFn, preferHTTP2, sessionOptions, transportOptions).
+    const fetchT = createTransport(globalThis.fetch);
+    assert.ok(fetchT instanceof FetchTransport, "a custom fetch must force FetchTransport");
+    (fetchT as { destroy?: () => void }).destroy?.();
   });
 
   await test("sendWithTimeout returns correct response", async () => {
@@ -171,6 +209,19 @@ async function main() {
     const merged = mergeSignals(ctrl1.signal, ctrl2.signal);
     assert.notEqual(merged, undefined);
     assert.equal(merged!.aborted, false);
+  });
+
+  await test("mergeSignals aborts from the SECOND source too", () => {
+    // The existing pair of tests only ever aborted the first controller, so a
+    // merge that listened to just one input passed both. `sendWithTimeout`
+    // merges the caller's signal with its timeout controller, and which of the
+    // two fires is not knowable in advance.
+    const ctrl1 = new AbortController();
+    const ctrl2 = new AbortController();
+    const merged = mergeSignals(ctrl1.signal, ctrl2.signal)!;
+    assert.equal(merged.aborted, false);
+    ctrl2.abort(new Error("from the second"));
+    assert.equal(merged.aborted, true, "the second source must abort the merge");
   });
 
   await test("mergeSignals propagates abort from either source", () => {
@@ -291,6 +342,59 @@ async function main() {
     setRuntime("browser");
     setRuntime(null);
     assert.equal(getEffectiveRuntime(), "node");
+  });
+
+  suite("Regressions (cross-runtime round)");
+
+  await test("regression: mergeSignals keeps the caller's abort reason", async () => {
+    // The pre-aborted shortcut called `controller.abort()` with no argument,
+    // installing the platform's generic `AbortError: This operation was
+    // aborted` and throwing away *why*. The two-live-signal branch preserved
+    // the reason, and so does `AbortSignal.any` — which is the path this
+    // function actually uses on every current runtime — so the one case a
+    // caller is most likely to hit was the only one that lost it.
+    // `interceptors.ts` re-aborts with `existing.reason` when it merges, so the
+    // loss propagated: a caller's `AbortSignal.timeout()` surfaced as a generic
+    // abort with nothing left to tell a timeout from a manual cancel.
+    const timed = AbortSignal.timeout(1);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(timed.aborted, true, "precondition: the caller's signal fired");
+
+    const merged = mergeSignals(timed, new AbortController().signal)!;
+    assert.equal(merged.aborted, true);
+    assert.equal(
+      String(merged.reason),
+      String(timed.reason),
+      "the merged signal must report the caller's reason, not a generic AbortError",
+    );
+    assert.notEqual(
+      String(merged.reason),
+      "AbortError: This operation was aborted",
+      "the generic reason is exactly what the fix removed",
+    );
+  });
+
+  await test("regression: mergeSignals keeps a caller's custom reason", () => {
+    const c = new AbortController();
+    c.abort(new RangeError("quota exhausted"));
+    const merged = mergeSignals(c.signal, new AbortController().signal)!;
+    assert.ok(
+      merged.reason instanceof RangeError,
+      `expected the caller's RangeError, got ${String(merged.reason)}`,
+    );
+    assert.equal(String(merged.reason), "RangeError: quota exhausted");
+  });
+
+  await test("regression: a pre-aborted merge matches AbortSignal.any", () => {
+    // The two implementations must agree, or the same request behaves
+    // differently depending on whether the runtime has `AbortSignal.any`.
+    const c = new AbortController();
+    c.abort(new Error("the real reason"));
+    const live = new AbortController().signal;
+    assert.equal(
+      String(mergeSignals(c.signal, live)!.reason),
+      String(AbortSignal.any([c.signal, live]).reason),
+    );
   });
 
   console.log(`\n${"=".repeat(60)}`);

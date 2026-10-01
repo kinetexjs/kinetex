@@ -492,15 +492,15 @@ export class WSClient {
   waitForOpen(timeoutMs = 60_000): Promise<void> {
     if (this._state === "OPEN") return Promise.resolve();
     return new Promise((resolve, reject) => {
-      const tid =
-        timeoutMs > 0
-          ? setTimeout(() => {
-              const i = this._openWaiters.findIndex((w) => w.resolve === resolve);
-              if (i !== -1) this._openWaiters.splice(i, 1);
-              reject(new WSConnectTimeoutError(this._url, timeoutMs));
-            }, timeoutMs)
-          : null;
-      this._openWaiters.push({
+      // The waiter is built first so the timeout can remove *this* entry by
+      // identity. It used to search for `w.resolve === resolve`, but the
+      // resolver stored on the queue is the wrapper below, not the promise's
+      // own `resolve` — so the search never matched, the timed-out waiter was
+      // never spliced out, and it stayed in `_openWaiters` for the lifetime
+      // of the client. A client whose `waitForOpen` timed out repeatedly grew
+      // that array without bound, and every later `open()`/`close()` walked
+      // the dead entries.
+      const waiter: OpenWaiter = {
         resolve: () => {
           if (tid) clearTimeout(tid);
           resolve();
@@ -509,7 +509,16 @@ export class WSClient {
           if (tid) clearTimeout(tid);
           reject(e);
         },
-      });
+      };
+      const tid: ReturnType<typeof setTimeout> | null =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              const i = this._openWaiters.indexOf(waiter);
+              if (i !== -1) this._openWaiters.splice(i, 1);
+              reject(new WSConnectTimeoutError(this._url, timeoutMs));
+            }, timeoutMs)
+          : null;
+      this._openWaiters.push(waiter);
     });
   }
 

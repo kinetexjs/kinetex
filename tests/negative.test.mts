@@ -20,7 +20,13 @@ import {
   isValidHeaderName,
   isValidHeaderValue,
 } from "../src/utils.ts";
-import { parseContentType, parseCacheControl, HttpHeaders } from "../src/headers.ts";
+import {
+  parseContentType,
+  parseCacheControl,
+  parseRetryAfter,
+  parseHTTPDate,
+  HttpHeaders,
+} from "../src/headers.ts";
 import { URLBuilder, normalizeURL, parseQuery, stringifyQuery, safeParseURL } from "../src/url.ts";
 import { parseBody } from "../src/core.ts";
 import {
@@ -183,8 +189,12 @@ async function main() {
 
   await test("parseCacheControl with excessively large max-age handles gracefully", () => {
     const r = parseCacheControl("max-age=99999999999999999999");
-    assert.equal(typeof r.maxAge, "number");
-    assert.ok(r.maxAge! > 0 || r.maxAge === null);
+    // `parseInt` on a 20-digit literal yields the nearest double, 1e20. The old
+    // `r.maxAge! > 0 || r.maxAge === null` disjunction was already dead on its
+    // right arm — the line above proves typeof is "number", and typeof null is
+    // "object" — so only the loose `> 0` half ever ran.
+    assert.equal(r.maxAge, 1e20);
+    assert.equal(Number.isFinite(r.maxAge), true, "must not overflow to Infinity");
   });
 
   await test("parseCacheControl with empty string returns default directives", () => {
@@ -575,16 +585,28 @@ async function main() {
       (e as any).code = "ENETWORK";
       throw e;
     };
-    try {
-      await cb.execute(failFactory);
-    } catch {}
-    try {
-      await cb.execute(failFactory);
-    } catch {}
-    try {
-      await cb.execute(failFactory);
-    } catch {}
-    assert.equal(cb.state, "OPEN");
+    // `assert.rejects` rather than `try { ... } catch {}`: the bare catch would
+    // pass just as happily if the factory stopped throwing, which is the whole
+    // thing under test.
+    for (let i = 1; i <= 3; i++) {
+      await assert.rejects(
+        () => cb.execute(failFactory),
+        (err: unknown) => {
+          assert.ok(err instanceof Error, `attempt ${i} must reject`);
+          assert.equal(
+            (err as { code?: string }).code,
+            "ENETWORK",
+            "the original error, not a wrapper",
+          );
+          assert.equal(err.message, "fail", "the breaker must not rewrite the message");
+          return true;
+        },
+        `attempt ${i} of 3 must reject`,
+      );
+      assert.equal(cb.state, i < 3 ? "CLOSED" : "OPEN", `state after ${i} failure(s)`);
+    }
+    assert.equal(cb.snapshot.totalFailures, 3, "every failure must be counted");
+    assert.equal(cb.snapshot.totalSuccesses, 0);
   });
 
   await test("CircuitBreaker: open circuit rejects immediately", async () => {
@@ -594,24 +616,42 @@ async function main() {
       (e as any).code = "ENETWORK";
       throw e;
     };
-    try {
-      await cb.execute(failFactory);
-    } catch {}
+    await assert.rejects(() => cb.execute(failFactory));
     assert.equal(cb.state, "OPEN");
-    try {
-      await cb.execute(async () => "should not reach");
-      assert.fail("Expected CircuitOpenError");
-    } catch (err) {
-      assert.ok(err instanceof CircuitOpenError);
-    }
+
+    // The operation must not be invoked at all while the circuit is open.
+    // `assert.rejects` alone would not catch a breaker that ran it and then
+    // discarded the result.
+    let invoked = 0;
+    await assert.rejects(
+      () =>
+        cb.execute(async () => {
+          invoked++;
+          return "should not reach";
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof CircuitOpenError, `expected CircuitOpenError, got ${String(err)}`);
+        assert.equal((err as { code?: string }).code, "ECIRCUITOPEN");
+        return true;
+      },
+    );
+    assert.equal(invoked, 0, "an open circuit must not call the operation");
+    assert.equal(cb.snapshot.totalRequests, 1, "a rejected-by-open-circuit call is not a request");
   });
 
   await test("CircuitBreaker: successful requests keep circuit closed", async () => {
     const cb = new CircuitBreaker("test3", { failureThreshold: 3, resetTimeoutMs: 60000 });
-    await cb.execute(async () => "ok");
-    await cb.execute(async () => "ok");
-    await cb.execute(async () => "ok");
+    // The return value must survive the wrapper, not just the state.
+    for (const n of [1, 2, 3]) {
+      assert.equal(
+        await cb.execute(async () => `ok-${n}`),
+        `ok-${n}`,
+        `call ${n} must return its value`,
+      );
+    }
     assert.equal(cb.state, "CLOSED");
+    assert.equal(cb.snapshot.totalSuccesses, 3, "every success must be counted");
+    assert.equal(cb.snapshot.totalFailures, 0);
   });
 
   await test("CircuitBreaker snapshot has correct state and counters", async () => {
@@ -631,18 +671,16 @@ async function main() {
       (e as any).code = "ENETWORK";
       throw e;
     };
-    try {
-      await reg.execute("key-a", fail);
-    } catch {}
-    try {
-      await reg.execute("key-a", fail);
-    } catch {}
-    try {
-      await reg.execute("key-b", fail);
-    } catch {}
+    // Two failures on key-a open it; one on key-b must not, because breakers
+    // are tracked per key.
+    await assert.rejects(() => reg.execute("key-a", fail));
+    await assert.rejects(() => reg.execute("key-a", fail));
+    await assert.rejects(() => reg.execute("key-b", fail));
     const snaps = reg.snapshots();
-    assert.equal(snaps["key-a"]!.state, "OPEN");
-    assert.equal(snaps["key-b"]!.state, "CLOSED");
+    assert.equal(snaps["key-a"]!.state, "OPEN", "key-a hit its threshold");
+    assert.equal(snaps["key-b"]!.state, "CLOSED", "key-b must be unaffected by key-a");
+    assert.equal(snaps["key-a"]!.totalFailures, 2);
+    assert.equal(snaps["key-b"]!.totalFailures, 1);
   });
 
   await test("BatchQueue enqueue same URL twice", async () => {
@@ -759,6 +797,351 @@ async function main() {
     const cookie = parseSetCookieHeader("cross=val; SameSite=None; Secure");
     assert.ok(cookie !== null);
     assert.equal(cookie!.sameSite, "None");
+  });
+
+  suite("12. Retry-After / retry back-off (regression)");
+
+  // A local fetch stub: the SSRF gate rejects loopback, so the real baseURL is
+  // never dialled — the response is manufactured instead.
+  const stub = (status: number, headers: Record<string, string>) =>
+    new Kinetex({
+      baseURL: "https://example.com",
+      fetch: (async () => new Response("{}", { status, headers })) as unknown as typeof fetch,
+    });
+
+  interface RetryRun {
+    delays: number[];
+    contexts: Array<{ response: unknown; error: unknown; attempt: number }>;
+    error: unknown;
+  }
+
+  async function runWithRetry(
+    client: Kinetex,
+    opts: { baseDelayMs: number; maxDelayMs: number; maxRetries: number },
+  ): Promise<RetryRun> {
+    const delays: number[] = [];
+    const contexts: RetryRun["contexts"] = [];
+    let error: unknown = null;
+    try {
+      await client.get("/", {
+        retry: {
+          maxRetries: opts.maxRetries,
+          baseDelayMs: opts.baseDelayMs,
+          maxDelayMs: opts.maxDelayMs,
+          jitter: 0,
+          onRetry: (ctx, delay) => {
+            delays.push(delay);
+            contexts.push({
+              response: ctx.response,
+              error: ctx.error,
+              attempt: ctx.attempt,
+            });
+          },
+        },
+      });
+    } catch (e) {
+      error = e;
+    }
+    return { delays, contexts, error };
+  }
+
+  await test("regression: parseRetryAfter rejects values Date.parse would misread", () => {
+    // Date.parse() reads all of these as real dates, which used to become a
+    // delay (and, on the retry path, a 0 ms back-off on a 429).
+    for (const bad of ["-5", "1.5", "+5", "tomorrow", "12:00", "2015-10-21T07:28:00Z", "-", ""]) {
+      assert.deepEqual(
+        parseRetryAfter(bad),
+        { date: null, delay: null },
+        `expected ${JSON.stringify(bad)} to be rejected outright`,
+      );
+      assert.equal(
+        parseHTTPDate(bad),
+        null,
+        `parseHTTPDate(${JSON.stringify(bad)}) should be null`,
+      );
+    }
+  });
+
+  await test("regression: parseRetryAfter accepts all three RFC 7231 HTTP-date forms", () => {
+    const imf = parseRetryAfter("Wed, 21 Oct 2015 07:28:00 GMT");
+    assert.equal(imf.delay, null);
+    assert.equal(imf.date?.toISOString(), "2015-10-21T07:28:00.000Z");
+
+    // The two obsolete formats RFC 7231 §7.1.1.1 still requires recipients to
+    // accept.
+    const rfc850 = parseRetryAfter("Sunday, 06-Nov-94 08:49:37 GMT");
+    assert.equal(rfc850.delay, null);
+    assert.equal(rfc850.date?.toISOString(), "1994-11-06T08:49:37.000Z");
+
+    const asctime = parseRetryAfter("Sun Nov  6 08:49:37 1994");
+    assert.equal(asctime.delay, null);
+    assert.equal(asctime.date?.toISOString(), "1994-11-06T08:49:37.000Z");
+  });
+
+  await test("regression: parseRetryAfter still reads delta-seconds, including 0", () => {
+    assert.deepEqual(parseRetryAfter("120"), { date: null, delay: 120 });
+    assert.deepEqual(parseRetryAfter("  120  "), { date: null, delay: 120 });
+    assert.deepEqual(parseRetryAfter("0"), { date: null, delay: 0 });
+    // A huge value is still a delta, not a date.
+    assert.deepEqual(parseRetryAfter("999999999"), { date: null, delay: 999999999 });
+  });
+
+  await test("regression: malformed Retry-After falls back to exponential back-off, not 0", async () => {
+    for (const bad of ["-5", "1.5", "+5", "tomorrow"]) {
+      const client = stub(429, { "retry-after": bad });
+      const run = await runWithRetry(client, {
+        baseDelayMs: 20,
+        maxDelayMs: 10_000,
+        maxRetries: 2,
+      });
+      client.destroy();
+      assert.ok(run.error instanceof HTTPStatusError, `${bad}: expected HTTPStatusError`);
+      // Deterministic (jitter: 0) exponential back-off: 20, then 40.
+      assert.deepEqual(run.delays, [20, 40], `retry-after=${bad} must not steer the back-off`);
+    }
+  });
+
+  await test("regression: Retry-After delta-seconds honoured on the default throwOnError path", async () => {
+    const client = stub(429, { "retry-after": "2" });
+    const run = await runWithRetry(client, { baseDelayMs: 20, maxDelayMs: 60_000, maxRetries: 2 });
+    client.destroy();
+    assert.ok(run.error instanceof HTTPStatusError);
+    assert.equal((run.error as HTTPStatusError).status, 429);
+    // Used to be [20, 40] — the header was dropped on the error path.
+    assert.deepEqual(run.delays, [2000, 2000]);
+  });
+
+  await test("regression: Retry-After HTTP-date honoured on the error path", async () => {
+    const when = new Date(Date.now() + 1500);
+    const client = stub(503, { "retry-after": when.toUTCString() });
+    const run = await runWithRetry(client, { baseDelayMs: 20, maxDelayMs: 60_000, maxRetries: 1 });
+    client.destroy();
+    assert.equal(run.delays.length, 1);
+    // Allow for clock granularity and the time the request itself took.
+    assert.ok(run.delays[0]! > 400, `expected a real wait, got ${run.delays[0]}ms`);
+    assert.ok(run.delays[0]! <= 1500, `expected <= 1500ms, got ${run.delays[0]}ms`);
+  });
+
+  await test("regression: a Retry-After date in the past means retry immediately", async () => {
+    const when = new Date(Date.now() - 60_000);
+    const client = stub(503, { "retry-after": when.toUTCString() });
+    const run = await runWithRetry(client, {
+      baseDelayMs: 5000,
+      maxDelayMs: 60_000,
+      maxRetries: 1,
+    });
+    client.destroy();
+    assert.deepEqual(run.delays, [0]);
+  });
+
+  await test("regression: Retry-After is capped at 24 hours", async () => {
+    const client = stub(429, { "retry-after": "999999" });
+    const delays: number[] = [];
+    // The cap is 24 h, so the sleep is aborted on the first callback rather
+    // than actually waited out.
+    const ac = new AbortController();
+    let err: unknown = null;
+    try {
+      await client.get("/", {
+        signal: ac.signal,
+        retry: {
+          maxRetries: 1,
+          baseDelayMs: 20,
+          maxDelayMs: 86_400_000,
+          jitter: 0,
+          onRetry: (_ctx, delay) => {
+            delays.push(delay);
+            ac.abort();
+          },
+        },
+      });
+      assert.fail("expected the aborted back-off to throw");
+    } catch (e) {
+      err = e;
+    }
+    client.destroy();
+    assert.ok(err instanceof KinetexError, `expected a KinetexError, got ${String(err)}`);
+    assert.equal((err as KinetexError).code, "EABORT");
+    assert.equal((err as KinetexError).isAbort, true);
+    // 999999 s would be ~11.6 days uncapped.
+    assert.deepEqual(delays, [86_400_000]);
+  });
+
+  await test("regression: RetryContext.response is populated for status-error retries", async () => {
+    const client = stub(429, { "retry-after": "2", "x-quota": "0" });
+    const run = await runWithRetry(client, { baseDelayMs: 20, maxDelayMs: 60_000, maxRetries: 2 });
+    client.destroy();
+    assert.equal(run.contexts.length, 2);
+    for (const [i, ctx] of run.contexts.entries()) {
+      // Was hard-coded to null, so hooks could not read the 429's headers.
+      const res = ctx.response as { status: number; headers: Record<string, string> } | null;
+      assert.ok(res !== null, `context ${i}: response should not be null`);
+      assert.equal(res!.status, 429);
+      assert.equal(res!.headers["retry-after"], "2");
+      assert.equal(res!.headers["x-quota"], "0");
+      assert.ok(ctx.error instanceof HTTPStatusError, `context ${i}: error should be set`);
+      assert.equal((ctx.error as HTTPStatusError).code, "EHTTPSTATUS");
+      assert.equal(ctx.attempt, i + 1);
+    }
+  });
+
+  await test("regression: lifecycle onRetry hooks fire for status-error retries", async () => {
+    let hookCalls = 0;
+    const client = new Kinetex({
+      baseURL: "https://example.com",
+      fetch: (async () => new Response("{}", { status: 500 })) as unknown as typeof fetch,
+      hooks: {
+        onRetry: [
+          () => {
+            hookCalls++;
+          },
+        ],
+      },
+    });
+    const run = await runWithRetry(client, { baseDelayMs: 20, maxDelayMs: 1000, maxRetries: 2 });
+    client.destroy();
+    assert.ok(run.error instanceof HTTPStatusError);
+    // Used to be 0 — only the resolved-response path notified hooks.
+    assert.equal(hookCalls, 2);
+  });
+
+  // Retry once, observe the computed delay via onRetry, then abort so the
+  // back-off is never actually slept. Returns the delay, or null if no retry
+  // happened at all.
+  async function firstRetryDelay(
+    client: Kinetex,
+    cfg: { baseDelayMs: number; maxDelayMs: number; jitter?: number },
+  ): Promise<number | null> {
+    const ac = new AbortController();
+    const delays: number[] = [];
+    let threw = false;
+    try {
+      await client.get("/", {
+        signal: ac.signal,
+        retry: {
+          maxRetries: 1,
+          baseDelayMs: cfg.baseDelayMs,
+          maxDelayMs: cfg.maxDelayMs,
+          ...(cfg.jitter !== undefined ? { jitter: cfg.jitter } : {}),
+          onRetry: (_ctx, delay) => {
+            delays.push(delay);
+            ac.abort();
+          },
+        },
+      });
+    } catch {
+      threw = true;
+    }
+    assert.ok(threw, "the aborted back-off must reject rather than resolve");
+    return delays.length === 0 ? null : delays[0]!;
+  }
+
+  await test("regression: retry jitter actually varies the back-off", async () => {
+    // Every other retry test here pins `jitter: 0` for determinism, which left
+    // `capped * cfg.jitter * Math.random()` completely unexercised: deleting
+    // the whole term passed the entire suite. Seed the randomness so the
+    // assertion does not depend on luck.
+    const realRandom = Math.random;
+    const samples: number[] = [];
+    try {
+      for (const r of [0, 0.25, 0.5, 0.75, 1]) {
+        Math.random = () => r;
+        const client = stub(503, {});
+        const d = await firstRetryDelay(client, {
+          baseDelayMs: 1000,
+          maxDelayMs: 60_000,
+          jitter: 0.5,
+        });
+        client.destroy();
+        assert.notEqual(d, null, `jitter seed ${r} produced no retry`);
+        samples.push(d!);
+      }
+    } finally {
+      Math.random = realRandom;
+    }
+    // base + base*jitter*seed  ->  1000 + 500*seed
+    assert.deepEqual(samples, [1000, 1125, 1250, 1375, 1500]);
+    for (let i = 1; i < samples.length; i++) {
+      assert.ok(samples[i]! > samples[i - 1]!, `sample ${i} must exceed ${i - 1}`);
+    }
+  });
+
+  await test("regression: the default jitter is 0.3, not 0", async () => {
+    // A default of 0 would switch off the documented thundering-herd
+    // protection silently, and nothing in the suite would notice.
+    const realRandom = Math.random;
+    try {
+      Math.random = () => 0.5;
+      const client = stub(503, {});
+      // No `jitter` supplied — the client default applies.
+      const d = await firstRetryDelay(client, { baseDelayMs: 1000, maxDelayMs: 60_000 });
+      client.destroy();
+      // 1000 + 30% of 1000, at a 0.5 seed.
+      assert.equal(d, 1150);
+    } finally {
+      Math.random = realRandom;
+    }
+  });
+
+  await test("regression: jitter 1.0 can at most double the base delay", async () => {
+    const realRandom = Math.random;
+    try {
+      Math.random = () => 1;
+      const client = stub(503, {});
+      const d = await firstRetryDelay(client, { baseDelayMs: 1000, maxDelayMs: 60_000, jitter: 1 });
+      client.destroy();
+      assert.equal(d, 2000, "jitter: 1 adds 100% of the base");
+    } finally {
+      Math.random = realRandom;
+    }
+  });
+
+  await test("regression: jitter never pushes the delay past maxDelayMs", async () => {
+    const realRandom = Math.random;
+    try {
+      Math.random = () => 1; // worst case
+      const client = stub(503, {});
+      const d = await firstRetryDelay(client, { baseDelayMs: 1000, maxDelayMs: 1200, jitter: 1 });
+      client.destroy();
+      // 1000 + 100% would be 2000, but the cap wins.
+      assert.equal(d, 1200);
+    } finally {
+      Math.random = realRandom;
+    }
+  });
+
+  await test("regression: jitter is not applied to a server Retry-After", async () => {
+    // A Retry-After is the server's instruction, not an estimate to decorrelate.
+    const realRandom = Math.random;
+    try {
+      Math.random = () => 1;
+      const client = stub(503, { "retry-after": "2" });
+      const d = await firstRetryDelay(client, { baseDelayMs: 1000, maxDelayMs: 60_000, jitter: 1 });
+      client.destroy();
+      assert.equal(d, 2000, "Retry-After wins outright, with no jitter added");
+    } finally {
+      Math.random = realRandom;
+    }
+  });
+
+  await test("regression: a non-retryable status still fires no onRetry hook", async () => {
+    let hookCalls = 0;
+    const client = new Kinetex({
+      baseURL: "https://example.com",
+      fetch: (async () => new Response("{}", { status: 404 })) as unknown as typeof fetch,
+      hooks: {
+        onRetry: [
+          () => {
+            hookCalls++;
+          },
+        ],
+      },
+    });
+    const run = await runWithRetry(client, { baseDelayMs: 20, maxDelayMs: 1000, maxRetries: 3 });
+    client.destroy();
+    assert.equal((run.error as HTTPStatusError).status, 404);
+    assert.deepEqual(run.delays, []);
+    assert.equal(hookCalls, 0);
   });
 
   console.log(

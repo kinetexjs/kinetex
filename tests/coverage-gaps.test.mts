@@ -17,9 +17,20 @@ let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
+const TEST_BUDGET_MS = 45_000;
+
 async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await fn();
+    await Promise.race([
+      Promise.resolve().then(fn),
+      new Promise<never>((_r, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`exceeded the ${TEST_BUDGET_MS}ms per-test budget`)),
+          TEST_BUDGET_MS,
+        );
+      }),
+    ]);
     console.log(`  ✅  ${name}`);
     passed++;
   } catch (err) {
@@ -27,6 +38,8 @@ async function test(name: string, fn: () => Promise<void> | void): Promise<void>
     console.log(`  ❌  ${name}: ${m}`);
     failures.push({ name, err });
     failed++;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -133,6 +146,46 @@ await test("registering a new window clears the previous timer for that key", as
   );
   assert.equal(calls, 2);
   assert.equal(timeouts.size, 1, "the stale timer must be replaced, not duplicated");
+  dedup.clear();
+});
+
+await test("an in-flight request is coalesced regardless of the window", async () => {
+  // `execute` treats a *resolved* entry as cacheable and gates that on the
+  // window, but an entry that is still in flight is always shared — "this is
+  // coalescing, not caching, so it is not gated on the window". A zero window
+  // is therefore not a way to force a duplicate request, and the timer test
+  // above ("a fresh request runs") only means that because its first call had
+  // already completed. Nothing pinned that distinction, and reading the test
+  // above the other way round would assert the opposite of the design.
+  const dedup = new DedupMap<string>({ windowMs: 60_000 });
+  let calls = 0;
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const factory = async (): Promise<string> => {
+    calls++;
+    await gate;
+    return "shared";
+  };
+
+  const first = dedup.execute("GET", "https://example.com/y", factory, undefined, 0);
+  // windowMs: 0 — an expired window — while the first is still running.
+  const second = dedup.execute("GET", "https://example.com/y", factory, undefined, 0);
+  release!();
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a, "shared");
+  assert.equal(b, "shared");
+  assert.equal(
+    calls,
+    1,
+    "an in-flight request must be shared even with a zero window — that is coalescing, not caching",
+  );
+
+  // Once it has resolved, the same zero window does start a new request.
+  const third = await dedup.execute("GET", "https://example.com/y", factory, undefined, 0);
+  assert.equal(third, "shared");
+  assert.equal(calls, 2, "a resolved entry with an elapsed window must not be reused");
   dedup.clear();
 });
 
@@ -303,6 +356,17 @@ await test("a successful request ends its span normally", async () => {
 
   assert.ok(events.includes("end"), `the span must be ended, saw ${events.join(",")}`);
   assert.ok(!events.includes("status:2"), "a successful request must not error the span");
+  // `end` exactly once: a span ended twice is exported twice, which double
+  // counts every request in the trace and is a very common SDK misuse.
+  assert.equal(
+    events.filter((e) => e === "end").length,
+    1,
+    `the span must be ended exactly once, saw ${events.join(",")}`,
+  );
+  assert.ok(
+    !events.includes("exception"),
+    "a successful request must not record an exception on the span",
+  );
 });
 
 // ============================================================================
@@ -331,7 +395,19 @@ await test("__KINETEX_DEBUG_RETRY logs the retry decision on failure", async () 
       }) as unknown as typeof fetch,
       retry: { maxRetries: 2, baseDelayMs: 1, jitter: 0 },
     });
-    await client.get("/x", { throwOnError: false }).catch(() => {});
+    // Asserted, not swallowed: `throwOnError: false` suppresses HTTP-status
+    // errors, not transport failures, so a TypeError from fetch must still
+    // surface. A bare `.catch(() => {})` would hide a regression that made
+    // this request succeed — which is the very thing that would stop the
+    // retry diagnostics from being emitted.
+    await assert.rejects(
+      () => client.get("/x", { throwOnError: false }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, "a transport failure must still reject");
+        assert.equal((err as { code?: string }).code, "ENETWORK");
+        return true;
+      },
+    );
     client.destroy();
   } finally {
     console.log = realLog;
@@ -339,6 +415,118 @@ await test("__KINETEX_DEBUG_RETRY logs the retry decision on failure", async () 
   }
 
   assert.ok(logged.includes("DBG catch"), "the retry catch path must log when debugging is on");
+});
+
+// ============================================================================
+// REGRESSIONS (coverage-gaps round)
+// One case per defect found while auditing this file and its siblings
+// cross-runtime-node.test.mts and core-unit.test.mts.
+// ============================================================================
+
+suite("Regressions (coverage-gaps round)");
+
+/** Stub `globalThis.fetch` for one call and restore it afterwards. */
+async function withStubbedFetch<T>(
+  body: string,
+  status: number,
+  run: () => Promise<T>,
+): Promise<T> {
+  const g = globalThis as Record<string, unknown>;
+  const prev = g.fetch;
+  g.fetch = (async (url: string) => {
+    const u = String(url);
+    if (u.endsWith("/latest/api/token")) return new Response("T", { status: 200 });
+    if (u.includes("security-credentials")) {
+      return new Response(body, { status, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ role: "r" }), {
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+  try {
+    return await run();
+  } finally {
+    g.fetch = prev;
+  }
+}
+
+await test("regression: a non-JSON IMDS body fails as ENETWORK, not a raw SyntaxError", async () => {
+  // Every other failure in imdsCredentials is a NetworkError. A proxy's HTML
+  // error page instead escaped from `Response.json()` as a bare SyntaxError
+  // with no `code` at all, so a caller branching on `err.code === "ENETWORK"`
+  // never saw it and the message said nothing about IMDS.
+  await assert.rejects(
+    () => withStubbedFetch("<html>502 Bad Gateway</html>", 200, () => imdsCredentials()()),
+    (err: unknown) => {
+      assert.ok(err instanceof Error, "expected an Error");
+      assert.equal((err as { code?: string }).code, "ENETWORK");
+      assert.match(err.message, /IMDS/);
+      assert.match(err.message, /not JSON/);
+      return true;
+    },
+  );
+});
+
+await test("regression: a shapeless IMDS body cannot produce credentials", async () => {
+  // `{}` parsed fine and produced accessKeyId: undefined, and a body of nulls
+  // produced nulls — both "succeeded". They then went on to produce a SigV4
+  // signature AWS rejects as `SignatureDoesNotMatch`, which points at the
+  // caller rather than at the metadata endpoint that answered with nonsense.
+  for (const body of [
+    "{}",
+    '{"AccessKeyId":null,"SecretAccessKey":null,"Token":null}',
+    // Empty strings are present but unusable: an empty access key cannot sign,
+    // so "is it a string" is not the question — "is it a non-empty string" is.
+    '{"AccessKeyId":"","SecretAccessKey":"","Token":""}',
+    '{"AccessKeyId":"AKIA","SecretAccessKey":"","Token":""}',
+    // Only the access key empty: a partial check that validates the secret and
+    // token but not the access key would let this through.
+    '{"AccessKeyId":"","SecretAccessKey":"secret","Token":"session"}',
+  ]) {
+    await assert.rejects(
+      () => withStubbedFetch(body, 200, () => imdsCredentials()()),
+      (err: unknown) => {
+        assert.equal((err as { code?: string }).code, "ENETWORK");
+        assert.match(
+          (err as Error).message,
+          /missing/,
+          `body ${body} must be reported as missing fields`,
+        );
+        return true;
+      },
+      `body ${body} must be refused`,
+    );
+  }
+});
+
+await test("regression: the IMDS error names every missing field at once", async () => {
+  // An operator should not have to re-fetch the metadata endpoint to discover
+  // the second missing field.
+  await assert.rejects(
+    () => withStubbedFetch("{}", 200, () => imdsCredentials()()),
+    (err: unknown) => {
+      const m = (err as Error).message;
+      assert.match(m, /AccessKeyId/);
+      assert.match(m, /SecretAccessKey/);
+      assert.match(m, /Token/);
+      return true;
+    },
+  );
+});
+
+await test("regression: a complete IMDS body still signs", async () => {
+  // The guard added above must not reject the shape IMDS actually returns.
+  const good = JSON.stringify({
+    AccessKeyId: "AKIAEXAMPLE",
+    SecretAccessKey: "secret",
+    Token: "session",
+    Expiration: new Date(Date.now() + 3_600_000).toISOString(),
+  });
+  const creds = await withStubbedFetch(good, 200, () => imdsCredentials()());
+  assert.equal(creds.accessKeyId, "AKIAEXAMPLE");
+  assert.equal(creds.secretAccessKey, "secret");
+  assert.equal(creds.sessionToken, "session");
+  assert.equal(typeof creds.expiration, "string");
 });
 
 console.log(`\n────────────────────────────────────────`);

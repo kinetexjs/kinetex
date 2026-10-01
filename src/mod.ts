@@ -93,6 +93,7 @@ export {
 export {
   parseDigestChallenge,
   computeDigestResponse,
+  computeUsernameStar,
   formatDigestAuth,
   createDigestAuthorization,
 } from "./digest.ts";
@@ -160,11 +161,15 @@ export {
   createDedupeInterceptor,
   createRateLimitInterceptor,
   RateLimitError,
+  ConcurrencyLimiter,
+  CONCURRENCY_DEFAULTS,
+  ConcurrencyLimitError,
   createHARInterceptor,
   createMetricsInterceptor,
   createInterceptorSuite,
   computeBodySize,
 } from "./interceptors.ts";
+export type { ConcurrencyLimitConfig } from "./interceptors.ts";
 
 // lifecycle.ts exports
 export {
@@ -522,7 +527,8 @@ export type {
   WSSubscribedRoom,
 } from "./ws.ts";
 
-export type { OTelTracer, OTelSpan } from "./client.ts";
+export type { OTelTracer, OTelSpan, MetricAttributes } from "./client.ts";
+export { generateIdempotencyKey, isValidIdempotencyKey } from "./headers.ts";
 
 // ── Utilities ────────────────────────────────────────────────────────────────
 export {

@@ -99,6 +99,8 @@ export const HeaderName = {
   TE: "te",
   /** HTTP header name for Expect */
   Expect: "expect",
+  /** HTTP header name for Idempotency-Key */
+  IdempotencyKey: "idempotency-key",
   /** HTTP header name for Max-Forwards */
   MaxForwards: "max-forwards",
 
@@ -806,9 +808,79 @@ export class HttpHeaders {
  * // Map(2) { "charset" => "utf-8", "boundary" => "something" }
  * ```
  */
+/**
+ * Split a parameter list on `;`, ignoring separators inside a quoted-string
+ * and honouring `quoted-pair` (RFC 7230 §3.2.6).
+ *
+ * `String.prototype.split(";")` treated every semicolon as a separator, so a
+ * value containing one was shredded into extra parameters:
+ *
+ *   `boundary="a;b"`               → boundary = `"a`, then a stray `b"`
+ *   `filename="report; final.pdf"` → filename = `"report`, then `final.pdf"`
+ *
+ * The second is a `Content-Disposition` with a perfectly ordinary filename —
+ * semicolons are legal in filenames, and the multipart spec's own example
+ * uses one. The first appears in every `multipart/form-data` boundary. Both
+ * were parsed by `parseParams`, which is also what `parseContentType`,
+ * `parseContentDisposition`, `parseCacheControl` and `parseServerTiming` read
+ * their parameters through.
+ */
+function splitParamList(paramStr: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let inQuotes = false;
+  for (let i = 0; i < paramStr.length; i++) {
+    const c = paramStr[i]!;
+    if (inQuotes) {
+      // A backslash escapes the next character, including a closing quote.
+      if (c === "\\" && i + 1 < paramStr.length) {
+        cur += c + paramStr[++i];
+        continue;
+      }
+      if (c === '"') inQuotes = false;
+      cur += c;
+      continue;
+    }
+    if (c === '"') {
+      inQuotes = true;
+      cur += c;
+      continue;
+    }
+    if (c === ";") {
+      out.push(cur);
+      cur = "";
+      continue;
+    }
+    cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+
+/** Remove surrounding quotes from a parameter value and decode quoted-pairs. */
+function unquoteParam(v: string): string {
+  if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) {
+    return v.slice(1, -1).replace(/\\(.)/g, "$1");
+  }
+  return v;
+}
+
+/**
+ * Wrap a parameter value in a `quoted-string`, escaping `\` and `"`.
+ *
+ * Every formatter in this module interpolated parameter values raw, so a
+ * value containing a double quote terminated its own string and the rest was
+ * read as further parameters: `formatLinkHeader` with `title: 'a "q" b'`
+ * emitted `title="a "q" b"`, and an unknown param `x` with value `v"w"`
+ * emitted `x="v"w""`. The same class of bug as an unescaped digest auth-param.
+ */
+function quoteParam(v: string): string {
+  return `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
 export function parseParams(paramStr: string): Map<string, string> {
   const map = new Map<string, string>();
-  for (const part of paramStr.split(";")) {
+  for (const part of splitParamList(paramStr)) {
     const t = part.trim();
     if (!t) continue;
     const eq = t.indexOf("=");
@@ -816,10 +888,7 @@ export function parseParams(paramStr: string): Map<string, string> {
       map.set(t.toLowerCase(), "");
     } else {
       const k = t.slice(0, eq).trim().toLowerCase();
-      let v = t.slice(eq + 1).trim();
-      // Strip optional surrounding quotes
-      if (v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
-      map.set(k, v);
+      map.set(k, unquoteParam(t.slice(eq + 1).trim()));
     }
   }
   return map;
@@ -853,8 +922,16 @@ function parseQualityList(header: string): QualityValue[] {
         if (eq === -1) continue;
         const k = seg.slice(0, eq).trim().toLowerCase();
         const v = seg.slice(eq + 1).trim();
-        if (k === "q") quality = parseFloat(v) || 0;
-        else params.set(k, v);
+        if (k === "q") {
+          // RFC 9110 §12.4.2 bounds a qvalue to 0..1 with at most 3 decimals.
+          // `parseFloat(v) || 0` made a *malformed* q read as 0 — "not
+          // acceptable" — so `Accept: text/html;q=abc` silently stopped
+          // matching text/html, and `q=1.5` or `q=-1` flowed out of here as
+          // out-of-range weights. A q that is not a number at all is treated
+          // as absent, which is what RFC 9110 §12.4.2 says it means.
+          const n = parseFloat(v);
+          if (Number.isFinite(n)) quality = Math.min(1, Math.max(0, n));
+        } else params.set(k, v);
       }
 
       return { value, quality, params };
@@ -1006,9 +1083,9 @@ export function parseContentDisposition(value: string): ContentDispositionValue 
  */
 export function formatContentDisposition(cd: ContentDispositionValue): string {
   let out = cd.type;
-  if (cd.name) out += `; name="${cd.name}"`;
+  if (cd.name) out += `; name=${quoteParam(cd.name)}`;
   if (cd.filename) {
-    out += `; filename="${cd.filename}"`;
+    out += `; filename=${quoteParam(cd.filename)}`;
     // Also emit RFC 5987 encoded form
     const encoded = encodeURIComponent(cd.filename);
     if (encoded !== cd.filename) {
@@ -1426,22 +1503,54 @@ export function parseContentLanguage(value: string): QualityValue[] {
  * @returns Best matching content type, or `null` if none match
  */
 export function negotiateContentType(acceptHeader: string, available: string[]): string | null {
-  const accepted = parseAccept(acceptHeader);
-  for (const { value } of accepted) {
-    if (value === "*/*") return available[0] ?? null;
-    const [type] = value.split("/");
-    if (value.endsWith("/*")) {
-      const match = available.find((a) => a.startsWith(type + "/"));
-      if (match) return match;
-    }
-    if (available.includes(value)) return value;
-  }
-  return null;
-}
+  if (available.length === 0) return null;
 
-// ============================================================================
-// §11  RANGE / CONTENT-RANGE
-// ============================================================================
+  // RFC 9110 §12.5.1: "A request without any Accept header field implies that
+  // the user agent will accept any media type in response." An absent or empty
+  // Accept therefore means *everything*, not nothing — the old loop over an
+  // empty list returned null, so a client that simply did not care got no
+  // match at all.
+  if (!acceptHeader.trim()) return available[0]!;
+
+  /** The `type/subtype` of an entry, lowercased, with parameters dropped. */
+  const essence = (v: string): string => v.split(";")[0]!.trim().toLowerCase();
+
+  const ranges = parseAccept(acceptHeader)
+    .map((qv) => ({ essence: essence(qv.value), quality: qv.quality }))
+    .filter((r) => r.essence !== "");
+
+  // 0 = no match, 1 = type/*, 2 = exact type/subtype. RFC 9110 §12.5.1 gives
+  // precedence to the *most specific* matching range, so a type named with
+  // `q=0` stays refused even when a wildcard would otherwise admit it.
+  const specificity = (range: string, want: string): number => {
+    if (range === want) return 2;
+    if (range.endsWith("/*") && want.startsWith(range.slice(0, range.length - 1))) return 1;
+    if (range === "*/*") return 0;
+    return -1;
+  };
+
+  let best: { index: number; quality: number; spec: number } | null = null;
+  for (let i = 0; i < available.length; i++) {
+    const want = essence(available[i]!);
+    let quality: number | null = null;
+    let spec = -1;
+    for (const range of ranges) {
+      const m = specificity(range.essence, want);
+      if (m < 0) continue;
+      if (m > spec) {
+        spec = m;
+        quality = range.quality;
+      }
+    }
+    // Unmatched, or matched at q=0 — the client will not take it.
+    if (quality === null || quality <= 0) continue;
+    if (best === null || quality > best.quality || (quality === best.quality && spec > best.spec)) {
+      best = { index: i, quality, spec };
+    }
+  }
+
+  return best === null ? null : available[best.index]!;
+}
 
 /** Parsed Range request header (RFC 7233 §3.1). */
 export interface RangeSpec {
@@ -1464,18 +1573,31 @@ export function parseRange(value: string): RangeSpec | null {
   const ranges = value
     .slice(eq + 1)
     .split(",")
-    .map((r) => {
+    .map((r): { start: number | null; end: number | null } | null => {
       const t = r.trim();
       const dash = t.indexOf("-");
       if (dash === -1) return null;
-      const start = t.slice(0, dash).trim();
-      const end = t.slice(dash + 1).trim();
-      return {
-        start: start === "" ? null : parseInt(start, 10),
-        end: end === "" ? null : parseInt(end, 10),
-      };
+      const startStr = t.slice(0, dash).trim();
+      const endStr = t.slice(dash + 1).trim();
+      const start = startStr === "" ? null : parseInt(startStr, 10);
+      const end = endStr === "" ? null : parseInt(endStr, 10);
+      // `bytes=abc-def` used to yield `{ start: NaN, end: NaN }` — `parseInt`
+      // returns NaN and nothing filtered it, so a caller arithmetic-ing on the
+      // bounds got NaN rather than a rejection.
+      if (start !== null && !Number.isFinite(start)) return null;
+      if (end !== null && !Number.isFinite(end)) return null;
+      // RFC 9110 §14.1.1: byte-range-spec is `first-pos "-" [last-pos]` or
+      // `"-" suffix-length`, with first-pos <= last-pos and both non-negative.
+      if (start === null && end === null) return null; // neither form given
+      if (start !== null && start < 0) return null;
+      if (end !== null && end < 0) return null;
+      if (start !== null && end !== null && start > end) return null;
+      return { start, end };
     })
     .filter((r): r is { start: number | null; end: number | null } => r !== null);
+
+  // `Range: bytes=` and a list of nothing but invalid specs are not ranges.
+  if (ranges.length === 0) return null;
 
   return { unit, ranges };
 }
@@ -1584,16 +1706,16 @@ export function formatLinkHeader(links: LinkValue[]): string {
   return links
     .map((l) => {
       let s = `<${l.uri}>`;
-      if (l.rel) s += `; rel="${l.rel}"`;
-      if (l.type) s += `; type="${l.type}"`;
-      if (l.hreflang) s += `; hreflang="${l.hreflang}"`;
-      if (l.title) s += `; title="${l.title}"`;
-      if (l.media) s += `; media="${l.media}"`;
+      if (l.rel) s += `; rel=${quoteParam(l.rel)}`;
+      if (l.type) s += `; type=${quoteParam(l.type)}`;
+      if (l.hreflang) s += `; hreflang=${quoteParam(l.hreflang)}`;
+      if (l.title) s += `; title=${quoteParam(l.title)}`;
+      if (l.media) s += `; media=${quoteParam(l.media)}`;
       const paramEntries =
         l.params instanceof Map ? [...l.params.entries()] : Object.entries(l.params ?? {});
       for (const [k, v] of paramEntries) {
         if (["rel", "type", "hreflang", "title", "media"].includes(k)) continue;
-        s += `; ${k}="${v}"`;
+        s += `; ${k}=${quoteParam(String(v))}`;
       }
       return s;
     })
@@ -1690,18 +1812,56 @@ export interface GetClientIPOptions {
  * @param options - Trust configuration
  * @returns The selected client IP, or `null` if none present
  */
+/** A dotted-quad IPv4 literal, or a syntactically plausible IPv6 literal. */
+function isIPLiteral(v: string): boolean {
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(v)) {
+    return v.split(".").every((o) => Number(o) <= 255 && (o === "0" || !o.startsWith("0")));
+  }
+  if (!v.includes(":")) return false;
+  // An IPv6 literal is hex groups, colons, and at most one `::`. At most one
+  // `::` is what rejects prose like "not:an:ip:address:here" while accepting
+  // the compressed and IPv4-mapped forms real proxies emit.
+  if (!/^[0-9a-f:.]+$/i.test(v)) return false;
+  return (v.match(/::/g) ?? []).length <= 1;
+}
+
+/**
+ * RFC 7239 permits an obfuscated identifier in place of an address, and
+ * `unknown` is the de-facto placeholder that nginx, HAProxy and several CDNs
+ * emit when they cannot determine the client. Neither is an IP address.
+ */
+function usableClientAddress(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const v = stripIPPortAndBrackets(raw);
+  if (!v) return null;
+  if (/^_/.test(v)) return v; // RFC 7239 obfuscated identifier
+  return isIPLiteral(v) ? v : null;
+}
+
 export function getClientIP(headers: HttpHeaders, options: GetClientIPOptions = {}): string | null {
   const trustedHops = Math.max(0, Math.trunc(options.trustedHops ?? 0));
   const fwd = normalizeForwardedHeaders(headers);
   if (fwd.for.length > 0) {
-    const list = fwd.for;
     // Right-most entry is the closest hop. trustedHops = 1 → the entry the
     // nearest trusted proxy appended; index = length - trustedHops.
-    const index = trustedHops === 0 ? 0 : list.length - trustedHops;
-    const value = list[index] ?? list[0];
-    return stripIPPortAndBrackets(value!);
+    const index = trustedHops === 0 ? 0 : fwd.for.length - trustedHops;
+    // Walk outwards from the chosen hop, skipping placeholders. Returning
+    // `unknown` as a client address, or any non-address the header happened
+    // to contain, meant a caller rate-limiting, logging or geo-locating on
+    // the literal string "unknown" or "garbage".
+    for (let i = index; i >= 0; i--) {
+      const found = usableClientAddress(fwd.for[i] as string | undefined);
+      if (found) return found;
+    }
+    for (const entry of fwd.for) {
+      const found = usableClientAddress(entry);
+      if (found) return found;
+    }
+    return null;
   }
-  return stripIPPortAndBrackets(headers.get(HeaderName.XRealIP) ?? "") || null;
+  // The old fallback returned `stripIPPortAndBrackets("")` — the empty string —
+  // for an empty `x-real-ip`, breaking the documented `string | null` contract.
+  return usableClientAddress(headers.get(HeaderName.XRealIP));
 }
 
 /**
@@ -1733,6 +1893,35 @@ export interface RetryAfterValue {
   delay: number | null;
 }
 
+/** RFC 7231 §7.1.1.1 IMF-fixdate, e.g. `Sun, 06 Nov 1994 08:49:37 GMT`. */
+const IMF_FIXDATE_RE =
+  /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+/** RFC 7231 §7.1.1.1 obsolete RFC 850 date, e.g. `Sunday, 06-Nov-94 08:49:37 GMT`. */
+const RFC850_DATE_RE =
+  /^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \d{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2,4} \d{2}:\d{2}:\d{2} GMT$/;
+/** RFC 7231 §7.1.1.1 obsolete asctime date, e.g. `Sun Nov  6 08:49:37 1994`. */
+const ASCTIME_DATE_RE =
+  /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4}$/;
+
+/**
+ * Parse a string that must be an HTTP-date in one of the three formats
+ * RFC 7231 §7.1.1.1 allows a recipient to accept.
+ *
+ * Unlike `Date.parse`, this never invents a date out of a bare number, a
+ * signed value or a floating-point one.
+ *
+ * @param value - Candidate HTTP-date (already trimmed)
+ * @returns Epoch milliseconds, or `null` when the value is not an HTTP-date
+ */
+export function parseHTTPDate(value: string): number | null {
+  const t = value.trim();
+  if (!IMF_FIXDATE_RE.test(t) && !RFC850_DATE_RE.test(t) && !ASCTIME_DATE_RE.test(t)) {
+    return null;
+  }
+  const ms = Date.parse(t);
+  return isNaN(ms) ? null : ms;
+}
+
 /**
  * Parse a Retry-After header which may be either delta-seconds or an
  * HTTP-date.
@@ -1744,9 +1933,12 @@ export function parseRetryAfter(value: string): RetryAfterValue {
   const t = value.trim();
   // Delta-seconds: pure integer
   if (/^\d+$/.test(t)) return { date: null, delay: parseInt(t, 10) };
-  // HTTP-date
-  const ms = Date.parse(t);
-  if (!isNaN(ms)) return { date: new Date(ms), delay: null };
+  // HTTP-date. Date.parse() is far more permissive than RFC 7231 §7.1.1.1 and
+  // happily reads "-5" as 2001-05-01, "1.5" as 2001-01-05 and "+5" as
+  // 2001-05-01, so a malformed header was silently turned into a *delay*.
+  // Gate on the three legal HTTP-date shapes before parsing.
+  const ms = parseHTTPDate(t);
+  if (ms !== null) return { date: new Date(ms), delay: null };
   return { date: null, delay: null };
 }
 
@@ -1960,7 +2152,7 @@ export function formatServerTiming(entries: ServerTimingEntry[]): string {
     .map((e) => {
       let s = e.name;
       if (e.duration !== null) s += `;dur=${e.duration}`;
-      if (e.description !== null) s += `;desc="${e.description}"`;
+      if (e.description !== null) s += `;desc=${quoteParam(e.description)}`;
       return s;
     })
     .join(", ");
@@ -2700,6 +2892,67 @@ export function createRequestHeaders(
   init?: HeadersInit | Record<string, string | string[]> | null,
 ): RichHeaders {
   return new RichHeaders(init, "request");
+}
+
+/**
+ * Generate a random Idempotency-Key value.
+ *
+ * Uses `crypto.getRandomValues`, available in every runtime kinetex targets
+ * (Node 18+, Deno, Bun, browsers, Workers) — no dependency, and not
+ * `Math.random`.
+ *
+ * Format is a RFC 9562 v4 UUID: 122 random bits, hyphenated, with the
+ * version and variant bits set. Servers that require an opaque string are
+ * equally satisfied; UUID is the form Stripe and most others document.
+ *
+ * @returns A fresh key, e.g. `"3f2a9c1e-7b4d-4a8f-9c2e-1d5b6f7a8c90"`.
+ * @throws {Error} If the runtime exposes no CSPRNG.
+ *
+ * @example
+ * ```ts
+ * client.post("/charges", body, { headers: { "idempotency-key": generateIdempotencyKey() } });
+ * ```
+ */
+export function generateIdempotencyKey(): string {
+  if (typeof crypto === "undefined" || typeof crypto.getRandomValues !== "function") {
+    throw new Error(
+      "generateIdempotencyKey: no CSPRNG available in this runtime — crypto.getRandomValues is required",
+    );
+  }
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  // RFC 9562 §5.4: set the version (4) and variant (10xx) bits.
+  // `noUncheckedIndexedAccess` makes these reads `number | undefined`; the
+  // buffer is a fixed 16 bytes so they are always present.
+  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40;
+  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+  const hex: string[] = [];
+  for (const b of bytes) hex.push(b.toString(16).padStart(2, "0"));
+  return [
+    hex.slice(0, 4).join(""),
+    hex.slice(4, 6).join(""),
+    hex.slice(6, 8).join(""),
+    hex.slice(8, 10).join(""),
+    hex.slice(10, 16).join(""),
+  ].join("-");
+}
+
+/**
+ * Validate an Idempotency-Key value.
+ *
+ * The header is opaque to the client, but it travels in a request header, so
+ * it must not be able to smuggle CR/LF into the request line or headers.
+ * Servers commonly cap the length (Stripe: 255 chars).
+ *
+ * @param key - Candidate value.
+ * @param maxLength - Maximum accepted length. Default: 255.
+ * @returns True when the value is safe to send.
+ */
+export function isValidIdempotencyKey(key: unknown, maxLength = 255): boolean {
+  if (typeof key !== "string") return false;
+  if (key.length === 0 || key.length > maxLength) return false;
+  // Visible ASCII only: rejects CR, LF, NUL, and any non-ASCII byte.
+  return /^[\x21-\x7e]+$/.test(key);
 }
 
 /**

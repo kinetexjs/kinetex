@@ -10,6 +10,13 @@
  *            not exist in type 'T'"
  *   TS2561 — "Property 'x' does not exist on type 'T'"
  *   TS2339 — "Property 'x' does not exist on type 'T'"
+ *   TS2551 — the same, with a suggestion: "Property 'x' does not exist on type
+ *            'T'. Did you mean 'y'?" TypeScript splits the property-does-not-
+ *            exist error in two, and only the suggestion-free form is 2339 — so
+ *            a guard listing 2339 alone misses the *more* common case, where the
+ *            documented name is a near-miss for a real one. `limiter.inFlightTypo`
+ *            for `inFlight` is exactly the drift this suite exists to catch, and
+ *            it passed until 2551 was added.
  *
  * Those are exactly the "this option does not exist", "this symbol is not
  * exported", and "this method/field does not exist" errors, which is the whole
@@ -45,7 +52,10 @@ import * as ts from "typescript";
 
 const PKG = JSON.parse(readFileSync("package.json", "utf8")) as {
   exports: Record<string, unknown>;
+  version: string;
 };
+const DENO = JSON.parse(readFileSync("deno.json", "utf8")) as { version?: string };
+const CHANGELOG = readFileSync("CHANGELOG.md", "utf8");
 
 const SRC_DIR = "src";
 const srcFiles = readdirSync(SRC_DIR)
@@ -65,7 +75,7 @@ const COMPILER_OPTIONS: ts.CompilerOptions = {
 };
 
 /** Diagnostics that mean "the documented API does not exist". */
-const DRIFT_CODES = new Set([2353, 2561, 2339]);
+const DRIFT_CODES = new Set([2353, 2561, 2339, 2551]);
 
 // ── Extract every documented code block ───────────────────────────────────
 
@@ -321,4 +331,101 @@ test("the docs test actually inspects something", () => {
     true,
     "virtual sample files were not added to the program",
   );
+});
+
+// ── Release-version consistency ─────────────────────────────────────────
+//
+// Three files carry the release version: package.json, deno.json and the
+// topmost CHANGELOG heading. They are edited by hand in three places during a
+// release, so they drift silently: a version bump that misses deno.json ships
+// a Deno entry point that disagrees with npm, and a bump with no CHANGELOG
+// entry ships undocumented changes. Nothing else in the suite would notice.
+
+/** The first `## [x.y.z]` heading in the changelog. */
+function changelogTopVersion(md: string): string | null {
+  const m = /^## \[([^\]\s]+)\]/m.exec(md);
+  return m ? m[1]! : null;
+}
+
+test("package.json, deno.json and the changelog agree on the version", () => {
+  const pkgVersion = PKG.version;
+  assert.match(
+    pkgVersion,
+    /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/,
+    `bad package.json version: ${pkgVersion}`,
+  );
+
+  assert.equal(
+    DENO.version,
+    pkgVersion,
+    `deno.json version (${String(DENO.version)}) must match package.json (${pkgVersion})`,
+  );
+
+  const top = changelogTopVersion(CHANGELOG);
+  assert.notEqual(top, null, "CHANGELOG.md must start its entries with a `## [version]` heading");
+  assert.equal(
+    top,
+    pkgVersion,
+    `the newest CHANGELOG entry (${top}) must be the version being shipped (${pkgVersion})`,
+  );
+});
+
+test("every CHANGELOG entry has a date and a recognised section", () => {
+  const headings = [...CHANGELOG.matchAll(/^## \[([^\]]+)\] - (\S+)$/gm)];
+  assert.ok(headings.length > 0, "no dated `## [version] - date` entries found");
+
+  const RELEASE_SECTIONS = new Set([
+    "Added",
+    "Changed",
+    "Deprecated",
+    "Removed",
+    "Fixed",
+    "Security",
+    "Documentation",
+    "Tests",
+  ]);
+
+  const problems: string[] = [];
+  for (const m of CHANGELOG.matchAll(/^## \[[^\]]+\] - \S+$/gm)) {
+    const start = m.index! + m[0].length;
+    const rest = CHANGELOG.slice(start);
+    const next = /^## /m.exec(rest);
+    const body = next ? rest.slice(0, next.index) : rest;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(m[0].split(" - ")[1]!)) {
+      problems.push(`${m[0]} — date is not ISO-8601`);
+    }
+    for (const sec of body.matchAll(/^### (.+)$/gm)) {
+      if (!RELEASE_SECTIONS.has(sec[1]!.trim())) {
+        problems.push(`${m[0]} — unknown section "### ${sec[1]!.trim()}"`);
+      }
+    }
+  }
+  assert.deepEqual(problems, [], problems.join("\n"));
+});
+
+test("the current release documents the features this version added", () => {
+  // Each of these shipped in 1.4.0. If a rename or a revert lands, the
+  // changelog must be updated in the same commit — that is the point.
+  const top = changelogTopVersion(CHANGELOG);
+  assert.notEqual(top, null);
+  const start = CHANGELOG.indexOf(`## [${top}]`);
+  const rest = CHANGELOG.slice(start);
+  const next = /^## /m.exec(rest.slice(1));
+  const entry = next ? rest.slice(0, next.index) : rest;
+
+  for (const symbol of [
+    "sessionPool",
+    "concurrencyLimit",
+    "ConcurrencyLimiter",
+    "ECONCURRENCY",
+    "proxy",
+    "EPROXY",
+    "dispatcher",
+    "zstd",
+    "recordHistogram",
+    "incrementCounter",
+    "idempotencyKey",
+  ]) {
+    assert.ok(entry.includes(symbol), `the ${top} changelog entry must document \`${symbol}\``);
+  }
 });

@@ -356,18 +356,71 @@ export function imdsCredentials(
       timeout,
     );
     if (!credsRes.ok) throw new NetworkError(`IMDS credentials fetch failed: ${credsRes.status}`);
-    const data = (await credsRes.json()) as {
-      AccessKeyId: string;
-      SecretAccessKey: string;
-      Token: string;
-      Expiration: string;
+
+    // Two failures used to escape this function unlabelled, and both of them
+    // turned into a silently broken signature rather than an error:
+    //
+    //  - `Response.json()` throws a bare `SyntaxError` on a non-JSON body, so
+    //    a proxy's HTML 502 page arrived with no `code` — a caller branching
+    //    on `err.code === "ENETWORK"` never saw it, and the message said
+    //    nothing about IMDS. Every other failure here is a `NetworkError`.
+    //  - A well-formed but shapeless body parsed fine and produced a
+    //    "successful" result: `{}` yielded `accessKeyId: undefined`, and
+    //    `{"AccessKeyId": null, …}` yielded nulls. Both then went on to
+    //    produce a SigV4 signature AWS rejects with an opaque
+    //    `SignatureDoesNotMatch`, pointing at the caller rather than at the
+    //    metadata endpoint that had actually answered with nonsense.
+    let data: {
+      AccessKeyId?: unknown;
+      SecretAccessKey?: unknown;
+      Token?: unknown;
+      Expiration?: unknown;
     };
+    try {
+      data = (await credsRes.json()) as typeof data;
+    } catch (err) {
+      throw new NetworkError(
+        `IMDS credentials response was not JSON: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (data === null || typeof data !== "object") {
+      throw new NetworkError(`IMDS credentials response was not an object: ${typeof data}`);
+    }
+
+    const { AccessKeyId, SecretAccessKey, Token, Expiration } = data;
+    const missing: string[] = [];
+    if (typeof AccessKeyId !== "string" || AccessKeyId.length === 0) missing.push("AccessKeyId");
+    if (typeof SecretAccessKey !== "string" || SecretAccessKey.length === 0)
+      missing.push("SecretAccessKey");
+    if (typeof Token !== "string" || Token.length === 0) missing.push("Token");
+    if (missing.length > 0) {
+      throw new NetworkError(
+        `IMDS credentials response is missing ${missing.join(", ")} — ` +
+          "the metadata endpoint returned a body this client cannot sign with",
+      );
+    }
+
+    // Re-read through a narrowing helper: the checks above report every missing
+    // field at once, which is the right message but does not let the compiler
+    // carry the narrowing into this scope.
+    const requireString = (value: unknown, name: string): string => {
+      if (typeof value !== "string" || value.length === 0) {
+        throw new NetworkError(`IMDS credentials response is missing ${name}`);
+      }
+      return value;
+    };
+    const accessKeyId = requireString(AccessKeyId, "AccessKeyId");
+    const secretAccessKey = requireString(SecretAccessKey, "SecretAccessKey");
+    const sessionToken = requireString(Token, "Token");
 
     return {
-      accessKeyId: data.AccessKeyId,
-      secretAccessKey: data.SecretAccessKey,
-      sessionToken: data.Token,
-      expiration: data.Expiration,
+      accessKeyId,
+      secretAccessKey,
+      sessionToken,
+      // Optional: a role without an expiry is legal, and the signer treats a
+      // missing expiration as "do not cache". Omitted rather than set to
+      // `undefined` — the project uses exactOptionalPropertyTypes.
+      ...(typeof Expiration === "string" ? { expiration: Expiration } : {}),
     };
   });
 }
@@ -582,6 +635,11 @@ function buildCanonicalHeaders(
 
   for (const [name, value] of Object.entries(headers)) {
     const lower = name.toLowerCase();
+    // An empty header name is not a valid HTTP field-name (RFC 9110 §5.1) and
+    // used to reach the canonical request verbatim, producing a `:value` line
+    // and a leading `;` in SignedHeaders. AWS answers that with an opaque
+    // SignatureDoesNotMatch rather than saying the header name was empty.
+    if (lower === "") continue;
     if (unsigned.has(lower) && !ALWAYS_SIGNED_HEADERS.has(lower)) continue;
     // Trim + collapse internal whitespace
     const normalized = value.trim().replace(/\s+/g, " ");
@@ -736,10 +794,19 @@ export async function signRequest(
 
   const parsedUrl = new URL(request.url);
 
-  // Build the headers to sign — start from request headers
+  // Build the headers to sign — start from request headers.
+  //
+  // An explicitly-supplied `host` (in any casing) must WIN. Setting it is how
+  // you sign for a virtual-hosted-style bucket, a custom endpoint or a proxy.
+  // The URL host used to be injected unconditionally, which left both keys in
+  // the map whenever the caller used a different casing; `buildCanonicalHeaders`
+  // lowercased them and its dedupe step joined them, so the request was signed
+  // as `host:override.example,s3.amazonaws.com` — a host that can never
+  // validate, and one the library reported no error about.
+  const hasExplicitHost = Object.keys(request.headers).some((k) => k.toLowerCase() === "host");
   const headers: Record<string, string> = {
     ...request.headers,
-    host: parsedUrl.host,
+    ...(hasExplicitHost ? {} : { host: parsedUrl.host }),
     "x-amz-date": amzDate,
   };
 
@@ -816,13 +883,23 @@ export async function presignRequest(
   const signingDate = resolveSigningDate(config);
   const amzDate = formatAmzDate(signingDate);
   const dateStamp = formatDateStamp(signingDate);
-  const expiresIn = options.expiresIn ?? 3600;
-
-  // Validate expiresIn range - different services have different limits
+  // Validate and CLAMP expiresIn. AWS enforces a hard maximum per service and
+  // rejects an out-of-range or fractional value with an opaque
+  // AuthorizationQueryParametersError at use time, long after the URL was
+  // handed out. The old code logged a warning and then wrote the caller's
+  // number straight into the query string, so `expiresIn: 0` produced
+  // `X-Amz-Expires=0`, `expiresIn: -1` produced `=-1`, and `expiresIn: 1e9`
+  // produced a link valid for ~31 years — every one of them permanently
+  // unusable, with a console warning as the only signal. Clamping can only
+  // shorten a link, never lengthen one, so it is the safe direction.
   const maxExpires = config.service === "s3" ? 604800 : 3600;
-  if (expiresIn < 1 || expiresIn > maxExpires) {
+  const requested = options.expiresIn ?? 3600;
+  const expiresIn = Number.isFinite(requested)
+    ? Math.min(Math.max(Math.floor(requested), 1), maxExpires)
+    : maxExpires;
+  if (expiresIn !== requested) {
     console.warn(
-      `[aws-sigv4] presignRequest: expiresIn should be 1-${maxExpires} seconds for ${config.service}, got ${expiresIn}`,
+      `[aws-sigv4] presignRequest: expiresIn must be an integer in 1-${maxExpires} for ${config.service}, got ${requested} — clamped to ${expiresIn}`,
     );
   }
 
@@ -846,10 +923,16 @@ export async function presignRequest(
     }
   }
 
-  // Determine signed headers (only "host" for presigned URLs typically)
+  // Determine signed headers (only "host" for presigned URLs typically).
+  // An explicit `host` wins here for the same reason it does in sign() — a
+  // differently-cased caller header used to be merged with the URL host into
+  // `host:override.example,s3.amazonaws.com`, which can never validate.
+  const presignHasExplicitHost = Object.keys(request.headers).some(
+    (k) => k.toLowerCase() === "host",
+  );
   const headers: Record<string, string> = {
     ...request.headers,
-    host: parsedUrl.host,
+    ...(presignHasExplicitHost ? {} : { host: parsedUrl.host }),
   };
 
   const unsignedHdrs = config.unsignedHeaders ?? [];
@@ -1073,11 +1156,42 @@ export async function signS3PostPolicy(
  * Returns 0 if the header is absent or unparseable.
  */
 export function detectClockSkew(responseHeaders: Record<string, string>): number {
-  const dateHeader = responseHeaders["date"] ?? responseHeaders["Date"];
-  if (!dateHeader) return 0;
-  const serverTime = new Date(dateHeader).getTime();
-  if (isNaN(serverTime)) return 0;
+  // `x-amz-date` is AWS's own signed timestamp and is the one present on the
+  // clock-skew error itself. `Date` is generated by whatever proxy fronts the
+  // endpoint and is frequently absent. Reading only `Date` meant a skew was
+  // silently undetectable on exactly the responses that carry it.
+  const amzDate = responseHeaders["x-amz-date"] ?? responseHeaders["X-Amz-Date"];
+  let serverTime: number;
+  if (amzDate !== undefined) {
+    serverTime = parseAmzDate(amzDate);
+    if (isNaN(serverTime)) return 0;
+  } else {
+    const dateHeader = responseHeaders["date"] ?? responseHeaders["Date"];
+    if (!dateHeader) return 0;
+    serverTime = new Date(dateHeader).getTime();
+    if (isNaN(serverTime)) return 0;
+  }
   return Math.round((serverTime - Date.now()) / 1000);
+}
+
+/**
+ * Parse AWS's basic ISO 8601 timestamp (`20300101T120000Z`), which is not a
+ * form `Date` can parse.
+ *
+ * @param value - Candidate `x-amz-date` value
+ * @returns Epoch milliseconds, or `NaN` when the value is not in that form
+ */
+function parseAmzDate(value: string): number {
+  const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(value.trim());
+  if (!m) return NaN;
+  const [, y, mo, d, h, mi, sec] = m;
+  // Reject values that roll over silently (e.g. month 13) instead of
+  // producing a date in the following month.
+  const t = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(sec));
+  const dt = new Date(t);
+  if (dt.getUTCFullYear() !== Number(y) || dt.getUTCMonth() + 1 !== Number(mo)) return NaN;
+  if (dt.getUTCDate() !== Number(d)) return NaN;
+  return t;
 }
 
 /**

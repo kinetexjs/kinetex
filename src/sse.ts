@@ -220,6 +220,11 @@ export class SSEParser {
 
     switch (field) {
       case "id":
+        // A field value containing U+0000 is ignored per spec. This string is
+        // replayed verbatim in the `Last-Event-ID` request header on every
+        // reconnect, and a NUL is not a legal header value at all — so
+        // storing one turns a reconnection into a thrown TypeError.
+        if (value.includes("\u0000")) break;
         // Empty id resets the last event id to null per spec
         this.id = value || null;
         break;
@@ -230,8 +235,11 @@ export class SSEParser {
         this.data.push(value);
         break;
       case "retry": {
-        const ms = parseInt(value, 10);
-        if (!isNaN(ms) && ms >= 0) this.retry = ms;
+        // Spec: the field is honoured only when every character is an ASCII
+        // digit. `parseInt` accepted a trailing "abc", a leading "+", and the
+        // "1e3" exponent, so a proxy rewriting the line as
+        // `retry: 3000; path=/` silently set the reconnection back-off.
+        if (/^[0-9]+$/.test(value)) this.retry = Number(value);
         break;
       }
       // Unknown fields are ignored per spec
@@ -410,11 +418,31 @@ export class SSEClient {
   async collect(options: { limit?: number; signal?: AbortSignal } = {}): Promise<SSEEvent[]> {
     const events: SSEEvent[] = [];
     let count = 0;
-    for await (const event of this._stream()) {
-      events.push(event);
-      count++;
-      if (options.limit && count >= options.limit) break;
-      if (options.signal?.aborted) break;
+    // The signal has to reach the read loop, not just the check after an
+    // event. Cancelling a collection is for a stream that has gone quiet, and
+    // a quiet stream is precisely the one parked in `reader.read()` with no
+    // event to reach the check — so the abort was only ever observed once
+    // something arrived, which for a stalled endpoint meant never. Aborting
+    // the stream's own controller is what makes the pending read settle, so
+    // the generator unwinds and the socket is released.
+    // An `abort` event never fires on a signal that is already aborted, so a
+    // listener alone would silently ignore the one case that needs no
+    // waiting: a request cancelled before it starts must not connect at all.
+    const signal = options.signal;
+    if (signal?.aborted) return [];
+    const onAbort = (): void => {
+      this._streamController?.abort();
+    };
+    signal?.addEventListener("abort", onAbort);
+    try {
+      for await (const event of this._stream()) {
+        events.push(event);
+        count++;
+        if (options.limit && count >= options.limit) break;
+        if (options.signal?.aborted) break;
+      }
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
     }
     return events;
   }
@@ -461,8 +489,14 @@ export class SSEClient {
 
     // Create abort controller for this stream
     this._streamController = new AbortController();
+    // `close()` aborts this controller, but the reconnect back-off below used
+    // to sleep on the *caller's* signal only. A `close()` during a back-off
+    // therefore left the generator parked for the full delay — up to
+    // `maxReconnectDelayMs` — so `for await (const e of client.stream())` hung
+    // long after the client was told to shut down. The back-off watches both.
+    const streamSignal = this._streamController.signal;
 
-    while (!this._closed && !this._streamController?.signal.aborted) {
+    while (!this._closed && !streamSignal.aborted) {
       // Snapshot _closed to avoid race with setter firing during yield
       const closedSnapshot = this._closed;
       if (closedSnapshot || cfg.signal?.aborted || this._streamController?.signal.aborted) break;
@@ -542,7 +576,16 @@ export class SSEClient {
           while (!closedSnapshot) {
             if (cfg.signal?.aborted) break;
 
-            const { done, value } = await reader.read();
+            // `closedSnapshot` is a snapshot, and neither signal is wired into
+            // the fetch (the request carries the caller's signal, not the
+            // stream's), so a `close()` — documented as aborting any active
+            // stream — was simply not observed until the server happened to
+            // send something. On a long-lived stream, which is the normal
+            // case, `for await (const e of client.stream())` never returned
+            // after `client.close()`. The read is raced against both signals.
+            const result = await readOrAbort(reader.read(), cfg.signal, streamSignal);
+            if (result === null) break;
+            const { done, value } = result;
 
             if (done) break;
 
@@ -570,15 +613,21 @@ export class SSEClient {
           }
         } finally {
           if (heartbeatTimer) clearTimeout(heartbeatTimer);
+          // The returned promise is what has to be handled, not the call.
+          // `cancel()` on a reader whose stream is already errored — which is
+          // exactly what an abort leaves behind — rejects with that stored
+          // error, and a rejection nobody awaits terminates a Node process.
           try {
-            reader.cancel();
+            void reader.cancel().catch(() => {});
           } catch {
             /* ignore */
           }
         }
 
-        // Flush remaining
-        const final = parser.flush();
+        // Flush remaining — but never after an abort or a close(): a
+        // half-received event belonging to a stream the caller has already
+        // torn down is not something to deliver.
+        const final = streamSignal.aborted || cfg.signal?.aborted ? null : parser.flush();
         if (final) {
           this.health.totalEvents++;
           this.health.lastEventAt = Date.now();
@@ -632,10 +681,11 @@ export class SSEClient {
           heartbeatTimer = null;
         }
 
-        // Abortable: without the signal an abort() during back-off had to wait
-        // out the full delay (up to maxReconnectDelayMs) before being noticed.
-        await sleep(delay, cfg.signal);
-        if (cfg.signal?.aborted) break;
+        // Abortable by the caller's signal *and* by close(). Without this, an
+        // abort or a close() during back-off had to wait out the full delay (up
+        // to maxReconnectDelayMs) before being noticed.
+        await sleepOrAbort(delay, cfg.signal, streamSignal);
+        if (cfg.signal?.aborted || streamSignal.aborted) break;
         parser.reset();
         continue;
       }
@@ -672,10 +722,11 @@ export class SSEClient {
         heartbeatTimer = null;
       }
 
-      await sleep(delay, cfg.signal);
-      // Same as the error path: without this, a close()/abort() during a
-      // clean-close back-off was not noticed until the full delay elapsed.
-      if (cfg.signal?.aborted) break;
+      // Same as the error path: without watching the stream signal here too, a
+      // close()/abort() during a clean-close back-off was not noticed until the
+      // full delay elapsed.
+      await sleepOrAbort(delay, cfg.signal, streamSignal);
+      if (cfg.signal?.aborted || streamSignal.aborted) break;
     }
 
     this.health.connected = false;
@@ -764,12 +815,18 @@ export class SSERouter {
    */
   onJSON<T>(eventType: string, handler: SSEEventHandler<T>): this {
     return this.on(eventType, async (data, evt) => {
+      let parsed: T;
       try {
-        const parsed = sanitizeParsedJSON(JSON.parse(data) as T);
-        await handler(parsed, evt);
+        parsed = sanitizeParsedJSON(JSON.parse(data) as T);
       } catch {
-        /* ignore parse error */
+        // Only the PARSE is swallowed, which is what the method documents. The
+        // handler used to run inside the same `try`, so a handler that threw
+        // was discarded with no trace of why — and `dispatch()` / `consume()`
+        // awaited every handler, so a caller relying on them to surface
+        // failures never saw one.
+        return;
       }
+      await handler(parsed, evt);
     });
   }
 
@@ -815,6 +872,25 @@ export class SSERouter {
 // ============================================================================
 
 /**
+ * Make a value safe to place after a field name in an SSE stream.
+ *
+ * The event-stream format has no escaping: a CR, LF or NUL inside a field
+ * value ends that line, and whatever follows is parsed as a field of its own.
+ * `id` and `event` are written verbatim, so a caller passing a row id, a
+ * filename or any other user-controlled string could forge `event:` or
+ * `data:` lines into the stream — the receiving parser reads them as
+ * first-class fields, not as a fragment of the value. The characters are
+ * removed rather than escaped, because there is nothing to escape them with.
+ */
+function asFieldValue(value: string): string {
+  // The control characters are the point: CR, LF and NUL are exactly the
+  // bytes that would terminate the SSE field line and let the rest of the
+  // value be read as fields of its own.
+  // deno-lint-ignore no-control-regex
+  return value.replace(/[\r\n\u0000]/g, "");
+}
+
+/**
  * Builder for creating SSE-compatible server responses.
  * Works with any runtime that supports the WHATWG Streams API.
  */
@@ -842,7 +918,7 @@ export class SSEServerResponse {
 
   /** Send a comment (heartbeat ping). */
   comment(text = ""): this {
-    if (!this._closed) this.controller.enqueue(`: ${text}\n\n`);
+    if (!this._closed) this.controller.enqueue(`: ${asFieldValue(text)}\n\n`);
     return this;
   }
 
@@ -855,12 +931,14 @@ export class SSEServerResponse {
   sendEvent(event: string, data: string, options: { id?: string; retry?: number } = {}): this {
     if (this._closed) return this;
     let msg = "";
-    if (options.id !== undefined) msg += `id: ${options.id}\n`;
-    if (event !== "message") msg += `event: ${event}\n`;
+    if (options.id !== undefined) msg += `id: ${asFieldValue(options.id)}\n`;
+    if (event !== "message") msg += `event: ${asFieldValue(event)}\n`;
     if (options.retry !== undefined) msg += `retry: ${options.retry}\n`;
 
-    // Multi-line data support
-    for (const line of data.split("\n")) {
+    // Multi-line data support. Split on all three SSE line endings, not just
+    // LF: a bare CR ends a line for every conforming reader, so leaving it
+    // inside a `data:` value silently turned one event into two on the way in.
+    for (const line of data.split(/\r\n|\r|\n/)) {
       msg += `data: ${line}\n`;
     }
     msg += "\n";
@@ -1054,21 +1132,77 @@ export function parseSSEText(text: string): SSEEvent[] {
 // §10  UTILITIES
 // ============================================================================
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+/**
+ * Sleep for `ms`, or until any of `signals` aborts.
+ *
+ * `sleep` above only watches one signal, which is not enough for the reconnect
+ * back-off: that sleep has to be interruptible both by the caller's signal and
+ * by `close()`, and those are two different signals.
+ */
+/**
+ * A read that gives up when any of `signals` aborts.
+ *
+ * Resolves `null` on abort, and otherwise passes the read through — including
+ * its rejection, which must still surface (a reset mid-stream is a real
+ * error, not an abort). The pending read is left with a no-op rejection
+ * handler when the race is won by an abort, or it would surface later as an
+ * unhandled rejection and take the host process down.
+ */
+function readOrAbort<T>(
+  read: Promise<T>,
+  ...signals: Array<AbortSignal | undefined | null>
+): Promise<T | null> {
+  const live = signals.filter((s): s is AbortSignal => Boolean(s));
+  if (live.some((s) => s.aborted)) {
+    read.then(undefined, () => {});
+    return Promise.resolve(null);
+  }
+  return new Promise<T | null>((resolve, reject) => {
+    const onAbort = (): void => {
+      detach();
+      read.then(undefined, () => {});
+      resolve(null);
+    };
+    const detach = (): void => {
+      for (const s of live) s.removeEventListener("abort", onAbort);
+    };
+    for (const s of live) s.addEventListener("abort", onAbort, { once: true });
+    read.then(
+      (v) => {
+        detach();
+        resolve(v);
+      },
+      (e) => {
+        detach();
+        reject(e);
+      },
+    );
+  });
+}
+
+function sleepOrAbort(
+  ms: number,
+  ...signals: Array<AbortSignal | undefined | null>
+): Promise<void> {
+  const live = signals.filter((s): s is AbortSignal => Boolean(s));
+  if (live.some((s) => s.aborted)) return Promise.resolve();
+
   return new Promise((r) => {
-    if (signal?.aborted) {
-      r();
-      return;
-    }
-    const onAbort = () => {
+    const handlers: Array<() => void> = [];
+    const finish = (): void => {
       clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
+      for (const h of handlers) h();
       r();
     };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      r();
-    }, ms);
-    signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(finish, ms);
+    for (const s of live) {
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        s.removeEventListener("abort", onAbort);
+        r();
+      };
+      handlers.push(() => s.removeEventListener("abort", onAbort));
+      s.addEventListener("abort", onAbort, { once: true });
+    }
   });
 }

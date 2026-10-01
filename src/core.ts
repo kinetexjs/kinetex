@@ -13,9 +13,16 @@ const g = globalThis as {
  *  - SOCKS5 proxy: custom TCP tunnel (from socks5.ts)
  */
 
-import type { KinetexRequest, HTTPVersion, Runtime } from "./types.ts";
+import type { KinetexRequest, HTTPVersion, Runtime, SessionPoolConfig } from "./types.ts";
 import { KinetexError, TimeoutError, SizeLimitError } from "./types.ts";
-import { concatUint8Arrays, mergeSignals, isAbortError, safeJSONParse } from "./utils.ts";
+import {
+  concatUint8Arrays,
+  mergeSignals,
+  isAbortError,
+  safeJSONParse,
+  isSafeURL,
+  randomBytes,
+} from "./utils.ts";
 import { isValidHeaderName, isValidHeaderValue } from "./headers.ts";
 
 // ============================================================================
@@ -88,7 +95,29 @@ let _runtimeOverride: Runtime | null = null;
  * setRuntime(null);                 // restore detection
  * ```
  */
+/** Every value {@link Runtime} admits, for runtime validation. */
+const KNOWN_RUNTIMES: readonly Runtime[] = [
+  "node",
+  "deno",
+  "bun",
+  "browser",
+  "cloudflare-workers",
+  "edge",
+  "unknown",
+];
+
 export function setRuntime(rt: Runtime | null): void {
+  // The parameter is typed, but nothing checks it at runtime, and the callers
+  // that matter pass a value read from configuration. A typo — "denno" — was
+  // stored verbatim and became the effective runtime, and every branch in the
+  // library gated on `RUNTIME === "..."` then missed: no fetch, no HTTP/2, no
+  // proxy, no Node-only path, with nothing thrown and nothing logged. An
+  // unrecognised value is a mistake worth reporting at the point it is made.
+  if (rt !== null && !KNOWN_RUNTIMES.includes(rt)) {
+    throw new TypeError(
+      `setRuntime: unknown runtime ${JSON.stringify(rt)}. Expected one of: ${KNOWN_RUNTIMES.join(", ")}`,
+    );
+  }
   _runtimeOverride = rt;
 }
 
@@ -195,6 +224,19 @@ export interface FetchTransportOptions {
    * @param value - The header value that was dropped.
    */
   onDroppedHeader?: (name: string, value: string) => void;
+  /**
+   * A `fetch` implementation extension passed straight through to the runtime,
+   * most usefully an `undici` dispatcher (`Agent`, `ProxyAgent`, `MockAgent`).
+   *
+   * Typed as `unknown` so this stays dependency-free — kinetex never imports,
+   * constructs, or type-checks against `undici`, it only forwards the value.
+   * Whether the runtime honours it is up to that runtime: Node's `fetch` reads
+   * `init.dispatcher`, Deno and Bun ignore it.
+   *
+   * Supplying a dispatcher forces {@link FetchTransport}, because the Node
+   * HTTP/2 transport talks to `node:http2` directly and has no notion of one.
+   */
+  dispatcher?: unknown;
 }
 
 /**
@@ -212,6 +254,7 @@ export class FetchTransport implements Transport {
   private readonly fetchFn: typeof globalThis.fetch;
   private readonly strict: boolean;
   private readonly onDroppedHeader: ((name: string, value: string) => void) | undefined;
+  private readonly dispatcher: unknown;
 
   /**
    * @param fetchFnOrOptions - Custom fetch function or options object
@@ -223,10 +266,12 @@ export class FetchTransport implements Transport {
       this.fetchFn = fetchFnOrOptions;
       this.strict = false;
       this.onDroppedHeader = undefined;
+      this.dispatcher = undefined;
     } else {
       this.fetchFn = fetchFnOrOptions.fetchFn ?? globalThis.fetch;
       this.strict = fetchFnOrOptions.strict ?? false;
       this.onDroppedHeader = fetchFnOrOptions.onDroppedHeader;
+      this.dispatcher = fetchFnOrOptions.dispatcher;
     }
   }
 
@@ -266,6 +311,20 @@ export class FetchTransport implements Transport {
         }
         continue;
       }
+      // `__proto__` is a legal header name — it is made of token characters,
+      // so it passes the check above — and `sanitizedHeaders[name] = value` is a
+      // [[Set]], so it went to the inherited setter, which ignores a primitive.
+      // The header did not overwrite anything: it vanished, and the caller was
+      // never told. Written as a data property, which is what was meant.
+      if (name === "__proto__") {
+        Object.defineProperty(sanitizedHeaders, name, {
+          value,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+        continue;
+      }
       sanitizedHeaders[name] = value;
     }
 
@@ -302,6 +361,12 @@ export class FetchTransport implements Transport {
       ) {
         (init as unknown as { duplex?: string }).duplex = "half";
       }
+    }
+
+    // Forwarded only when set: an explicit `dispatcher: undefined` would
+    // otherwise override a globally-installed dispatcher on the runtime.
+    if (this.dispatcher !== undefined) {
+      (init as unknown as { dispatcher?: unknown }).dispatcher = this.dispatcher;
     }
 
     let response: Response;
@@ -385,6 +450,25 @@ export class NodeHTTP2Transport implements Transport {
   private readonly _requestTimeoutMs: number;
   /** Cached HTTP/1.1 fallback transport — reuse instead of creating fresh FetchTransport per call */
   private _http1Fallback: FetchTransport | null = null;
+  /**
+   * Dedicated keep-alive agent for the legacy `node:https` path.
+   *
+   * This path called `https.request(options)` with no `agent`, so behaviour was
+   * whatever the global agent happened to do — and that default is a moving
+   * target. Node 19 turned `keepAlive` on for `https.globalAgent`, so this path
+   * silently changed from a TCP + TLS handshake per request (Node 18 and
+   * earlier) to pooled connections, with no code change here to explain it.
+   *
+   * An explicit agent makes the behaviour identical on every supported Node
+   * version, bounds the idle-socket pool (the global agent keeps 256 free
+   * sockets, which is a lot to hold open for a legacy fallback), and gives
+   * callers a way to opt out.
+   */
+  private readonly _http1KeepAlive: boolean;
+  private readonly _http1MaxSockets: number;
+  private _http1Agent: import("node:https").Agent | null = null;
+  /** HTTP(S) CONNECT proxy, or undefined for a direct connection. */
+  private readonly _proxy: import("./types.ts").ProxyConfig | undefined;
 
   /**
    * @param options - Session pool and transport configuration
@@ -402,11 +486,23 @@ export class NodeHTTP2Transport implements Transport {
       connectTimeoutMs?: number;
       /** HTTP/2 per-stream request timeout in ms. Default: 30 000 */
       requestTimeoutMs?: number;
+      /** Reuse TCP sockets on the legacy node:https path. Default: true */
+      http1KeepAlive?: boolean;
+      /** Max idle sockets retained by the legacy keep-alive agent. Default: 16 */
+      http1MaxSockets?: number;
+      /**
+       * Route every connection through this HTTP(S) proxy using `CONNECT`.
+       * Node.js only.
+       */
+      proxy?: import("./types.ts").ProxyConfig;
     } = {},
   ) {
     this.sessionTTLMs = options.sessionTTLMs ?? 5 * 60_000;
     this.pingIntervalMs = options.pingIntervalMs ?? 30_000;
     this.maxSessions = options.maxSessions ?? 100;
+    this._http1KeepAlive = options.http1KeepAlive ?? true;
+    this._http1MaxSockets = options.http1MaxSockets ?? 16;
+    this._proxy = options.proxy;
     this._strict = options.strict ?? false;
     this._onDroppedHeader = options.onDroppedHeader;
     this._ca = options.ca;
@@ -482,11 +578,32 @@ export class NodeHTTP2Transport implements Transport {
       }
     }
 
+    // With a proxy, the tunnel (and, for an https origin, the TLS handshake
+    // to the target) is established *before* http2.connect is called.
+    //
+    // `createConnection` must return a socket synchronously — node:http2 does
+    // not await it, and handing it a Promise yields a session built on a
+    // thenable, which fails deep inside the stream layer with
+    // "stream.pause is not a function". So the async work happens here and
+    // the already-open socket is passed back synchronously.
+    let proxiedSocket: import("node:net").Socket | import("node:tls").TLSSocket | null = null;
+    if (this._proxy !== undefined) {
+      proxiedSocket = await this._createProxiedSocket(origin, undefined, req);
+    }
+
     const session = await new Promise<import("node:http2").ClientHttp2Session>(
       (resolve, reject) => {
         const s = http2.connect(origin, {
           rejectUnauthorized: true,
           ...(this._ca !== undefined ? { ca: this._ca } : {}),
+          // Already connected (and already TLS-wrapped for an https origin),
+          // so node:http2 must use it as-is rather than negotiating again.
+          ...(proxiedSocket !== null
+            ? {
+                createConnection: (() =>
+                  proxiedSocket) as unknown as import("node:http2").SecureClientSessionOptions["createConnection"],
+              }
+            : {}),
         });
         // FIX 11: use configurable connect timeout instead of hardcoded 30 000 ms
         // FIX 9: unref() the timer so it does not prevent process exit
@@ -586,6 +703,36 @@ export class NodeHTTP2Transport implements Transport {
   }
 
   /**
+   * Refuse one header on the HTTP/2 path. Strict mode raises `EVALIDATION`
+   * before anything is dialled; non-strict notifies the callback (if any) and
+   * warns, never dropping silently.
+   *
+   * Both the pseudo-header filter and the validation loop go through here so
+   * the two cannot drift apart, which is what let a caller-supplied `:path`
+   * reach the wire while `FetchTransport` dropped the identical header.
+   */
+  private _rejectHeader(
+    name: string,
+    value: string,
+    reason: string,
+    request: KinetexRequest,
+  ): void {
+    if (this._strict) {
+      throw new KinetexError(`Strict mode: header "${name}" ${reason}`, "EVALIDATION", {
+        request,
+      });
+    }
+    if (this._onDroppedHeader) {
+      this._onDroppedHeader(name, value);
+    } else if (typeof console !== "undefined") {
+      console.warn(
+        `[kinetex] Invalid header dropped (HTTP/2): "${name}" — ${reason}. ` +
+          `Pass strictHeaders: true to throw instead.`,
+      );
+    }
+  }
+
+  /**
    * Send a request over HTTP/2 with iterative redirect following.
    * Each hop reuses or creates a session for the target origin.
    */
@@ -622,14 +769,75 @@ export class NodeHTTP2Transport implements Transport {
         this.sessionUsage.set(origin, Date.now());
       }
 
-      // Build headers for this hop
+      // A `FormData` body has to be encoded BEFORE the header block is built:
+      // the multipart boundary is generated during encoding, and a boundary
+      // that cannot reach `content-type` leaves a body the peer cannot parse.
+      // This transport bypasses fetch, so nothing else would have encoded it.
+      // The client's own path never reaches this — it encodes the form and sets
+      // the header together before dispatch — but a caller handing a `FormData`
+      // straight to a transport would otherwise send a body whose boundary no
+      // header ever named.
+      let bodyForHop: import("./types.ts").BodyInit = currentReq.body;
+      let encodedForHop: EncodedBody | undefined;
+      if (currentReq.body instanceof FormData) {
+        encodedForHop = await serializeRawBody(currentReq.body);
+        bodyForHop = encodedForHop.bytes;
+        // Request headers are lowercased before they reach the transport, so
+        // a direct key read is the right test here.
+        if (encodedForHop.contentType !== undefined && !currentReq.headers["content-type"]) {
+          currentReq = {
+            ...currentReq,
+            headers: { ...currentReq.headers, "content-type": encodedForHop.contentType },
+          };
+        }
+      }
+
+      // Build headers for this hop. The transport owns the request line, so a
+      // caller-supplied pseudo-header (":path", ":authority", ":method",
+      // ":scheme") is refused rather than merged.
+      //
+      // They used to be spread over the transport's own values, which meant a
+      // caller could send a request to a path and a `:authority` that the URL
+      // argument never contained — the URL that `isSafeURL` screened is not
+      // the URL that got dialled. The validation loop below could not catch it
+      // either, because it skipped every name starting with ":", so even
+      // `strict: true` returned 200 for a hijacked `:path`, and
+      // `FetchTransport` dropped the very same header because ":" is not a
+      // token character. Same request, two transports, two answers.
       const h2ReqHeaders: Record<string, string | string[]> = {
         ":method": currentReq.method,
         ":path": currentUrl.pathname + currentUrl.search,
         ":scheme": "https",
         ":authority": currentUrl.host,
-        ...currentReq.headers,
       };
+      for (const [hName, hValue] of Object.entries(currentReq.headers)) {
+        if (hName.startsWith(":")) {
+          this._rejectHeader(
+            hName,
+            Array.isArray(hValue) ? hValue.join(", ") : String(hValue),
+            "is not a valid header name",
+            currentReq,
+          );
+          continue;
+        }
+        // `__proto__` is a legal header name — it is made of token characters,
+        // so it passes `isValidHeaderName` — and `h2ReqHeaders[name] = value`
+        // is a [[Set]], so it hit the inherited setter, which ignores a
+        // primitive. The header did not overwrite anything: it vanished, and
+        // neither the callback nor the warning said so. Written as a data
+        // property, which is what `FetchTransport` already does — the two
+        // transports disagreed about whether it is sent at all.
+        if (hName === "__proto__") {
+          Object.defineProperty(h2ReqHeaders, hName, {
+            value: hValue,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
+          continue;
+        }
+        h2ReqHeaders[hName] = hValue;
+      }
 
       // Header validation (HTTP/2 control-character check). Runs in BOTH modes:
       // strict throws, non-strict drops with callback/warn — matching the
@@ -640,43 +848,36 @@ export class NodeHTTP2Transport implements Transport {
       for (const [hName, hValue] of Object.entries(h2ReqHeaders)) {
         if (hName.startsWith(":")) continue;
         const hStr = Array.isArray(hValue) ? hValue.join(", ") : String(hValue);
-        let hasForbidden = false;
-        for (let ci = 0; ci < hStr.length; ci++) {
-          const code = hStr.charCodeAt(ci);
-          if ((code >= 0x00 && code <= 0x08) || (code >= 0x0a && code <= 0x1f) || code === 0x7f) {
-            hasForbidden = true;
-            break;
-          }
-        }
-        if (hasForbidden) {
-          if (this._strict) {
-            throw new KinetexError(
-              `Strict mode: header "${hName}" contains forbidden control characters`,
-              "EVALIDATION",
-              { request: currentReq },
-            );
-          }
-          // FIX (H3): non-strict mode must match FetchTransport behavior —
-          // notify the callback (if any) and warn, never drop silently.
-          if (this._onDroppedHeader) {
-            this._onDroppedHeader(hName, hStr);
-          } else if (typeof console !== "undefined") {
-            console.warn(
-              `[kinetex] Invalid header dropped (HTTP/2): "${hName}" — value contains illegal control characters. ` +
-                `Pass strictHeaders: true to throw instead.`,
-            );
-          }
+        // The same two checks FetchTransport runs, through the same helpers —
+        // not a hand-rolled control-character scan. The scan checked the value
+        // only, so a header *name* that was not a token ("X Bad", "X\u00e9")
+        // reached `session.request()` and came back as a raw
+        // ERR_INVALID_HTTP2_HEADER / ERR_INVALID_HEADER_VALUE instead of being
+        // dropped in non-strict mode or raising EVALIDATION in strict mode; and
+        // it had no upper bound, so a value above U+00FF — which FetchTransport
+        // refuses because no ByteString header value can carry it — was sent on
+        // this path and dropped on that one. Same request, two transports, two
+        // answers. The comment above this loop claimed they matched; they did
+        // not, and HTTP/2 is the default on Node.
+        const nameOk = isValidHeaderName(hName);
+        const valueOk = isValidHeaderValue(hStr);
+        if (!nameOk || !valueOk) {
+          this._rejectHeader(
+            hName,
+            hStr,
+            nameOk ? "contains forbidden control characters" : "is not a valid header name",
+            currentReq,
+          );
           delete (h2ReqHeaders as Record<string, unknown>)[hName];
         }
       }
 
-      const endStream =
-        !currentReq.body || currentReq.method === "GET" || currentReq.method === "HEAD";
+      const endStream = !bodyForHop || currentReq.method === "GET" || currentReq.method === "HEAD";
       const stream = session.request(h2ReqHeaders, { endStream });
 
       // FIX 6 (backpressure): attachBodyToH2Stream now awaits drain events
-      if (currentReq.body && !endStream) {
-        attachBodyToH2Stream(stream, currentReq.body).catch((err) => {
+      if (bodyForHop && !endStream) {
+        attachBodyToH2Stream(stream, bodyForHop).catch((err) => {
           stream.destroy(err instanceof Error ? err : new Error(String(err)));
         });
       }
@@ -788,8 +989,9 @@ export class NodeHTTP2Transport implements Transport {
       try {
         if (raw.body) {
           const drain = raw.body.getReader();
-          // eslint-disable-next-line no-constant-condition
-          while (true) {
+          // `for(;;)` rather than `while (true)`: same loop, no condition for a
+          // linter to have an opinion about.
+          for (;;) {
             const { done } = await drain.read();
             if (done) break;
           }
@@ -801,12 +1003,45 @@ export class NodeHTTP2Transport implements Transport {
 
       const location = raw.headers["location"]!;
       let nextHref: string;
+      let nextProtocol: string;
       try {
-        nextHref = new URL(location, currentReq.url).href;
+        const nextUrl = new URL(location, currentReq.url);
+        nextHref = nextUrl.href;
+        nextProtocol = nextUrl.protocol.toLowerCase();
       } catch {
         throw new KinetexError(`Invalid redirect Location: ${location}`, "ENETWORK", {
           request: req,
         });
+      }
+
+      // The same two gates the client's manual redirect follower applies, for
+      // the same reasons. They were absent here, and this loop is the *only*
+      // follower on this path whenever the request arrives without
+      // `redirect: "manual"` — which is every direct use of this transport.
+      //
+      //  - Protocol. This transport hardcodes `:scheme: "https"` and speaks
+      //    HTTP/2, so a cleartext target cannot be dialled at all: the hop
+      //    failed as `ERR_HTTP2_ERROR: Protocol error` with nothing to connect
+      //    it to the target. A downgrade was therefore possible by accident
+      //    rather than refused on purpose, and an `httpsOnly` client could not
+      //    tell the difference.
+      //  - SSRF. The hop origin is dialled directly by `http2.connect` below,
+      //    with no `isSafeURL` screen — the client's follower screens every hop
+      //    precisely because "a redirect target never went through that
+      //    check". A 302 to `http://127.0.0.1:9/` opened the socket.
+      if (nextProtocol !== "https:") {
+        throw new KinetexError(
+          `HTTP/2 redirect to a non-HTTPS target blocked: ${nextProtocol}//…`,
+          "EVALIDATION",
+          { request: req },
+        );
+      }
+      if (!isSafeURL(nextHref)) {
+        throw new KinetexError(
+          `Unsafe redirect target blocked: ${nextHref.replace(/:\/\/[^/@]*@/, "://…@")}`,
+          "EVALIDATION",
+          { request: req },
+        );
       }
 
       // RFC 7231 §6.4: 301/302/303 → downgrade to GET; 307/308 → preserve method
@@ -853,12 +1088,34 @@ export class NodeHTTP2Transport implements Transport {
     const https = await import("node:https");
     const url = new URL(req.url);
 
+    // A `FormData` body is encoded before the request options are built, for
+    // the same reason as on the HTTP/2 path: the multipart boundary is
+    // generated during encoding, and this transport bypasses fetch, so
+    // nothing else would encode it or announce the boundary. A caller-set
+    // `content-type` wins — they may have encoded the form themselves.
+    let legacyReq = req;
+    if (req.body instanceof FormData) {
+      const encoded = await serializeRawBody(req.body);
+      legacyReq = { ...req, body: encoded.bytes };
+      if (encoded.contentType !== undefined && !legacyReq.headers["content-type"]) {
+        legacyReq = {
+          ...legacyReq,
+          headers: { ...legacyReq.headers, "content-type": encoded.contentType },
+        };
+      }
+    }
+
     const options: import("node:http").RequestOptions = {
       hostname: url.hostname,
       port: url.port || "443",
       path: url.pathname + url.search,
-      method: req.method,
-      headers: req.headers,
+      method: legacyReq.method,
+      headers: legacyReq.headers,
+      ...(this._http1KeepAlive ? { agent: this._getHttp1Agent(https) } : {}),
+      // `ca` was accepted by the transport but never reached this path, so a
+      // private or self-signed peer could not be reached without disabling
+      // verification process-wide.
+      ...(this._ca !== undefined ? { ca: this._ca } : {}),
     };
 
     return new Promise<RawResponse>((resolve, reject) => {
@@ -883,7 +1140,15 @@ export class NodeHTTP2Transport implements Transport {
       });
 
       httpReq.once("error", (err: Error) => {
-        reject(new KinetexError(err.message, "ENETWORK", { request: req, cause: err }));
+        // An error raised while building the connection (a refused proxy
+        // tunnel, a TLS failure) is already a KinetexError carrying a
+        // meaningful code. Re-wrapping it as ENETWORK threw that away, so a
+        // 403 from the proxy and a DNS failure became indistinguishable.
+        reject(
+          err instanceof KinetexError
+            ? err
+            : new KinetexError(err.message, "ENETWORK", { request: req, cause: err }),
+        );
       });
 
       // Remove the abort listener once the request settles so the httpReq
@@ -898,10 +1163,90 @@ export class NodeHTTP2Transport implements Transport {
       httpReq.once("error", cleanup);
 
       if (req.body && req.method !== "GET" && req.method !== "HEAD") {
-        pipeBodyToNodeReq(httpReq, req.body).catch(reject);
+        pipeBodyToNodeReq(httpReq, legacyReq.body).catch(reject);
       } else {
         httpReq.end();
       }
+    });
+  }
+
+  /**
+   * Lazily create the keep-alive agent used by the legacy HTTP/1.1 path.
+   *
+   * @param https - The already-imported `node:https` module.
+   * @returns The shared agent, reused across requests.
+   */
+  private _getHttp1Agent(https: typeof import("node:https")): import("node:https").Agent {
+    if (!this._http1Agent) {
+      this._http1Agent = new https.Agent({
+        keepAlive: true,
+        maxSockets: this._http1MaxSockets,
+        maxFreeSockets: this._http1MaxSockets,
+        // A private/self-signed peer must be trusted before the socket enters
+        // the pool, otherwise the agent only fails later on reuse.
+        ...(this._ca !== undefined ? { ca: this._ca } : {}),
+      });
+
+      if (this._proxy !== undefined) {
+        // Assigned to the INSTANCE, not passed in the agent options:
+        // `new Agent({ createConnection })` only copies it into
+        // `agent.options`, while `Agent.prototype.createSocket` calls
+        // `this.createConnection(...)` — the prototype method. Passing it in
+        // the options is silently ignored and the agent dials the origin
+        // directly, bypassing the proxy entirely.
+        //
+        // `createSocket` does:
+        //     const s = this.createConnection(options, oncreate);
+        //     if (s) oncreate(null, s);
+        // so returning a Promise would be truthy and the agent would adopt
+        // the thenable as a socket. The callback form is the supported way to
+        // connect asynchronously: this returns undefined and reports the
+        // tunneled socket through `oncreate`.
+        //
+        // The tunnel is already TLS-wrapped for an https origin, which is
+        // exactly what https.Agent expects createConnection to return.
+        this._http1Agent.createConnection = ((
+          opts: import("node:tls").ConnectionOptions,
+          oncreate: (err: Error | null, socket?: import("node:net").Socket) => void,
+        ) => {
+          void this._createProxiedSocket(
+            `https://${String(opts.host ?? opts.servername ?? "localhost")}:${String(opts.port ?? 443)}`,
+            undefined,
+            undefined,
+          ).then(
+            (socket) => oncreate(null, socket),
+            (err: Error) => oncreate(err),
+          );
+          return undefined;
+        }) as unknown as typeof import("node:https").Agent.prototype.createConnection;
+      }
+    }
+    return this._http1Agent;
+  }
+
+  /**
+   * Open a socket to `origin` through the configured proxy.
+   *
+   * The returned socket is fully established — tunneled, and TLS-wrapped when
+   * the origin is `https:` — so it can be handed to a transport that requires
+   * its connection synchronously.
+   *
+   * @param origin - Target origin, e.g. `https://api.example.com:443`.
+   * @param req - Originating request, attached to any thrown error.
+   * @returns A socket connected to the target through the proxy.
+   */
+  private async _createProxiedSocket(
+    origin: string,
+    _tlsOpts: unknown,
+    req: KinetexRequest | undefined,
+  ): Promise<import("node:net").Socket | import("node:tls").TLSSocket> {
+    const { connectThroughProxy } = await import("./proxy.ts");
+    const target = new URL(origin);
+    return await connectThroughProxy(this._proxy as import("./types.ts").ProxyConfig, target, {
+      ...(this._ca !== undefined ? { ca: this._ca } : {}),
+      connectTimeoutMs: this._connectTimeoutMs,
+      ...(req?.signal != null ? { signal: req.signal } : {}),
+      ...(req !== undefined ? { request: req } : {}),
     });
   }
 
@@ -931,6 +1276,11 @@ export class NodeHTTP2Transport implements Transport {
       this._evictSession(origin, session);
     }
     this.sessions.clear();
+
+    // Drain the legacy HTTP/1.1 keep-alive pool too, so a destroyed transport
+    // leaves no idle sockets behind holding the event loop open.
+    this._http1Agent?.destroy();
+    this._http1Agent = null;
   }
 }
 
@@ -956,13 +1306,13 @@ interface NodeHTTP2Session {
 export function createTransport(
   fetchFn?: typeof globalThis.fetch,
   preferHTTP2 = true,
-  sessionOptions?: {
-    sessionTTLMs?: number;
-    pingIntervalMs?: number;
-    connectTimeoutMs?: number;
-    requestTimeoutMs?: number;
+  sessionOptions?: SessionPoolConfig,
+  transportOptions?: Pick<FetchTransportOptions, "strict" | "onDroppedHeader" | "dispatcher"> & {
+    /** CA certificate(s) trusted in addition to the system store. */
+    ca?: string | string[];
+    /** HTTP(S) CONNECT proxy (Node.js only). */
+    proxy?: import("./types.ts").ProxyConfig;
   },
-  transportOptions?: Pick<FetchTransportOptions, "strict" | "onDroppedHeader">,
 ): Transport {
   // FIX (M7-class silent no-op): a custom `fetch` config was silently ignored on
   // Node.js when HTTP/2 was preferred (the default) — NodeHTTP2Transport has no
@@ -971,22 +1321,42 @@ export function createTransport(
   // "Custom fetch implementation" behavior holds on every runtime.
   // Use NodeHTTP2Transport for Node.js when HTTP/2 is preferred and no custom
   // fetch is given. Falls back to FetchTransport otherwise.
-  if (IS_NODE && preferHTTP2 && fetchFn) {
+  // A dispatcher belongs to the fetch implementation, exactly like a custom
+  // fetch does — NodeHTTP2Transport speaks `node:http2` and has no notion of
+  // one. So it forces the same fallback rather than being silently dropped.
+  const needsFetchTransport = fetchFn !== undefined || transportOptions?.dispatcher !== undefined;
+  if (IS_NODE && preferHTTP2 && needsFetchTransport) {
     if (!isProductionEnvironment()) {
       console.warn(
-        '[kinetex] httpVersion: "HTTP/2" is ignored when a custom `fetch` is configured — ' +
-          "NodeHTTP2Transport cannot use a custom fetch, so the request goes through " +
-          "FetchTransport (HTTP/1.1 semantics). Drop the `fetch` option to use HTTP/2.",
+        fetchFn !== undefined
+          ? '[kinetex] httpVersion: "HTTP/2" is ignored when a custom `fetch` is configured — ' +
+              "NodeHTTP2Transport cannot use a custom fetch, so the request goes through " +
+              "FetchTransport (HTTP/1.1 semantics). Drop the `fetch` option to use HTTP/2."
+          : '[kinetex] httpVersion: "HTTP/2" is ignored when a `dispatcher` is configured — ' +
+              "NodeHTTP2Transport talks to node:http2 directly and cannot use a fetch " +
+              "dispatcher, so the request goes through FetchTransport (HTTP/1.1 semantics). " +
+              "Drop the `dispatcher` option to use HTTP/2.",
       );
     }
   }
-  if (IS_NODE && preferHTTP2 && !fetchFn) {
+  if (IS_NODE && preferHTTP2 && !needsFetchTransport) {
     return new NodeHTTP2Transport({
       ...(sessionOptions?.sessionTTLMs !== undefined
         ? { sessionTTLMs: sessionOptions.sessionTTLMs }
         : {}),
       ...(sessionOptions?.pingIntervalMs !== undefined
         ? { pingIntervalMs: sessionOptions.pingIntervalMs }
+        : {}),
+      // maxSessions was a documented transport option but was never forwarded
+      // here, so the LRU cap was unreachable and the pool grew unbounded.
+      ...(sessionOptions?.maxSessions !== undefined
+        ? { maxSessions: sessionOptions.maxSessions }
+        : {}),
+      ...(sessionOptions?.http1KeepAlive !== undefined
+        ? { http1KeepAlive: sessionOptions.http1KeepAlive }
+        : {}),
+      ...(sessionOptions?.http1MaxSockets !== undefined
+        ? { http1MaxSockets: sessionOptions.http1MaxSockets }
         : {}),
       ...(sessionOptions?.connectTimeoutMs !== undefined
         ? { connectTimeoutMs: sessionOptions.connectTimeoutMs }
@@ -998,6 +1368,8 @@ export function createTransport(
       ...(transportOptions?.onDroppedHeader !== undefined
         ? { onDroppedHeader: transportOptions.onDroppedHeader }
         : {}),
+      ...(transportOptions?.ca !== undefined ? { ca: transportOptions.ca } : {}),
+      ...(transportOptions?.proxy !== undefined ? { proxy: transportOptions.proxy } : {}),
     });
   }
   return new FetchTransport({
@@ -1005,6 +1377,9 @@ export function createTransport(
     ...(transportOptions?.strict !== undefined ? { strict: transportOptions.strict } : {}),
     ...(transportOptions?.onDroppedHeader !== undefined
       ? { onDroppedHeader: transportOptions.onDroppedHeader }
+      : {}),
+    ...(transportOptions?.dispatcher !== undefined
+      ? { dispatcher: transportOptions.dispatcher }
       : {}),
   });
 }
@@ -1198,6 +1573,20 @@ export function parseBody<T>(
       });
       if (result.success && result.value !== undefined) {
         parseResult = result.value;
+      } else if (!result.success) {
+        // `safeJSONParse` refuses a payload for a reason it can name — a
+        // depth, a length, a key count, a prototype-pollution key — and that
+        // reason was dropped on the floor, so the caller was told "JSON parse
+        // failed" for a body that is perfectly valid JSON and merely larger
+        // than the limits this function chose. A response that quietly changes
+        // from parsed to raw text is worth one specific sentence about which
+        // limit it crossed, and the code is on the error so a handler can
+        // branch on it.
+        const failure = new Error(
+          `JSON body rejected: ${result.message ?? "parse failed"} — falling back to raw text`,
+        );
+        Object.assign(failure, { code: result.error ?? "EPARSE" });
+        parseError = failure;
       }
     } catch (e) {
       parseError = e instanceof Error ? e : new Error(String(e));
@@ -1254,34 +1643,50 @@ export function normalizeHeaders(headers: Headers): Record<string, string> {
  * @param _headers - Parsed response headers (reserved)
  * @returns Detected HTTP version
  */
+/**
+ * Translate a runtime-reported protocol string into the {@link HTTPVersion}
+ * union, or return null when it says nothing this library can act on.
+ *
+ * Accepts the spellings Deno and Bun actually use ("2", "2.0", "1", "1.0",
+ * "1.1") plus the union's own members, case- and whitespace-insensitively, so a
+ * peer cannot widen the field to a string by adding a prefix.
+ */
+function normalizeHTTPVersion(raw: string): HTTPVersion | null {
+  const v = raw.trim().toLowerCase();
+  if (v === "2" || v === "2.0" || v === "h2" || v === "http/2" || v === "http/2.0") return "HTTP/2";
+  if (v === "1" || v === "1.0" || v === "http/1" || v === "http/1.0") return "HTTP/1.0";
+  if (v === "1.1" || v === "http/1.1") return "HTTP/1.1";
+  return null;
+}
+
 function detectHTTPVersion(response: Response, _headers: Record<string, string>): HTTPVersion {
-  // Deno exposes response.type or we can infer from headers
-  // Runtime-specific property access requires type assertion
+  // Deno and Bun both expose `httpVersion` on the Response, and both spell it
+  // their own way: Deno answers "2.0", Bun answers "1.1" and "2". The Deno arm
+  // translated its values; the Bun arm returned whatever it was given, so a
+  // plain HTTP/1.1 response on Bun reported the string "1.1" — a value outside
+  // the `HTTPVersion` union, reaching every caller of `res.httpVersion` through
+  // a `[[typed]]` lie. A consumer switching on "HTTP/1.1" silently fell through,
+  // and on a runtime the library does not run in CI the type checker is the only
+  // thing that would have said so. Both arms now go through one translation, and
+  // anything unrecognised falls through to the evidence below rather than being
+  // reported as a protocol.
   const denoResponse = response as unknown as { httpVersion?: string };
-  if (denoResponse.httpVersion === "2.0" || denoResponse.httpVersion === "2") {
-    return "HTTP/2";
+  const runtimeVersion = denoResponse.httpVersion;
+  if (typeof runtimeVersion === "string") {
+    const normalized = normalizeHTTPVersion(runtimeVersion);
+    if (normalized) return normalized;
   }
 
-  // Bun exposes httpVersion as a property
-  const bunResponse = response as unknown as { httpVersion?: HTTPVersion };
-  if (bunResponse.httpVersion) {
-    return bunResponse.httpVersion;
-  }
-
-  // HTTP/3 (QUIC) detection via Alt-Svc header.
+  // Server capability advertisement.
   // Servers that support HTTP/3 advertise: Alt-Svc: h3="...", h3-29="..."
-  // We detect the advertisement here and update accordingly.
+  //
+  // kinetex does not speak HTTP/3, and no runtime it targets has a stable
+  // HTTP/3 client, so an h3 advertisement is deliberately NOT reported as
+  // HTTP/3: the response in hand was served over HTTP/2, and saying otherwise
+  // would misreport the protocol actually used. A runtime that ever does
+  // negotiate h3 itself reaches the same answer below rather than claiming a
+  // version the transport cannot produce.
   const altSvc = response.headers.get("alt-svc");
-
-  // Check for active HTTP/3 negotiation (runtime-specific property)
-  const h3Response = response as unknown as { httpVersion?: string; protocol?: string };
-  if (
-    h3Response.httpVersion === "3" ||
-    h3Response.httpVersion === "3.0" ||
-    h3Response.protocol === "h3"
-  ) {
-    return "HTTP/3";
-  }
 
   // Alt-Svc advertisement: infer HTTP version from the advertised protocols.
   // - h3 (QUIC) means the server supports HTTP/3
@@ -1435,7 +1840,7 @@ async function attachBodyToH2Stream(
     // The raw Node transports bypass fetch, so bodies fetch would normally
     // serialize (URLSearchParams, Blob) must be encoded here. Skipping them
     // silently sent an empty body to the server.
-    const bytes = await serializeRawBody(body);
+    const { bytes } = await serializeRawBody(body);
     stream.end(bytes);
   }
 }
@@ -1470,9 +1875,21 @@ async function pipeBodyToNodeReq(
     // The raw Node transports bypass fetch, so bodies fetch would normally
     // serialize (URLSearchParams, Blob) must be encoded here. Skipping them
     // silently sent an empty body to the server.
-    const bytes = await serializeRawBody(body);
+    const { bytes } = await serializeRawBody(body);
     req.end(bytes);
   }
+}
+
+/**
+ * The result of encoding a body the raw Node transports have to serialize
+ * themselves. `contentType` is set only when the encoding produced one the
+ * caller must announce — a multipart body is unusable without its boundary,
+ * and a boundary invented here cannot reach a header block that was already
+ * written.
+ */
+interface EncodedBody {
+  bytes: Uint8Array;
+  contentType?: string;
 }
 
 /**
@@ -1480,16 +1897,94 @@ async function pipeBodyToNodeReq(
  * Node HTTP/1.1 and HTTP/2 transports do not silently send an empty payload.
  *
  * @param body - Request body that is not a stream, byte array, or string
- * @returns The encoded bytes to write (empty for unsupported types)
+ * @returns The encoded bytes to write, plus a content type to announce when the
+ *          encoding generated one (empty bytes for unsupported types)
  */
-async function serializeRawBody(body: import("./types.ts").BodyInit): Promise<Uint8Array> {
+async function serializeRawBody(body: import("./types.ts").BodyInit): Promise<EncodedBody> {
   if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
-    return new TextEncoder().encode(body.toString());
+    return { bytes: new TextEncoder().encode(body.toString()) };
   }
   if (typeof Blob !== "undefined" && body instanceof Blob) {
-    return new Uint8Array(await body.arrayBuffer());
+    return { bytes: new Uint8Array(await body.arrayBuffer()) };
   }
-  return new Uint8Array(0);
+  if (typeof FormData !== "undefined" && body instanceof FormData) {
+    const { bytes, boundary } = await encodeMultipart(body);
+    return { bytes, contentType: `multipart/form-data; boundary=${boundary}` };
+  }
+  return { bytes: new Uint8Array(0) };
+}
+
+/**
+ * Escape a multipart field name or filename for a `Content-Disposition`
+ * parameter. RFC 7578 §5.1 percent-encodes CR, LF and a double quote; a bare
+ * backslash is escaped too so a name cannot terminate the quoted string early.
+ */
+function escapeFieldName(name: string): string {
+  return name.replace(
+    /[\r\n"\\]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
+  );
+}
+
+/**
+ * Encode a `FormData` as `multipart/form-data` (RFC 7578).
+ *
+ * The function this lives in was written to stop the raw Node transports from
+ * sending an *empty* body for the types fetch would have serialized, and it
+ * covered `URLSearchParams` and `Blob`. `FormData` was missed, so on the
+ * default transport on Node — `NodeHTTP2Transport`, which bypasses fetch
+ * entirely — a form upload went out as a request with no body at all and no
+ * `Content-Type`, and the server recorded an empty form. The response was an
+ * ordinary 200, so nothing looked wrong.
+ *
+ * The boundary is generated per call and written into the body. The transports
+ * that call this only ever see bytes, so the header is set by the client from
+ * `options.headers`; a body encoded here without a matching header is
+ * unparseable, which is why the boundary is returned alongside the bytes for a
+ * caller that has to announce it. Passing one in makes the output
+ * deterministic, which is what the test suite pins.
+ */
+export async function encodeMultipart(
+  form: FormData,
+  boundary?: string,
+): Promise<{ bytes: Uint8Array; boundary: string }> {
+  // 24 random bytes as hex: 192 bits is far past any collision concern, and hex
+  // is all legal in a boundary.
+  const bnd = boundary ?? `----kinetexFormBoundary${randomBytes(24)}`;
+  const encoder = new TextEncoder();
+  const chunks: Uint8Array[] = [];
+  const push = (text: string): void => {
+    chunks.push(encoder.encode(text));
+  };
+
+  for (const [name, value] of form.entries()) {
+    // A field name is application- and sometimes user-controlled, and CR/LF in
+    // one would forge a part header. Such a name is refused rather than sent
+    // or silently dropped.
+    if (/[\r\n"]/.test(name)) {
+      throw new KinetexError(
+        `Cannot send a multipart field whose name contains CR, LF or a quote: ${JSON.stringify(name)}`,
+        "EVALIDATION",
+      );
+    }
+    push(`--${bnd}\r\n`);
+    if (typeof value === "string") {
+      push(`Content-Disposition: form-data; name="${escapeFieldName(name)}"\r\n\r\n`);
+      push(value);
+      push("\r\n");
+      continue;
+    }
+    // A File/Blob part: RFC 7578 §4.2 wants its own type and filename.
+    push(
+      `Content-Disposition: form-data; name="${escapeFieldName(name)}"; ` +
+        `filename="${escapeFieldName(value.name || "blob")}"\r\n` +
+        `Content-Type: ${value.type || "application/octet-stream"}\r\n\r\n`,
+    );
+    chunks.push(new Uint8Array(await value.arrayBuffer()));
+    push("\r\n");
+  }
+  push(`--${bnd}--\r\n`);
+  return { bytes: concatUint8Arrays(chunks), boundary: bnd };
 }
 
 // ============================================================================
@@ -1501,8 +1996,9 @@ async function serializeRawBody(body: import("./types.ts").BodyInit): Promise<Ui
  * Dynamically imports response.ts so that environments that don't use
  * decompression don't pay the code cost. The import is cached by the runtime.
  *
- * Supported encodings: gzip, deflate, br (brotli)
- * Unsupported encodings (zstd, etc.) are passed through compressed; caller must handle or error.
+ * Supported encodings: gzip, deflate, br (brotli), zstd.
+ * Unsupported encodings are passed through compressed; the caller must handle
+ * them.
  *
  * @param body    - Raw body stream (or null)
  * @param headers - Response headers (content-encoding is read and stripped on success)
@@ -1525,7 +2021,7 @@ export async function decompressBodyStream(
     .filter(Boolean);
 
   // Check for unsupported encodings
-  const supportedEncodings = ["gzip", "deflate", "br", "identity"];
+  const supportedEncodings = ["gzip", "deflate", "br", "zstd", "identity"];
   for (const enc of encodings) {
     if (!supportedEncodings.includes(enc)) {
       console.warn(

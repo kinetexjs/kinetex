@@ -252,6 +252,11 @@ class BufReader {
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  // A non-positive budget means "no timeout", matching `denoTcpConnector`,
+  // which documents and tests exactly that. Passing 0 to `setTimeout` fired on
+  // the next tick, so `connectTimeoutMs: 0` — the conventional way to say
+  // "wait as long as it takes" — failed the connection instantly.
+  if (!Number.isFinite(ms) || ms <= 0) return promise;
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Socks5Error(message, "SOCKS5_TIMEOUT", true)), ms);
     promise.then(
@@ -303,8 +308,45 @@ function encodeAddress(this: void, host: string, remoteDns: boolean): Uint8Array
   return new Uint8Array([AddrType.Domain, enc.length, ...enc]);
 }
 
+/**
+ * A single hextet: one to four hex digits.
+ *
+ * `parseInt(g, 16)` is not a validation. It accepts trailing garbage
+ * (`parseInt("12zz", 16)` is 18) and returns `NaN` for anything that is not
+ * hex at all — and `NaN` then sailed through the `g < 0 || g > 0xffff` range
+ * check, because every comparison with `NaN` is false. `NaN >> 8 & 0xff` is
+ * 0, so such a group contributed a zero pair.
+ */
+const HEX_GROUP = /^[0-9a-fA-F]{1,4}$/;
+
+/**
+ * True when `s` is a syntactically valid IPv6 literal.
+ *
+ * Structural, NOT "contains a colon". The old test accepted any string with a
+ * colon in it, so a hostname like `g:h:i:j:k:l:m:n` was taken for an IPv6
+ * literal: eight groups, every one of them `NaN`, all eight of which passed
+ * the range check, and the result encoded as sixteen zero bytes. The proxy
+ * was then asked to connect to the unspecified address `::` and the tunnel
+ * was established — to the wrong place, with no error anywhere. A name that
+ * is not a valid IPv6 literal is now left to the domain-name encoding, where
+ * the proxy resolves it and reports host-unreachable if it is not real.
+ */
 function isIPv6(s: string): boolean {
-  return s.includes(":");
+  if (!s.includes(":")) return false;
+  // At most one compressed run ("::"). Two would be ambiguous.
+  const halves = s.split("::");
+  if (halves.length > 2) return false;
+  const groupsOf = (part: string | undefined): string[] =>
+    part === undefined || part === "" ? [] : part.split(":");
+  const left = groupsOf(halves[0]);
+  if (halves.length === 2) {
+    const right = groupsOf(halves[1]);
+    // "::" must stand for at least one omitted group.
+    if (left.length + right.length > 7) return false;
+    return [...left, ...right].every((g) => HEX_GROUP.test(g));
+  }
+  // Uncompressed: all eight groups must be present and well formed.
+  return left.length === 8 && left.every((g) => HEX_GROUP.test(g));
 }
 
 /**
@@ -324,7 +366,7 @@ function expandIPv6(addr: string): number[] {
   // Expand :: and return 16 bytes
   const halves = addr.split("::");
   const expand = (part: string | undefined) =>
-    part ? part.split(":").map((g) => parseInt(g || "0", 16)) : [];
+    part ? part.split(":").map((g) => (HEX_GROUP.test(g) ? parseInt(g, 16) : Number.NaN)) : [];
 
   let groups: number[];
   if (halves.length === 2) {
@@ -340,9 +382,11 @@ function expandIPv6(addr: string): number[] {
     throw new Socks5Error(`Invalid IPv6 address: ${addr}`, "SOCKS5_INVALID_ADDR");
   }
 
-  // Validate each group is within 16-bit range (0-0xFFFF)
+  // Validate each group is a finite 16-bit value. `Number.isFinite` is the
+  // load-bearing half: a bare `g < 0 || g > 0xffff` is false for every NaN,
+  // so an unparseable group passed and then encoded as a zero pair.
   for (const g of groups) {
-    if (g < 0 || g > 0xffff) {
+    if (!Number.isFinite(g) || g < 0 || g > 0xffff) {
       throw new Socks5Error(
         `Invalid IPv6 group: ${g} out of range (0-65535)`,
         "SOCKS5_INVALID_ADDR",
@@ -540,6 +584,18 @@ function sleep(ms: number): Promise<void> {
 // 8. CONFIG NORMALISATION
 // ---------------------------------------------------------------------------
 
+/** TCP-level errors worth another attempt. */
+const TRANSIENT_DIAL_CODES: ReadonlySet<string> = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENETDOWN",
+  "ETIMEDOUT",
+  "EPIPE",
+  "EAI_AGAIN",
+]);
+
 function resolveConfig(cfg: Socks5ProxyConfig): Required<Socks5ProxyConfig> {
   return {
     host: cfg.host,
@@ -589,12 +645,41 @@ export async function createSocks5Tunnel(
 
   return await withRetry(
     async () => {
-      // Open raw TCP to proxy
+      // Open raw TCP to proxy.
+      //
+      // A rejection from the connector used to escape UNCHANGED, so a proxy
+      // that was not listening surfaced as a bare
+      // `Error: connect ECONNREFUSED 127.0.0.1:1` rather than a
+      // Socks5Error. Two things broke at once. The documented contract says
+      // this function throws Socks5Error, and a caller switching on `code`
+      // now had to know about two vocabularies — `ECONNREFUSED` from node:net
+      // and `SOCKS5_*` from here. And `withRetry` only retries an error that
+      // is a Socks5Error with `retriable` set, so the one failure most worth
+      // retrying — the proxy not being up yet — was the one failure never
+      // retried, and the exponential backoff this module is built around went
+      // unused for it.
       const conn = await withTimeout(
         connector(config.host, config.port, config.connectTimeoutMs),
         config.connectTimeoutMs,
         `TCP connection to SOCKS5 proxy ${config.host}:${config.port} timed out`,
-      );
+      ).catch((err: unknown) => {
+        // An abort is the caller's own doing and is already an AbortError,
+        // and anything already in this module's vocabulary passes through.
+        if (err instanceof Socks5Error || err instanceof DOMException) throw err;
+        const code = (err as { code?: unknown })?.code;
+        const systemCode = typeof code === "string" ? code : "UNKNOWN";
+        throw new Socks5Error(
+          `Cannot reach SOCKS5 proxy ${config.host}:${config.port}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          "SOCKS5_CONNECT_FAILED",
+          // Transient at the TCP layer: the proxy may come back, or the path
+          // to it may. ENOTFOUND is deliberately excluded — a proxy hostname
+          // that does not resolve is a configuration mistake, and retrying it
+          // only delays saying so.
+          TRANSIENT_DIAL_CODES.has(systemCode),
+        );
+      });
 
       try {
         const { boundAddr, boundPort } = await performHandshake(conn, target, config);
@@ -671,11 +756,25 @@ export function parseSocks5Url(url: string): Socks5ProxyConfig {
     remoteDns,
   };
 
+  // Percent-decoding can itself fail: `decodeURIComponent("%ZZ")` throws a
+  // `URIError`, which escaped this function as a raw URIError rather than the
+  // documented Socks5Error, so a caller mapping error codes never saw one.
+  // Nothing here includes the URL, so a clean SOCKS5_BAD_URL leaks nothing.
+  const decode = (raw: string, field: "username" | "password"): string => {
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      throw new Socks5Error(
+        `Invalid SOCKS5 proxy URL: malformed percent-encoding in the ${field}`,
+        "SOCKS5_BAD_URL",
+      );
+    }
+  };
   if (parsed.username) {
-    config.username = decodeURIComponent(parsed.username);
+    config.username = decode(parsed.username, "username");
   }
   if (parsed.password) {
-    config.password = decodeURIComponent(parsed.password);
+    config.password = decode(parsed.password, "password");
   }
 
   return config;
@@ -786,10 +885,19 @@ export const nodeTcpConnector: TcpConnector = (host, port, timeoutMs): Promise<T
     import("node:net")
       .then(({ createConnection }) => {
         const socket = createConnection({ host, port });
-        const timer = setTimeout(() => {
-          socket.destroy();
-          reject(new Socks5Error("TCP connect to proxy timed out", "SOCKS5_TIMEOUT", true));
-        }, timeoutMs);
+        // Same rule as the Deno connector: 0 (or any non-positive budget)
+        // disables the timeout rather than firing on the next tick. Every
+        // `clearTimeout(timer)` below is guarded on `timer` being defined.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+          timer = setTimeout(() => {
+            socket.destroy();
+            reject(new Socks5Error("TCP connect to proxy timed out", "SOCKS5_TIMEOUT", true));
+          }, timeoutMs);
+        }
+        const clear = (): void => {
+          if (timer !== undefined) clearTimeout(timer);
+        };
 
         let buffer = new Uint8Array(0);
         let pendingRead: ((value: number | null) => void) | null = null;
@@ -845,14 +953,14 @@ export const nodeTcpConnector: TcpConnector = (host, port, timeoutMs): Promise<T
         });
 
         socket.once("error", (err) => {
-          clearTimeout(timer);
+          clear();
           lastError = err;
           rejectPending(err);
           reject(err);
         });
 
         socket.once("connect", () => {
-          clearTimeout(timer);
+          clear();
           socket.on("error", (err) => {
             lastError = err;
             rejectPending(err);
@@ -933,8 +1041,20 @@ export function socks5Connector(
   baseConnector: TcpConnector,
 ): TcpConnector {
   return async (host: string, port: number, timeoutMs: number): Promise<TcpConn> => {
+    // The per-call `timeoutMs` is the more specific value, so it must be
+    // spread LAST. It was spread first, so a `connectTimeoutMs` in the proxy
+    // config silently overrode it — a caller asking for 5s was dialled with
+    // the config's 99s, and nothing said so. It also now bounds the
+    // handshake, which is the same "how long may this connection take" budget
+    // the caller expressed and was otherwise ignored entirely.
+    const perCall = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : undefined;
+    const connectTimeoutMs = perCall ?? proxyConfig.connectTimeoutMs;
     const tunnel = await createSocks5Tunnel(
-      { connectTimeoutMs: timeoutMs, ...proxyConfig },
+      {
+        ...proxyConfig,
+        ...(connectTimeoutMs !== undefined ? { connectTimeoutMs } : {}),
+        ...(perCall !== undefined ? { handshakeTimeoutMs: perCall } : {}),
+      },
       { host, port },
       baseConnector,
     );

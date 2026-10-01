@@ -207,6 +207,29 @@ function enforcePrefixRules(cookie: Cookie, requestUrl: URL): boolean {
  * @param context  - The request's SameSite context
  * @returns true if the cookie may be sent
  */
+/**
+ * Canonicalise a `SameSite` read from outside the library.
+ *
+ * `SameSite` is a closed union, so anything arriving from JSON is untrusted
+ * by construction. An unrecognised value (including a missing one) becomes
+ * `"Unset"`, which `sameSiteAllows` treats permissively but still refuses on
+ * an explicit cross-site request.
+ */
+function normalizeSameSite(value: unknown): SameSite {
+  if (typeof value !== "string") return "Unset";
+  switch (value.trim().toLowerCase()) {
+    case "strict":
+      return "Strict";
+    case "lax":
+      return "Lax";
+    case "none":
+      return "None";
+    case "unset":
+    default:
+      return "Unset";
+  }
+}
+
 function sameSiteAllows(sameSite: SameSite, context: SameSiteContext): boolean {
   switch (sameSite) {
     case "Strict":
@@ -508,6 +531,16 @@ export class CookieJar {
           )
             continue;
 
+          // The same argument applies to RFC 6265 §5.3's "the cookie domain must
+          // not be a public suffix", which setCookie() enforces but the storage
+          // map does not: fromJSON()/loadCookieJar() write straight into the map
+          // and skip setCookie() entirely. A persisted cookie with
+          // `domain: "com"` — which setCookie refuses — was therefore sent to
+          // every .com host, so anyone able to write the serialized jar (an XSS
+          // bug plus localStorage) got a cross-site cookie-tossing primitive.
+          // A cookie whose domain is a public suffix is never emitted.
+          if (isPublicSuffix(cookie.domain)) continue;
+
           result.push(cookie);
         }
       }
@@ -521,14 +554,23 @@ export class CookieJar {
     });
 
     // §5.4 step 3: update last-access time
+    //
+    // The timestamp is stamped on the STORED cookie, because that is the value
+    // LRU eviction orders by, and the caller receives copies. It used to return
+    // the stored objects themselves, so
+    // `jar.getCookies(opts)[0].value = "x"` rewrote the jar's contents — while
+    // getAll() and getForDomain() both return copies, leaving the two halves of
+    // the same API disagreeing about whether the result was yours to modify.
     const ts = Date.now();
-    for (const c of result) {
-      // Note: getCookies returns direct references to stored cookies, not copies.
-      // Modifying lastAccessed here directly updates the stored cookie.
+    // The snapshot is taken before the stamp, so a caller sees the cookie as it
+    // was stored at the moment of the call while the jar records the access.
+    // Copying first and stamping after also means a mutation of the returned
+    // object cannot write a lastAccessed back into the store.
+    return result.map((c) => {
+      const snapshot = { ...c };
       c.lastAccessed = ts;
-    }
-
-    return result;
+      return snapshot;
+    });
   }
 
   // --------------------------------------------------------------------------
@@ -564,15 +606,36 @@ export class CookieJar {
   getCookiesForDomain(domain: string): Cookie[] {
     const d = canonicalizeDomainFull(domain);
     const result: Cookie[] = [];
+    const now = Date.now();
 
     for (const [stored, pm] of this.dm) {
-      // Match domain or its subdomains
-      if (stored === d || stored.endsWith("." + d)) {
+      // A domain is in scope if it is `d` itself, a subdomain of it, or an
+      // ancestor of it. The ancestor case was missing, so the result
+      // disagreed with getCookieHeader() for every subdomain query:
+      // getCookiesForDomain("sub.example.com") listed only the host-only
+      // cookie while the request actually sent "hostonly=1; domainwide=1",
+      // and "deep.sub.example.com" returned nothing at all. A parent-domain
+      // cookie applies to every host beneath it (RFC 6265 §5.3 step 5), and
+      // the host-only check below already keeps an ancestor's host-only
+      // cookie out of the result.
+      if (stored === d || stored.endsWith("." + d) || d.endsWith("." + stored)) {
         for (const [, nm] of pm) {
           for (const [, cookie] of nm) {
             // Skip expired cookies
-            if (cookie.expires !== Infinity && cookie.expires < Date.now()) continue;
-            result.push(cookie);
+            if (cookie.expires !== Infinity && cookie.expires < now) continue;
+            // A host-only cookie is bound to its own host and is never sent to
+            // a sibling or parent domain. The method documents itself as
+            // returning "cookies that would be sent to this domain", and it was
+            // returning them anyway: asking for "example.com" listed the
+            // host-only cookie belonging to "sub.example.com", which never
+            // reaches example.com. Only exact-domain host-only cookies apply.
+            if (cookie.hostOnly && cookie.domain !== d) continue;
+            // Same public-suffix rule as getCookies().
+            if (isPublicSuffix(cookie.domain)) continue;
+            // A copy, like every other accessor. Returning the stored object
+            // let `jar.getCookiesForDomain(d)[0].value = "x"` rewrite the jar,
+            // while the method sitting directly above it returned copies.
+            result.push({ ...cookie });
           }
         }
       }
@@ -793,7 +856,16 @@ export class CookieJar {
         maxAge: item.maxAge,
         secure: item.secure,
         httpOnly: item.httpOnly,
-        sameSite: item.sameSite,
+        // Normalized, because this is the one public ingestion path that takes
+        // externally authored JSON verbatim. `sameSiteAllows` switches on the
+        // canonical `"Strict" | "Lax" | "Unset" | "None"` and returns
+        // `undefined` for anything else, and `getCookies` filters on that
+        // result — so a persisted `"lax"`, or a store that simply omitted the
+        // field, produced a jar whose `count` was 1 and whose cookie was never
+        // sent to anything, with no error anywhere. `Unset` is the documented
+        // "cannot tell" bucket: everything except an explicit cross-site
+        // non-navigation request.
+        sameSite: normalizeSameSite(item.sameSite),
         createdAt: item.createdAt,
         lastAccessed: item.lastAccessed,
         hostOnly: item.hostOnly,
@@ -860,31 +932,55 @@ export class CookieJar {
   private putCookie(cookie: Cookie): void {
     const { domain, path, name } = cookie;
 
-    if (!this.dm.has(domain)) this.dm.set(domain, new Map());
-    const pm = this.dm.get(domain)!;
-
-    if (!pm.has(path)) pm.set(path, new Map());
-    const nm = pm.get(path)!;
-
-    if (nm.has(name)) {
-      // Update: preserve original createdAt (RFC 6265 §5.3 step 11)
-      const old = nm.get(name)!;
-      nm.set(name, { ...cookie, createdAt: old.createdAt });
-      // total unchanged — same slot
-    } else {
-      // New cookie: enforce caps first
-      this.evictForDomain(domain, pm);
-      this.evictGlobal();
-      nm.set(name, cookie);
-      this.total++;
+    // Update in place: same domain/path/name replaces the value and keeps the
+    // original createdAt (RFC 6265 §5.3 step 11). `total` is unchanged — it is
+    // the same slot.
+    const existing = this.dm.get(domain)?.get(path)?.get(name);
+    if (existing) {
+      this.dm
+        .get(domain)!
+        .get(path)!
+        .set(name, { ...cookie, createdAt: existing.createdAt });
+      return;
     }
+
+    // Evict BEFORE this cookie's path map exists.
+    //
+    // Both eviction helpers prune empty path maps as they go, and evictGlobal
+    // can drop a whole domain. Creating the path map up front meant the prune
+    // deleted the map that was about to be written into: the new cookie was
+    // stored into an orphaned map that nothing could reach, so `setCookie`
+    // returned true, the cookie was never sent, `getAll()`/`toJSON()` could
+    // not see it, and `this.total` was incremented regardless. The counter
+    // then drifted above the number of cookies actually held — measured at
+    // `count === 5` with 2 cookies stored — and since evictGlobal() reads
+    // `this.total`, the global cap stopped bounding anything either.
+    this.evictForDomain(domain);
+    this.evictGlobal();
+
+    // Re-fetch: eviction may have removed this domain, or emptied it, while
+    // the local reference went stale.
+    let pm = this.dm.get(domain);
+    if (!pm) {
+      pm = new Map();
+      this.dm.set(domain, pm);
+    }
+    let nm = pm.get(path);
+    if (!nm) {
+      nm = new Map();
+      pm.set(path, nm);
+    }
+    nm.set(name, cookie);
+    this.total++;
   }
 
   /**
    * Evict the least-recently-accessed cookie from a domain when
    * the per-domain cap is exceeded. Evicts down to maxPerDomain - 1.
    */
-  private evictForDomain(_domain: string, pm: PathMap): void {
+  private evictForDomain(domain: string): void {
+    const pm = this.dm.get(domain);
+    if (!pm) return;
     let count = 0;
     for (const nm of pm.values()) count += nm.size;
     if (count < this.maxPerDomain) return;

@@ -39,6 +39,7 @@ Works in **Node.js 18+**, **Deno**, **Bun**, **browsers**, **Cloudflare Workers*
 - [Authentication](#authentication)
 - [Retry](#retry)
 - [Rate Limiting](#rate-limiting)
+- [Concurrency Limiting](#concurrency-limiting)
 - [Timeout](#timeout)
 - [Interceptors](#interceptors)
 - [Lifecycle Hooks](#lifecycle-hooks)
@@ -150,6 +151,9 @@ const client = kinetex({
   throwOnError: true, // Throw on 4xx/5xx (default: true)
   followRedirects: true, // Follow redirects (default: true; false returns the 3xx as-is)
   maxRedirects: 20, // Max redirect hops (default: 20; 0 disables following)
+  //                    kinetex follows every hop itself, so each `Location` is screened
+  //                    (see "Redirects" under Transport Layer) — the transport is never
+  //                    asked to follow, whatever this is set to
   httpsOnly: false, // Reject non-HTTPS URLs
   maxResponseSize: 10_000_000, // Response body size limit (0 = no limit)
   maxRequestSize: 10_000_000, // Request body size limit (0 = no limit)
@@ -171,10 +175,15 @@ const client = kinetex({
   // ── Rate Limit ──
   rateLimit: { limit: 100, windowMs: 60_000, queue: true, maxQueue: 100 },
 
+  // ── Concurrency Limit ──
+  // Bounds requests *in flight*, which rateLimit cannot: a token bucket
+  // releases at dispatch, so 100/min still permits 100 simultaneous sockets.
+  concurrencyLimit: { maxConcurrent: 10, queue: true, maxQueue: 100 },
+
   // ── Proxy ──
-  // NOTE: `proxy` fails fast — kinetex's built-in transports cannot route
-  // through it. Use the `fetch` option with a proxy-capable agent for
-  // HTTP(S) proxies, or createSocks5Tunnel() from "kinetex/socks5" for SOCKS5.
+  // HTTP(S) CONNECT proxies work on Node, on both built-in transports.
+  // SOCKS5 URLs still throw, pointing at kinetex/socks5.
+  // proxy: { url: "http://127.0.0.1:8080" },
   // proxy: { url: "socks5://127.0.0.1:1080" },  // → throws with guidance
 
   // ── Cache ──
@@ -516,6 +525,76 @@ kinetex({
 
 ---
 
+## Concurrency Limiting
+
+A counting semaphore bounding how many requests may be **in flight** at once.
+`rateLimit` cannot do this: a token bucket releases at _dispatch_, so
+`rateLimit: { limit: 100 }` per minute still permits 100 simultaneous sockets.
+
+```ts
+kinetex({
+  concurrencyLimit: {
+    maxConcurrent: 10, // Permits held at once (default: 10; must be a finite number >= 1)
+    queue: true, // Queue the excess vs reject (default: true)
+    maxQueue: 100, // Queue depth before rejecting (default: 100)
+  },
+});
+```
+
+A permit is held for the **whole logical request, retries included**, and
+returned in a `finally` — so a throw, an exhausted retry budget or a `destroy()`
+can never leak one and permanently shrink the pool. On release the permit is
+handed straight to the longest-waiting caller rather than freed and re-taken, so
+`inFlight` never transiently exceeds `maxConcurrent`.
+
+When the queue is full (or `queue: false`), the request is rejected with
+`ConcurrencyLimitError`, code `ECONCURRENCY`:
+
+```ts
+import { ConcurrencyLimitError } from "kinetex";
+
+try {
+  await client.get("/slow");
+} catch (err) {
+  if (err instanceof ConcurrencyLimitError) {
+    console.log(err.code); // "ECONCURRENCY"
+  }
+}
+```
+
+A request cancelled while queued is a **different** failure and is reported as
+such — `code: "EABORT"` with `isAbort`, the same contract every other abort path
+in the library offers. That holds whichever path the acquire took: an idle pool,
+a saturated pool with queueing on, queueing off, and a full queue all answer
+`EABORT` rather than reporting a cancellation as a capacity failure. An
+already-aborted signal is refused before a permit is taken, so none can leak.
+
+`maxQueue` must be a non-negative integer, or `Infinity` for an unbounded queue;
+anything else — including `NaN` — throws a `RangeError` at construction rather
+than leaving the cap unbound. `maxConcurrent` is validated the same way.
+
+### Standalone use
+
+The limiter is exported on its own, for gating work that is not a request:
+
+```ts
+import { ConcurrencyLimiter, CONCURRENCY_DEFAULTS } from "kinetex";
+
+const limiter = new ConcurrencyLimiter({ maxConcurrent: 4 });
+console.log(limiter.inFlight, limiter.waiting, limiter.highWaterMark);
+
+await limiter.acquire(signal);
+try {
+  await doWork();
+} finally {
+  limiter.release();
+}
+
+limiter.drain(); // reject everyone still queued (what Kinetex.destroy does)
+```
+
+---
+
 ## Timeout
 
 Default timeout is 30 seconds. Set to 0 for no timeout:
@@ -539,6 +618,15 @@ try {
 ```
 
 Internally uses `sendWithTimeout(transport, request, timeoutMs)` which races the transport promise against a timeout promise using `AbortController` and `mergeSignals`.
+
+**A merged signal keeps the reason.** `mergeSignals(a, b)` re-aborts with the
+`reason` of whichever source actually aborted, so
+`signal.reason` survives the combination instead of collapsing to a generic
+`AbortError: This operation was aborted` — including when a source was _already_
+aborted before the call, which is the case a shortcut in the "no live signals
+left" branch used to get wrong. Interceptors rely on this: retry and
+deduplication logic reads `existing.reason` off the combined signal to decide
+what actually went wrong.
 
 ---
 
@@ -655,7 +743,14 @@ const suite = createInterceptorSuite({
 
 ## Lifecycle Hooks
 
-Hooks are higher-level callbacks for specific lifecycle stages, configured at client creation:
+Hooks are higher-level callbacks for specific lifecycle stages, configured at client creation.
+
+`onAfterRequest` fires in exactly the window its name describes: after the
+transport has answered and before the response is built, once per attempt. It
+is the only place you can observe that the round trip is over without also
+having to see the parsed response — and it deliberately does **not** fire on a
+request that never left, so a hook that counts what was sent does not count a
+connection that died first.
 
 ```ts
 kinetex({
@@ -668,7 +763,7 @@ kinetex({
     ],
     onAfterRequest: [
       (req, ctx) => {
-        /* request was sent */
+        /* the wire round trip is over; the response is not built yet */
       },
     ],
     onBeforeResponse: [
@@ -1009,6 +1104,11 @@ client.GET("/users").cache({ ttlMs: 5000 }).json();
 client.GET("/users").noCache().json(); // forceRefresh: true
 ```
 
+`forceRefresh` skips the cache **read** for that one request and nothing else:
+the fresh response is still written, so a later plain request is served from
+the cache again. It is a bypass, not a purge — use `cache.clear()` or
+`invalidateTags()` to drop entries.
+
 **Stale-while-revalidate needs no config flag.** There is no `swr` or `swrTtlMs` option: the SWR window is taken from the response's `Cache-Control: stale-while-revalidate=N`, and within that window kinetex serves the stale copy immediately and revalidates in the background. Two consequences worth knowing:
 
 - A per-request `cache.ttlMs` override pins the SWR window to 0 for that request. If you want SWR, let the server's `Cache-Control` decide the lifetime.
@@ -1113,7 +1213,15 @@ await cache.clear();
 
 ## Cookie Jar
 
-Full RFC 6265 cookie storage and management with SameSite, HttpOnly, Secure, domain/path matching:
+Full RFC 6265 cookie storage and management with SameSite, HttpOnly, Secure, domain/path matching.
+
+`CookieJar.fromJSON` / `loadCookieJar` are the one public path that ingests
+externally authored JSON, so they canonicalise `sameSite` on the way in:
+`"lax"`, `"LAX"` and `"Lax"` all mean `Lax`, and an unrecognised or missing
+value becomes `Unset`. Without that, a persisted jar could report `count === 1`
+and send nothing at all, because an unrecognised `SameSite` matches no branch
+of the retrieval filter. `Unset` still refuses an explicit cross-site request,
+so a value that cannot be interpreted is never treated as "send everywhere".
 
 ```ts
 // Auto-managed through the client
@@ -2004,6 +2112,17 @@ const skewMs = await detectClockSkew("https://sts.amazonaws.com", credentials);
 isClockSkewError(err); // → boolean
 ```
 
+**`imdsCredentials` reports failure as a `NetworkError`, never a raw
+`SyntaxError`.** Every way the EC2 metadata service can disappoint you — an
+unreachable endpoint, a non-200, a body that is not JSON, or a 200 whose JSON
+is missing `AccessKeyId` / `SecretAccessKey` / `Token` — surfaces as the same
+error type, so a `chainCredentials` fallback can catch one thing. A body is
+accepted only if every required field is a non-empty string; `{}` and
+`{"AccessKeyId": null}` are refused, and the error names _all_ the fields that
+were absent rather than making you discover them one round trip at a time.
+Signing with `undefined` keys would otherwise produce a `SignatureDoesNotMatch`
+from AWS that points at the caller instead of at the metadata service.
+
 ### Client-Level SigV4
 
 ```ts
@@ -2155,6 +2274,14 @@ Create one per client (do not share it across users). `Kinetex`'s built-in `auth
 
 ## Structured Logging
 
+Body-field redaction applies to every JSON media type, not just
+`application/json`: `+json` structured suffixes (`application/vnd.api+json`,
+`application/hal+json`, `application/problem+json`, …), `text/json`, any
+casing, and any parameters. `allowedBodyTypes` decides whether a body is logged
+at all; a body that clears that gate has its `bodyFields` redacted whatever
+its exact media type, so widening `allowedBodyTypes` cannot quietly start
+leaking `password` fields.
+
 ```ts
 import {
   HTTPLogger,
@@ -2238,7 +2365,7 @@ const har = client.getHAR();
 // HARLog { version: "1.2", creator: { name: "kinetex", version: "1.0.0" }, entries: [...] }
 
 // Each HAREntry contains:
-// startedDateTime, time, request (method, url, httpVersion, headers, queryString, bodySize),
+// startedDateTime, time, request (method, url, httpVersion, headers, queryString, bodySize, postData?),
 // response (status, statusText, httpVersion, headers, content, redirectURL, bodySize),
 // timings (send, wait, receive), cache
 
@@ -2254,6 +2381,7 @@ HAR logs are routinely exported and shared, so entries are redacted before they 
 - **URLs** — sensitive query parameters (`api_key`, `access_token`, `signature`, `password`, `code`, `sas`, …) and the fragment are masked, in both `request.url` and `request.queryString[]`. Non-sensitive parameters and the rest of the URL are preserved so the log stays useful.
 - **`Location`** — the redirect target is passed through the same URL redaction.
 - **Bodies** — response text is recorded only for `json`/`xml`/`text/plain`/`javascript` content types and truncated to 8 KiB; HTML and binary bodies are never recorded.
+- **Request bodies** — recorded as `request.postData` (`{ mimeType, text }`) under the same policy and the same limit, so a HAR viewer shows what was actually sent. A `ReadableStream` or `FormData` body is omitted rather than buffered, since reading it would consume it; `request.bodySize` is `-1` for those, as it always was.
 
 ```ts
 // ?api_key=SUPERSECRET&page=2  →  https://api.example.com/v1/items?api_key=***REDACTED***&page=2
@@ -2339,6 +2467,54 @@ Pipeline stages in order:
 
 ## Transport Layer
 
+### Redirects
+
+**kinetex follows every redirect itself.** The outgoing request always carries
+`redirect: "manual"`, and a server-chosen `Location` is resolved, screened and
+re-dispatched one hop at a time. This is not a tuning knob — it is what makes
+the per-hop checks below possible at all, because `fetch` following on its own
+never reports a target back to the caller.
+
+Every hop is subject to:
+
+- **SSRF.** `isSafeURL` runs on each `Location` before it is dialled, so a
+  redirect cannot walk the client onto a loopback, private or link-local
+  address. A 302 to `http://127.0.0.1:9/` or to `http://169.254.169.254/`
+  raises `EVALIDATION` ("Unsafe redirect target blocked") rather than opening
+  the socket — the initial request URL gets the same screen.
+- **`httpsOnly`.** Checked on the target, not just the request you wrote, so an
+  `https:` request cannot be downgraded to cleartext by its response.
+- **`maxRedirects`.** Enforced per request, default 20. Exhausting it raises
+  `RedirectError` (`EREDIRECT`, "Too many redirects"). `followRedirects: false`
+  — or `maxRedirects: 0` — hands the 3xx back to you instead.
+- **Loop detection.** A target already visited in this chain is refused with
+  `RedirectError` (`EREDIRECT`, "Redirect loop detected").
+- **Method downgrade.** Per RFC 7231, 301/302/303 downgrade to `GET` and drop
+  the body; 307/308 preserve both.
+- **Credentials.** `Authorization`, `apikey` headers, `Cookie` and any
+  declared auth are dropped when a hop changes origin, and kept when it does
+  not. Intermediate `Set-Cookie` headers are captured by the jar, so cookies
+  set on a redirect leg are applied to the next one.
+- **Scheme.** Anything but `http:` / `https:` is rejected as
+  `EVALIDATION`, so `file:`, `data:` and friends cannot be reached.
+
+`res.redirected` tells you whether a hop was actually taken, and `res.url` is
+where the request finally landed. An _unfollowed_ 3xx — `followRedirects:
+false`, or `maxRedirects: 0` — reports `redirected: false` and the original
+`res.url`, because nothing was followed: that response is the one you have to
+read `Location` on and act on yourself.
+
+A redirect failure is a `RedirectError` with code `EREDIRECT` ("Too many
+redirects", "Redirect loop detected"), and it is **not** retried. A chain is a
+deterministic answer from the origin, so replaying it would only multiply the
+requests against a server already looping: `maxRedirects: 3` makes exactly
+four requests, not one per retry attempt. The SSRF and `httpsOnly` gates stay
+`EVALIDATION`, as does an unsafe redirect target.
+
+The built-in transports enforce the same two gates in their own loops
+(`https:` only, plus `isSafeURL`), so the protection does not depend on going
+through `Kinetex`.
+
 ### FetchTransport
 
 Universal fetch-based transport for all runtimes:
@@ -2387,6 +2563,57 @@ Features:
 - Keepalive pings with dead-session detection
 - Iterative redirect following (not recursive)
 - Backpressure-aware body writes (awaits `drain` events)
+
+**The transport owns the request line.** `:method`, `:path`, `:scheme` and
+`:authority` are built from the URL you hand to `send()` and cannot be
+overridden from `request.headers`. A pseudo-header there is refused the same
+way any other invalid header is: `EVALIDATION` under `strict: true`, otherwise
+`onDroppedHeader(name, value)` or a `console.warn`. This is not a formality —
+`":"` is not a token character, so `FetchTransport` has always dropped such a
+header, and the two transports now answer a single request the same way.
+
+Header names are validated as tokens and values as field-values, so a
+`__proto__` header (legal — it is all token characters) is sent as a real
+header rather than disappearing into an inherited setter.
+
+### Request Bodies
+
+`FetchTransport` hands the body to `fetch`; `NodeHTTP2Transport` drives
+`node:http2` directly. The two therefore serialize differently, and on Node
+the default transport is the latter — so anything fetch would have encoded has
+to be encoded by kinetex first. `URLSearchParams`, `Blob` and `FormData` are
+all covered:
+
+```ts
+const form = new FormData();
+form.append("field", "value");
+form.append("file", new File([blob], "report.csv", { type: "text/csv" }));
+
+// → multipart/form-data; boundary=----kinetexFormBoundary<random>
+const res = await client.POST("/upload").withForm(form).send();
+```
+
+**The boundary and the header are generated together.** The boundary is
+invented _during_ encoding, so a body encoded after the header block was
+already written names a boundary no header mentions — and a multipart body
+whose boundary is not announced is unparseable. Both raw Node paths therefore
+pre-encode the body before building headers, and a `content-type` you set
+yourself always wins. `encodeMultipart(form, boundary?)` is exported for
+callers who want the bytes directly; pass a boundary to make the output
+deterministic.
+
+A field name containing CR, LF or a double quote is refused with
+`EVALIDATION` rather than serialized, since a name is interpolated into a
+`Content-Disposition` header and could otherwise forge extra part headers. A
+File's `filename` goes into the same quoted-string context but is
+percent-escaped rather than refused, so ordinary names keep working.
+
+`maxRequestSize` counts what actually goes on the wire. For a `FormData`
+that means the form is encoded once and its real byte length is compared —
+there is no per-part guess, and the encoding is not repeated on the dispatch
+path. A `ReadableStream` body is the one type that cannot be measured at all,
+so it is refused instead of bypassing the limit; pass `maxRequestSize: 0` to
+opt out, or buffer the body first.
 
 ### Transport Factory
 
@@ -3023,8 +3250,18 @@ const b64 = uint8ArrayToBase64(uint8);
 
 // Object
 const clone = deepClone(original);
-const normalized = normalizeHeaders(rawHeaders); // Lowercase keys
+// normalizeHeaders keys are lowercased, and a header that appears more than
+// once keeps every value rather than only the last one.
+const normalized = normalizeHeaders(rawHeaders);
 ```
+
+**Repeated headers keep every value.** `Set-Cookie` is the one header a
+`Headers` object yields _separately_ per cookie rather than already joined, so
+a naive normalisation that assigns as it iterates silently drops every cookie
+but the last — and the request still looks fine. `normalizeHeaders`
+accumulates instead, so a response with three `Set-Cookie` lines round-trips
+back to three, each with its `Expires=Wed, 09 Jun 2021 10:18:14 GMT` intact.
+`toNodeHeaders` and the `HttpHeaders` type were already correct on this.
 
 ---
 
