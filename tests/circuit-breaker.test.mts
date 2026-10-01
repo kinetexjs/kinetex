@@ -48,9 +48,6 @@ const succeed =
   (): Promise<unknown> =>
     Promise.resolve(value);
 
-/** A call that always fails with a countable ENETWORK error. */
-const failNet = (): Promise<never> => Promise.reject(netErr());
-
 /** Run `ms` of real time. */
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -1337,7 +1334,13 @@ await test("regression: `state` reflects the elapsed reset window without traffi
   });
   await assert.rejects(() => observed.execute(() => Promise.reject(netErr())));
   await wait(150);
-  for (let i = 0; i < 5; i++) observed.snapshot; // poll like a dashboard would
+  for (let i = 0; i < 5; i++) {
+    // Polled like a dashboard would. Each read is checked rather than merely
+    // performed: a bare `observed.snapshot;` statement is a no-op, so the
+    // repeated reads it stood for were never actually verified.
+    assert.equal(observed.snapshot.state, "HALF_OPEN", `poll ${i + 1} must not transition`);
+    assert.equal(halfOpenFired, 0, `poll ${i + 1} must not fire onHalfOpen`);
+  }
   assert.equal(observed.state, "HALF_OPEN");
   assert.equal(halfOpenFired, 0, "observing the state must not fire onHalfOpen");
   // The transition — and the callback — happen when traffic arrives.
