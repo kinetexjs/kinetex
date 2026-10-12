@@ -1,18 +1,24 @@
-# The gitleaks config below exists because of this directory. Read this first.
+# Why this file exists: the gitleaks job had been failing to download its own
+# binary since gitleaks renamed its release assets from `linux_amd64` to
+# `linux_x64`, so the scan never ran. Fixing that (see ci.yml) turned up three
+# findings, all of them placeholders rather than credentials. A gate that has
+# never run is worse than one that runs and fails, because it reads as coverage.
 #
-# `localhost-key.pem` is a private key, so gitleaks' `private-key` rule flags it
-# — correctly, on a file that is a private key. It is allowlisted by path rather
-# than by fingerprint, because a fingerprint embeds the commit SHA and goes stale
-# the moment the file changes; a path does not.
-#
-# The scope is one file. Every other rule in gitleaks' default config still
-# applies, including to this directory: a real credential pasted into any other
-# fixture is still caught. This does not disable the scan, and it was added only
-# after the scan was fixed enough to run at all (see the note in ci.yml about the
-# `linux_amd64` → `linux_x64` asset rename that had silently broken the job).
+# Two allowlist entries, both narrow. Every other rule in the default config
+# still applies, to every other file — including this directory and including
+# the test suites that hold other token-shaped strings.
 [extend]
 useDefault = true
 
 [allowlist]
-description = "Self-signed localhost test key — see tests/fixtures/README.md"
+description = "Test-only placeholder — see tests/fixtures/README.md"
+
+# `localhost-key.pem` is a private key, so the `private-key` rule flags it —
+# correctly, on a file that is one. Allowlisted by path rather than by
+# fingerprint, because a fingerprint embeds the commit SHA and goes stale the
+# moment the file changes. It is a throwaway self-signed localhost key with no
+# CA and no name outside 127.0.0.1; see tests/fixtures/README.md.
+#
+# Historic findings are handled in .gitleaksignore instead — that file is the
+# one that takes fingerprints.
 paths = ['''tests/fixtures/localhost-key\.pem''']
