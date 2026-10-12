@@ -5,6 +5,7 @@
  */
 
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 import {
   percentEncode,
   percentDecode,
@@ -223,7 +224,7 @@ await test("safeJSONParse 10KB blob — 2,000 iterations", () => {
   for (let i = 0; i < 2_000; i++) {
     const r = safeJSONParse<{ data: number[] }>(blob);
     assert.equal(r.success, true);
-    if (r.success) assert.equal(r.value.data.length, 2200);
+    if (r.success) assert.equal(r.value?.data.length, 2200);
   }
   const e = logTiming("safeJSONParse 10KB", start, 2_000);
   assert.ok(e < 1000, `safeJSONParse 10KB took ${e}ms, expected <1000ms`);
@@ -237,7 +238,7 @@ await test("safeJSONParse 100KB blob — 200 iterations", () => {
   for (let i = 0; i < 200; i++) {
     const r = safeJSONParse<{ data: number[] }>(blob, opts);
     assert.equal(r.success, true, `safeJSONParse failed: ${r.error} ${r.message}`);
-    if (r.success) assert.ok(r.value.data.length >= 20_000);
+    if (r.success) assert.ok((r.value?.data.length ?? 0) >= 20_000);
   }
   const e = logTiming("safeJSONParse 100KB", start, 200);
   assert.ok(e < 1000, `safeJSONParse 100KB took ${e}ms, expected <1000ms`);
@@ -417,7 +418,7 @@ await test("Base64 round-trip correctness — 100 random buffers", () => {
 suite("Request deduplication");
 
 await test("RequestDeduplicator 1,000 concurrent dedup requests", async () => {
-  const d = new DedupMap<string>();
+  const d = new DedupMap();
   let calls = 0;
   const factory = async () => {
     calls++;
@@ -425,7 +426,7 @@ await test("RequestDeduplicator 1,000 concurrent dedup requests", async () => {
     return "result";
   };
   const start = performance.now();
-  const batch: Promise<string>[] = [];
+  const batch: Array<Promise<unknown>> = [];
   for (let i = 0; i < 1_000; i++) {
     batch.push(d.execute("GET", "https://example.com/data", factory));
   }
@@ -461,9 +462,9 @@ suite("Real HTTP (single)");
 
 await test("Kinetex GET to httpbin.org/get — should complete < 5s", async () => {
   const { kinetex } = await import("../src/mod.ts");
-  const client = kinetex({ timeout: 10_000 });
+  const client = kinetex({ timeout: 10_000, allowPrivateNetwork: true });
   const start = performance.now();
-  const res = await client.get("https://httpbin.org/get");
+  const res = await client.get(`${HTTPBIN_LOCAL_ORIGIN}/get`);
   const e = elapsedMs(start);
   logTiming("GET httpbin.org/get", start, 1);
   assert.equal(res.status, 200);
@@ -472,11 +473,11 @@ await test("Kinetex GET to httpbin.org/get — should complete < 5s", async () =
 
 await test("Kinetex POST with 1KB body — should complete < 5s", async () => {
   const { kinetex } = await import("../src/mod.ts");
-  const client = kinetex({ timeout: 10_000 });
+  const client = kinetex({ timeout: 10_000, allowPrivateNetwork: true });
   const body = "x".repeat(1024);
   const start = performance.now();
   try {
-    const res = await client.post("https://httpbin.org/post", body, {
+    const res = await client.post(`${HTTPBIN_LOCAL_ORIGIN}/post`, body, {
       headers: { "content-type": "text/plain" },
     });
     const e = elapsedMs(start);

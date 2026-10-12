@@ -1,4 +1,5 @@
 import assert from "assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "../../httpbin-local.ts";
 import { Kinetex, KinetexError, TimeoutError, HTTPStatusError } from "../../../src/mod.ts";
 import {
   detectRuntime,
@@ -150,20 +151,32 @@ async function main() {
   suite("Kinetex client in Bun");
 
   await test("GET to httpbin returns 200", async () => {
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: T });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: T,
+      allowPrivateNetwork: true,
+    });
     const res = await client.get<{ origin: string }>("/get");
     assert.equal(res.status, 200);
     assert.equal(typeof res.data.origin, "string");
   });
 
   await test("Fluent .GET().json() works", async () => {
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: T });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: T,
+      allowPrivateNetwork: true,
+    });
     const data = await client.GET("/get").json<{ origin: string }>();
     assert.equal(typeof data.origin, "string");
   });
 
   await test("Fluent .param() sends query parameters", async () => {
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: T });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: T,
+      allowPrivateNetwork: true,
+    });
     const data = await client
       .GET("/get")
       .param("a", "1")
@@ -174,7 +187,11 @@ async function main() {
   });
 
   await test("POST with JSON body", async () => {
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: T });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: T,
+      allowPrivateNetwork: true,
+    });
     const payload = { msg: "hello from bun" };
     const res = await client.post<{ json: typeof payload }>("/post", JSON.stringify(payload), {
       headers: { "content-type": "application/json" },
@@ -184,7 +201,11 @@ async function main() {
   });
 
   await test("Timeout throws TimeoutError", async () => {
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: 500 });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: 500,
+      allowPrivateNetwork: true,
+    });
     try {
       await client.get("/delay/10");
       assert.fail("Expected timeout");

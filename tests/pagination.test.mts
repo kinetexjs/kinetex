@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 import {
   collectAll,
   collectPages,
@@ -22,7 +23,11 @@ import {
 } from "../src/pagination.ts";
 import { kinetex } from "../src/mod.ts";
 
-const client = kinetex({ baseURL: "https://jsonplaceholder.typicode.com", maxAttempts: 1 });
+const client = kinetex({
+  baseURL: HTTPBIN_LOCAL_ORIGIN,
+  retry: { maxRetries: 0 },
+  allowPrivateNetwork: true,
+});
 
 let passed = 0,
   failed = 0;
@@ -32,7 +37,7 @@ function suite(name: string) {
   console.log(`\n${name}`);
 }
 
-async function test(name: string, fn: () => Promise<void>) {
+async function test(name: string, fn: () => Promise<void> | void) {
   try {
     await fn();
     console.log(`  ✅ ${name}`);
@@ -80,8 +85,8 @@ function assertThat(cond: boolean, what: string): void {
   if (!cond) throw new Error(`Expected ${what}`);
 }
 
-function assertOk(val: unknown) {
-  if (!val) throw new Error(`Expected truthy, got ${String(val)}`);
+function assertOk(val: unknown, note?: string) {
+  if (!val) throw new Error(`Expected truthy, got ${String(val)}${note ? ` (${note})` : ""}`);
 }
 
 type DataPage = { items: number[]; total?: number; cursor?: string | null; token?: string | null };
@@ -188,13 +193,13 @@ suite("paginate core");
 
 await test("paginate yields pages until hasNext returns false", async () => {
   const pages: Page<number>[] = [];
-  for await (const page of paginate({
+  for await (const page of paginate<number, DataPage>({
     fetch: makeFetch([{ items: [1, 2] }, { items: [3] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: (d: DataPage, s) => s.totalFetched + d.items.length < 3,
     perPage: 2,
   })) {
-    pages.push(page);
+    pages.push(page ?? -1);
   }
   assertEqual(pages.length, 2);
   assertEqual(pages[0].items, [1, 2]);
@@ -229,14 +234,14 @@ await test("paginate yields pages until hasNext returns false", async () => {
 
 await test("Page reports total and totalPages when getTotal is given", async () => {
   const pages: Page<number>[] = [];
-  for await (const page of paginate({
+  for await (const page of paginate<number, DataPage>({
     fetch: makeFetch([{ items: [1, 2, 3] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     getTotal: () => 7,
     hasNext: () => false,
     perPage: 3,
   })) {
-    pages.push(page);
+    pages.push(page ?? -1);
   }
   // 7 items at 3 per page is 3 pages, not 2 — a floor division here would
   // tell a caller they had seen everything after two.
@@ -245,9 +250,9 @@ await test("Page reports total and totalPages when getTotal is given", async () 
   assertEqual(pages[0].totalPages, 3);
   // Without perPage, totalPages is genuinely unknown.
   const noPerPage: Page<number>[] = [];
-  for await (const page of paginate({
+  for await (const page of paginate<number, DataPage>({
     fetch: makeFetch([{ items: [1] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     getTotal: () => 100,
     hasNext: () => false,
   })) {
@@ -260,14 +265,14 @@ await test("Page reports total and totalPages when getTotal is given", async () 
 
 await test("paginate respects maxPages", async () => {
   const pages: Page<number>[] = [];
-  for await (const page of paginate({
+  for await (const page of paginate<number, DataPage>({
     fetch: makeFetch([{ items: [1] }, { items: [2] }, { items: [3] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => true,
     perPage: 1,
     maxPages: 2,
   })) {
-    pages.push(page);
+    pages.push(page ?? -1);
   }
   // maxPages counts *fetches*, and stops before the (maxPages + 1)-th, so a
   // config with more pages available than permitted must not over-fetch.
@@ -289,17 +294,17 @@ await test("maxPages: 0 means unlimited, not zero pages", async () => {
   // rather than hang.
   let calls = 0;
   const pages: Page<number>[] = [];
-  for await (const page of paginate({
+  for await (const page of paginate<number, DataPage>({
     fetch: async () => {
       calls++;
       return { items: [calls] };
     },
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: (_d, s) => s.page < 4,
     perPage: 1,
     maxPages: 0,
   })) {
-    pages.push(page);
+    pages.push(page ?? -1);
   }
   // 0 is "unlimited", so all four pages come back. A reading of "stop
   // immediately" would return none, and a reading of "one" would return one.
@@ -315,30 +320,30 @@ await test("paginate respects signal abort", async () => {
   const ac = new AbortController();
   ac.abort();
   const pages: Page<number>[] = [];
-  for await (const page of paginate({
+  for await (const page of paginate<number, DataPage>({
     fetch: async () => ({ items: [1] }),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => true,
     perPage: 1,
     maxPages: 10,
     signal: ac.signal,
   })) {
-    pages.push(page);
+    pages.push(page ?? -1);
   }
   assertEqual(pages.length, 0);
 });
 
 await test("paginate applies transform and filter", async () => {
   const pages: Page<number>[] = [];
-  for await (const page of paginate({
+  for await (const page of paginate<number, DataPage>({
     fetch: makeFetch([{ items: [1, 2, 3, 4] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => false,
     perPage: 4,
     transform: (x: number) => x * 10,
     filter: (x: number) => x > 10,
   })) {
-    pages.push(page);
+    pages.push(page ?? -1);
   }
   // The order matters and is pinned: transform runs first, then filter on the
   // transformed values (so `x > 10` keeps 20, 30, 40 and drops 10).
@@ -347,9 +352,9 @@ await test("paginate applies transform and filter", async () => {
   // A filter that drops everything still yields the page — an empty page is
   // a page, and swallowing it would hide the fetch from the caller.
   const emptied: Page<number>[] = [];
-  for await (const page of paginate({
+  for await (const page of paginate<number, DataPage>({
     fetch: makeFetch([{ items: [1, 2] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => false,
     perPage: 2,
     filter: () => false,
@@ -362,18 +367,18 @@ await test("paginate applies transform and filter", async () => {
 
 await test("paginate uses getNext to update state", async () => {
   const pages: Page<number>[] = [];
-  for await (const page of paginate({
+  for await (const page of paginate<number, DataPage>({
     fetch: makeFetch([
       { items: [1], cursor: "c1" },
       { items: [2], cursor: null },
     ]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: (d: DataPage) => d.cursor !== null,
     getNext: (d: DataPage): Partial<PaginationState> | null =>
       d.cursor ? { cursor: d.cursor } : null,
     perPage: 1,
   })) {
-    pages.push(page);
+    pages.push(page ?? -1);
   }
   assertEqual(pages.length, 2);
   assertEqual(pages[0].nextCursor, "c1");
@@ -382,9 +387,9 @@ await test("paginate uses getNext to update state", async () => {
 
 await test("paginate calls onPage callback", async () => {
   const seen: Array<{ items: number[]; state: PaginationState }> = [];
-  for await (const _page of paginate({
+  for await (const _page of paginate<number, DataPage>({
     fetch: makeFetch([{ items: [1] }, { items: [2] }, { items: [3] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => true,
     perPage: 1,
     maxPages: 2,
@@ -415,9 +420,9 @@ await test("paginate calls onPage callback", async () => {
   // The state snapshot is a copy: a hook that mutated it must not steer the
   // iteration.
   const mutated: number[] = [];
-  for await (const _page of paginate({
+  for await (const _page of paginate<number, DataPage>({
     fetch: makeFetch([{ items: [1] }, { items: [2] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => true,
     perPage: 1,
     maxPages: 2,
@@ -431,9 +436,9 @@ await test("paginate calls onPage callback", async () => {
   assertEqual(mutated, [99, 99], "the hook saw its own write");
   // ...and the iteration still advanced 1, 2.
   const advanced: number[] = [];
-  for await (const p of paginate({
+  for await (const p of paginate<number, DataPage>({
     fetch: makeFetch([{ items: [1] }, { items: [2] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => true,
     perPage: 1,
     maxPages: 2,
@@ -441,7 +446,7 @@ await test("paginate calls onPage callback", async () => {
       /* noop */
     },
   })) {
-    advanced.push(p.page);
+    advanced.push(p.page ?? -1);
   }
   assertEqual(advanced, [1, 2]);
 });
@@ -454,21 +459,21 @@ await test("aborting during the inter-page delay stops pagination promptly", asy
   const start = Date.now();
   const pages: Page<number>[] = [];
 
-  for await (const page of paginate({
+  for await (const page of paginate<number, DataPage>({
     fetch: async () => {
       fetchCount++;
       // Abort once the first page is in hand, i.e. while the next sleep runs.
       if (fetchCount === 1) setTimeout(() => controller.abort(), 10);
       return { items: [fetchCount] };
     },
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => true,
     perPage: 1,
     delayMs: 30_000,
     maxPages: 10,
     signal: controller.signal,
   })) {
-    pages.push(page);
+    pages.push(page ?? -1);
   }
 
   const elapsed = Date.now() - start;
@@ -485,18 +490,18 @@ await test("paginate with delayMs waits between pages", async () => {
   let fetchCount = 0;
   const start = Date.now();
   const pages: Page<number>[] = [];
-  for await (const page of paginate({
+  for await (const page of paginate<number, DataPage>({
     fetch: async () => {
       fetchCount++;
       return { items: [fetchCount] };
     },
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: (d: DataPage, s) => s.totalFetched < 2,
     perPage: 1,
     delayMs: 50,
     maxPages: 2,
   })) {
-    pages.push(page);
+    pages.push(page ?? -1);
   }
   assertOk(Date.now() - start >= 40);
   assertEqual(pages.length, 2);
@@ -510,7 +515,7 @@ await test("paginateItems yields individual items across pages", async () => {
   const items: number[] = [];
   for await (const item of paginateItems({
     fetch: makeFetch([{ items: [1, 2] }, { items: [3, 4] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: (d: DataPage, s) => s.totalFetched + d.items.length < 4,
     perPage: 2,
   })) {
@@ -526,7 +531,7 @@ suite("Collection helpers");
 await test("collectAll collects all items from pages", async () => {
   const items = await collectAll({
     fetch: makeFetch([{ items: [1, 2] }, { items: [3] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: (d: DataPage, s) => s.totalFetched + d.items.length < 3,
     perPage: 2,
   });
@@ -536,7 +541,7 @@ await test("collectAll collects all items from pages", async () => {
 await test("collectPages collects all page objects", async () => {
   const pages = await collectPages({
     fetch: makeFetch([{ items: [1, 2] }, { items: [3] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: (d: DataPage, s) => s.totalFetched + d.items.length < 3,
     perPage: 2,
   });
@@ -548,7 +553,7 @@ await test("collectPages collects all page objects", async () => {
 await test("takeItems takes exactly N items across pages", async () => {
   const items = await takeItems(3, {
     fetch: makeFetch([{ items: [1, 2, 3, 4, 5] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => false,
     perPage: 5,
   });
@@ -560,9 +565,9 @@ await test("takeItems takes exactly N items across pages", async () => {
 suite("toPaginationIterator");
 
 await test("toPaginationIterator wraps generator with return", async () => {
-  const gen = paginate({
+  const gen = paginate<number, DataPage>({
     fetch: makeFetch([{ items: [1] }, { items: [2] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => true,
     perPage: 1,
   });
@@ -620,14 +625,14 @@ await test("Offset paginator real HTTP against jsonplaceholder", async () => {
   try {
     const pages: Page<any>[] = [];
     for await (const page of createOffsetPaginator<any>({
-      url: "https://jsonplaceholder.typicode.com/posts",
+      url: `${HTTPBIN_LOCAL_ORIGIN}/posts`,
       limit: 5,
       paramNames: { offset: "_start", limit: "_limit" },
       getItems: (d: any) => d,
       getTotal: () => 100,
       maxPages: 2,
     })) {
-      pages.push(page);
+      pages.push(page ?? -1);
       assertEqual(page.items.length, 5);
     }
     assertEqual(pages.length, 2);
@@ -652,7 +657,7 @@ await test("Offset paginator hasMore function with real HTTP", async () => {
   let calls = 0;
   const pages: Page<any>[] = [];
   for await (const page of createOffsetPaginator<any>({
-    url: "https://jsonplaceholder.typicode.com/posts",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/posts`,
     limit: 5,
     paramNames: { offset: "_start", limit: "_limit" },
     getItems: (d: any) => d,
@@ -663,7 +668,7 @@ await test("Offset paginator hasMore function with real HTTP", async () => {
     },
     maxPages: 5,
   })) {
-    pages.push(page);
+    pages.push(page ?? -1);
     assertEqual(page.items.length, 5);
   }
   assertEqual(pages.length, 3);
@@ -672,14 +677,14 @@ await test("Offset paginator hasMore function with real HTTP", async () => {
 await test("Offset paginator custom param names with real HTTP", async () => {
   const pages: Page<any>[] = [];
   for await (const page of createOffsetPaginator<any>({
-    url: "https://jsonplaceholder.typicode.com/posts",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/posts`,
     limit: 3,
     paramNames: { offset: "_start", limit: "_limit" },
     getItems: (d: any) => d,
     getTotal: () => 100,
     maxPages: 2,
   })) {
-    pages.push(page);
+    pages.push(page ?? -1);
     assertEqual(page.items.length, 3);
   }
   assertEqual(pages.length, 2);
@@ -690,14 +695,14 @@ suite("createPagePaginator");
 await test("Page paginator real HTTP against jsonplaceholder", async () => {
   const pages: Page<any>[] = [];
   for await (const page of createPagePaginator<any>({
-    url: "https://jsonplaceholder.typicode.com/posts",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/posts`,
     perPage: 5,
     paramNames: { page: "_page", perPage: "_limit" },
     getItems: (d: any) => d,
     getTotal: () => 100,
     maxPages: 2,
   })) {
-    pages.push(page);
+    pages.push(page ?? -1);
     assertEqual(page.items.length, 5);
   }
   assertEqual(pages.length, 2);
@@ -705,7 +710,7 @@ await test("Page paginator real HTTP against jsonplaceholder", async () => {
 
 await test("Page paginator with startPage", async () => {
   for await (const page of createPagePaginator<any>({
-    url: "https://jsonplaceholder.typicode.com/posts",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/posts`,
     perPage: 5,
     startPage: 3,
     paramNames: { page: "_page", perPage: "_limit" },
@@ -719,7 +724,7 @@ await test("Page paginator with startPage", async () => {
 
 await test("Page paginator with getTotalPages using real HTTP", async () => {
   for await (const page of createPagePaginator<any>({
-    url: "https://jsonplaceholder.typicode.com/posts",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/posts`,
     perPage: 5,
     paramNames: { page: "_page", perPage: "_limit" },
     getItems: (d: any) => d,
@@ -734,7 +739,7 @@ await test("Page paginator with getTotalPages using real HTTP", async () => {
 await test("Page paginator respects maxPages with real HTTP", async () => {
   let count = 0;
   for await (const _page of createPagePaginator<any>({
-    url: "https://jsonplaceholder.typicode.com/posts",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/posts`,
     perPage: 5,
     paramNames: { page: "_page", perPage: "_limit" },
     getItems: (d: any) => d,
@@ -768,8 +773,8 @@ await test("Token paginator uses pageToken param", async () => {
   let callNum = 0;
   for await (const page of createTokenPaginator<number>({
     url: "https://api.test/items",
-    fetch: async (url: string) => {
-      lastUrl = url;
+    fetch: async (url: string | URL | Request) => {
+      lastUrl = String(url);
       callNum++;
       return new Response(
         JSON.stringify({ items: [1, 2, 3], nextToken: callNum < 2 ? "tok2" : null }),
@@ -852,13 +857,13 @@ suite("mergePaginators");
 await test("mergePaginators interleaves items", async () => {
   const g1 = paginateItems({
     fetch: makeFetch([{ items: [1, 2] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => false,
     perPage: 2,
   });
   const g2 = paginateItems({
     fetch: makeFetch([{ items: [10, 20] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => false,
     perPage: 2,
   });
@@ -872,9 +877,9 @@ await test("mergePaginators interleaves items", async () => {
 suite("Page properties");
 
 await test("Page hasPrev false for first page", async () => {
-  for await (const page of paginate({
+  for await (const page of paginate<number, DataPage>({
     fetch: makeFetch([{ items: [1, 2], total: 4 }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => false,
     getTotal: (d: DataPage) => d.total ?? null,
     perPage: 2,
@@ -886,9 +891,9 @@ await test("Page hasPrev false for first page", async () => {
 });
 
 await test("Page totalPages null when missing info", async () => {
-  for await (const page of paginate({
+  for await (const page of paginate<number, DataPage>({
     fetch: makeFetch([{ items: [1, 2] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => false,
   })) {
     assertEqual(page.total, null);
@@ -909,8 +914,8 @@ await test("Keyset paginator with startKey uses initial cursor", async () => {
     keyParam: "after",
     startKey: "initial-key",
     getLastKey: () => (callNum++ === 0 ? "cursor-2" : null),
-    fetch: async (url: string) => {
-      urls.push(url);
+    fetch: async (url: string | URL | Request) => {
+      urls.push(String(url));
       return new Response(JSON.stringify([1]));
     },
     getItems: (d: any) => d,
@@ -959,7 +964,7 @@ await test("Keyset paginator hasMore with empty items returns false", async () =
 suite("Additional branch coverage");
 
 await test("paginate rethrows fetch errors unrelated to abort", async () => {
-  const gen = paginate({
+  const gen = paginate<number, DataPage>({
     fetch: async () => {
       throw new Error("network error");
     },
@@ -1003,7 +1008,7 @@ await test("prefetchPaginate prefetches ahead", async () => {
         callCount++;
         return { items: [callCount] };
       },
-      getItems: (d: DataPage) => d.items,
+      getItems: (d: DataPage) => (d as DataPage).items,
       hasNext: (d: DataPage, s) => s.totalFetched < 3,
       getNext: () => null,
       perPage: 1,
@@ -1012,7 +1017,7 @@ await test("prefetchPaginate prefetches ahead", async () => {
     "page",
     2,
   )) {
-    pages.push(page);
+    pages.push(page ?? -1);
   }
   // paginate yields the page where hasMore=false before breaking, so 4 pages, 4 fetches
   assertEqual(pages.length, 4);
@@ -1034,11 +1039,11 @@ function isGitHubThrottled(items: unknown): boolean {
   return typeof message === "string" && /rate limit|abuse detection/i.test(message);
 }
 
-await test("LinkHeader paginator real HTTP against GitHub API", async () => {
+await test("LinkHeader paginator real HTTP against a Link-header server", async () => {
   let callCount = 0;
   try {
     for await (const page of createLinkHeaderPaginator<any>({
-      url: "https://api.github.com/repos/opencode-ai/opencode/issues?per_page=2",
+      url: `${HTTPBIN_LOCAL_ORIGIN}/paged?page=1`,
       getItems: (d: any) => d,
       maxPages: 2,
     })) {
@@ -1096,13 +1101,13 @@ await test("regression: a filter no longer corrupts the offset", async () => {
   // pages: offsets 0, 2, 4, 6, 8, 10 instead of 0, 3, 6, 9 — the odd items
   // never yielded at all, and every even one yielded twice.
   const requested: number[] = [];
-  const it = paginate<number>(
+  const it = paginate<number, DataPage>(
     {
       fetch: async (s) => {
         requested.push(s.offset);
         return { items: [s.offset, s.offset + 1, s.offset + 2] };
       },
-      getItems: (d: DataPage) => d.items,
+      getItems: (d: DataPage) => (d as DataPage).items,
       hasNext: (_d, s) => s.offset < 9,
       filter: (n) => n % 2 === 0,
     },
@@ -1125,13 +1130,13 @@ await test("regression: a filter no longer corrupts the offset", async () => {
   // A transform is 1:1, so it must not move the offset at all.
   const tRequested: number[] = [];
   const tGot: number[] = [];
-  for await (const page of paginate<number>(
+  for await (const page of paginate<number, DataPage>(
     {
       fetch: async (s) => {
         tRequested.push(s.offset);
         return { items: [s.offset, s.offset + 1] };
       },
-      getItems: (d: DataPage) => d.items,
+      getItems: (d: DataPage) => (d as DataPage).items,
       hasNext: (_d, s) => s.offset < 4,
       transform: (n) => n * 10,
     },
@@ -1143,16 +1148,16 @@ await test("regression: a filter no longer corrupts the offset", async () => {
   assertEqual(tGot, [0, 10, 20, 30, 40, 50]);
   // An explicit getNext still wins over the arithmetic.
   const explicit: number[] = [];
-  for await (const page of paginate<number>(
+  for await (const page of paginate<number, DataPage>(
     {
       fetch: async (s) => ({ items: [s.page], page: s.page }),
-      getItems: (d: DataPage) => d.items,
+      getItems: (d: DataPage) => (d as DataPage).items,
       hasNext: (_d, s) => s.page < 3,
       getNext: (_d, s) => ({ page: s.page + 1 }),
     },
     "page",
   )) {
-    explicit.push(page.page);
+    explicit.push(page.page ?? -1);
   }
   assertEqual(explicit, [1, 2, 3]);
 });
@@ -1231,10 +1236,10 @@ await test("regression: a paginator that cannot advance stops instead of looping
   // ...and a page/offset strategy is still allowed to progress by those
   // numbers with a null getNext, which is a no-op rather than a stop.
   let byPage = 0;
-  for await (const _p of paginate<number>(
+  for await (const _p of paginate<number, DataPage>(
     {
       fetch: async (st) => ({ items: [st.page] }),
-      getItems: (d: DataPage) => d.items,
+      getItems: (d: DataPage) => (d as DataPage).items,
       hasNext: (_d, st) => st.page < 3,
       getNext: () => null,
       perPage: 1,
@@ -1370,7 +1375,7 @@ await test("regression: a deserialized state must actually be a state", async ()
     '{"strategy":"cursor","page":2,"offset":10,"cursor":"c","prevCursor":null,"token":null,"done":false,"totalFetched":10,"__proto__":{"polluted":1}}',
   );
   assertEqual(
-    (deserializePaginationState(dirty) as Record<string, unknown>).__proto__,
+    (deserializePaginationState(dirty) as unknown as Record<string, unknown>).__proto__,
     Object.prototype,
   );
   assertEqual(({} as Record<string, unknown>).polluted, undefined);
@@ -1383,7 +1388,7 @@ await test("regression: takeItems(0) and takeItems(negative) return nothing", as
   // with the stated contract, not an undocumented edge.
   const config = () => ({
     fetch: makeFetch([{ items: [1, 2, 3, 4, 5] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => false,
     perPage: 5,
   });
@@ -1411,7 +1416,7 @@ await test("regression: takeItems(0) and takeItems(negative) return nothing", as
       calls++;
       return { items: [1] };
     },
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => true,
   });
   assertEqual(calls, 0, "takeItems(0) performs no request");
@@ -1457,7 +1462,7 @@ await test("regression: prefetchPaginate overlaps the consumer with the next fet
         inFlight--;
         return { items: [idx] };
       },
-      getItems: (d: DataPage) => d.items,
+      getItems: (d: DataPage) => (d as DataPage).items,
       // `hasNext` is required — `paginate` calls it after every fetch — and is
       // always true here so that `maxPages` alone decides when to stop. The
       // paginator yields the page that turns `hasMore` false as well, so a
@@ -1502,7 +1507,7 @@ await test("regression: prefetchPaginate surfaces errors and survives early exit
           if (n++ === 1) throw new Error("boom");
           return { items: [n] };
         },
-        getItems: (d: DataPage) => d.items,
+        getItems: (d: DataPage) => (d as DataPage).items,
         hasNext: () => n <= 4,
       },
       "page",
@@ -1523,7 +1528,9 @@ await test("regression: prefetchPaginate surfaces errors and survives early exit
   // consumer that stops early is a normal thing to do, so it must not be able
   // to take the process down.
   const unhandled: unknown[] = [];
-  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  const onUnhandled = (reason: unknown) => {
+    unhandled.push(reason);
+  };
   process.on("unhandledRejection", onUnhandled);
   try {
     let i = 0;
@@ -1537,7 +1544,7 @@ await test("regression: prefetchPaginate surfaces errors and survives early exit
           if (idx === 3) throw new Error("late-boom");
           return { items: [idx] };
         },
-        getItems: (d: DataPage) => d.items,
+        getItems: (d: DataPage) => (d as DataPage).items,
         hasNext: () => true,
       },
       "page",
@@ -1565,7 +1572,7 @@ await test("regression: totalFetched counts rows fetched, not rows kept", async 
   for await (const page of paginate<number, DataPage>(
     {
       fetch: async (s) => ({ items: [s.offset, s.offset + 1, s.offset + 2, s.offset + 3] }),
-      getItems: (d: DataPage) => d.items,
+      getItems: (d: DataPage) => (d as DataPage).items,
       hasNext: (_d, s) => s.offset < 8,
       filter: (n) => n % 2 === 0,
     },
@@ -1586,7 +1593,7 @@ await test("regression: totalFetched counts rows fetched, not rows kept", async 
         states.push(s);
         return { items: [s.offset, s.offset + 1, s.offset + 2, s.offset + 3] };
       },
-      getItems: (d: DataPage) => d.items,
+      getItems: (d: DataPage) => (d as DataPage).items,
       hasNext: (_d, s) => s.offset < 8,
       filter: (n) => n % 2 === 0,
     },
@@ -1609,7 +1616,7 @@ await test("regression: totalFetched counts rows fetched, not rows kept", async 
         noFilter.push(s.totalFetched);
         return { items: [s.offset, s.offset + 1] };
       },
-      getItems: (d: DataPage) => d.items,
+      getItems: (d: DataPage) => (d as DataPage).items,
       hasNext: (_d, s) => s.offset < 4,
     },
     "offset",
@@ -1626,7 +1633,7 @@ await test("regression: one failing source does not abort a merge", async () => 
   // the short stream. The failing source is dropped and the rest continue.
   const g1 = paginateItems<number, DataPage>({
     fetch: makeFetch([{ items: [1, 2] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => false,
     perPage: 2,
   });
@@ -1635,14 +1642,14 @@ await test("regression: one failing source does not abort a merge", async () => 
       fetch: async () => {
         throw new Error("endpoint down");
       },
-      getItems: (d: DataPage) => d.items,
+      getItems: (d: DataPage) => (d as DataPage).items,
       hasNext: () => true,
     },
     "page",
   );
   const g3 = paginateItems<number, DataPage>({
     fetch: makeFetch([{ items: [10, 20] }]),
-    getItems: (d: DataPage) => d.items,
+    getItems: (d: DataPage) => (d as DataPage).items,
     hasNext: () => false,
     perPage: 2,
   });
@@ -1658,7 +1665,7 @@ await test("regression: one failing source does not abort a merge", async () => 
   const flaky = paginateItems<number, DataPage>(
     {
       fetch: makeFetch([{ items: [1] }, { items: [2] }]),
-      getItems: (d: DataPage) => d.items,
+      getItems: (d: DataPage) => (d as DataPage).items,
       perPage: 1,
       hasNext: () => true,
       // `maxPages` bounds the fixture to exactly two pages. Driving this off
@@ -1674,7 +1681,7 @@ await test("regression: one failing source does not abort a merge", async () => 
       fetch: async (): Promise<DataPage> => {
         throw new Error("down");
       },
-      getItems: (d: DataPage) => d.items,
+      getItems: (d: DataPage) => (d as DataPage).items,
       hasNext: () => true,
     },
     "page",
@@ -1690,7 +1697,7 @@ await test("regression: one failing source does not abort a merge", async () => 
       fetch: async (): Promise<DataPage> => {
         throw new Error("down");
       },
-      getItems: (d: DataPage) => d.items,
+      getItems: (d: DataPage) => (d as DataPage).items,
       hasNext: () => true,
     },
     "page",

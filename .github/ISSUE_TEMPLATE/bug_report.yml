@@ -144,7 +144,7 @@ body:
     id: checks
     attributes:
       label: Pre-submission Checklist
-      description: By submitting this issue, you confirm the following:
+      description: "By submitting this issue, you confirm the following:"
       options:
         - label: I have searched existing issues to avoid duplicates
           required: true

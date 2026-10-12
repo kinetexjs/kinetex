@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN, HTTPBIN_LOCAL_TLS_ORIGIN, LOCAL_TLS_CA } from "./httpbin-local.ts";
 import { TimeoutError } from "../src/types.ts";
 import {
   detectRuntime,
@@ -16,6 +17,7 @@ import {
   decompressBodyStream,
   normalizeHeaders,
 } from "../src/core.ts";
+import { KinetexError } from "../src/types.ts";
 
 let passed = 0,
   failed = 0;
@@ -95,9 +97,14 @@ suite("FetchTransport header sanitization");
 
 await test("onDroppedHeader callback fires for invalid value", async () => {
   const dropped: string[] = [];
-  const t = new FetchTransport({ strict: false, onDroppedHeader: (n) => dropped.push(n) });
+  const t = new FetchTransport({
+    strict: false,
+    onDroppedHeader: (n) => {
+      dropped.push(n);
+    },
+  });
   const raw = await t.send({
-    url: "https://httpbin.org/get",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
     method: "GET",
     headers: { "x-valid": "ok", "x-bad": "bad\x00value" },
     body: null,
@@ -123,7 +130,7 @@ await test("non-strict mode console.warn for invalid headers", async () => {
   try {
     const t = new FetchTransport();
     raw = await t.send({
-      url: "https://httpbin.org/get",
+      url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
       method: "GET",
       headers: { "x-bad": "bad\x00value" },
       body: null,
@@ -152,7 +159,7 @@ await test("strict mode throws EVALIDATION instead of warning", async () => {
   await assert.rejects(
     () =>
       t.send({
-        url: "https://httpbin.org/get",
+        url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
         method: "GET",
         headers: { "x-bad": "bad\x00value" },
         body: null,
@@ -176,7 +183,7 @@ await test("null headers object does not throw", async () => {
   // would throw on a null.
   const t = new FetchTransport();
   const raw = await t.send({
-    url: "https://httpbin.org/get",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
     method: "GET",
     headers: null as unknown as Record<string, string>,
     body: null,
@@ -191,7 +198,7 @@ await test("getReader body check: duplex added for Node ReadableStream", async (
   // The duplex: half logic only triggers for ReadableStream bodies in Node
   const t = new FetchTransport();
   const raw = await t.send({
-    url: "https://httpbin.org/post",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
     method: "POST",
     headers: { "content-type": "text/plain" },
     body: new ReadableStream({
@@ -229,7 +236,7 @@ await test("network error on invalid host wraps in KinetexError", async () => {
   } catch (err) {
     error = err;
   }
-  assert.ok(error instanceof Error);
+  assert.ok(error instanceof KinetexError);
   assert.equal(error.code, "ENETWORK");
 });
 
@@ -243,7 +250,7 @@ await test("timeout=0 returns immediately", async () => {
   const raw = await sendWithTimeout(
     new FetchTransport(),
     {
-      url: "https://httpbin.org/get",
+      url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
       method: "GET",
       headers: {},
       body: null,
@@ -256,6 +263,41 @@ await test("timeout=0 returns immediately", async () => {
   assert.equal(raw.status, 200);
 });
 
+await test("readRawBody checks the abort before the first read, not after", async () => {
+  // A 50 ms bound is the only thing separating two implementations here, and it
+  // measures the runner rather than the code: a loaded CI host fails a correct
+  // implementation and a fast one passes a version that drains the body first.
+  // The property is observable without a clock — the stream throws a marker from
+  // `pull`, so an implementation that reads first surfaces the marker instead of
+  // EABORT and fails on the code alone.
+  const ctrl = new AbortController();
+  ctrl.abort();
+  let read = false;
+  const stream = new ReadableStream<Uint8Array>({
+    pull() {
+      read = true;
+      throw new Error("BODY_WAS_READ");
+    },
+  });
+  await assert.rejects(
+    () => readRawBody(stream, 0, "http://127.0.0.1/x", ctrl.signal),
+    (err: unknown) => {
+      assert.equal(
+        (err as { code?: string }).code,
+        "EABORT",
+        "must abort before touching the body",
+      );
+      assert.equal(
+        (err as Error).message.includes("BODY_WAS_READ"),
+        false,
+        "the body must not be read at all",
+      );
+      return true;
+    },
+  );
+  assert.equal(read, false, "pull must never have been called");
+});
+
 await test("pre-aborted signal propagates as EABORT", async () => {
   const ctrl = new AbortController();
   ctrl.abort();
@@ -264,7 +306,7 @@ await test("pre-aborted signal propagates as EABORT", async () => {
     await sendWithTimeout(
       new FetchTransport(),
       {
-        url: "https://httpbin.org/delay/3",
+        url: `${HTTPBIN_LOCAL_ORIGIN}/delay/3`,
         method: "GET",
         headers: {},
         body: null,
@@ -316,7 +358,7 @@ await test("abort signal during read cancels and throws", async () => {
   } catch (err) {
     error = err;
   }
-  assert.ok(error instanceof Error);
+  assert.ok(error instanceof KinetexError);
   assert.equal(error.code, "EABORT");
 });
 
@@ -456,7 +498,7 @@ await test("unsupported encoding returns compressed body with warning", async ()
     console.warn = realWarn;
   }
   // Unsupported encoding should return the body as-is (compressed), not throw
-  assert.notEqual(result, null);
+  assert.ok(result !== null);
   const reader = result!.getReader();
   const { value } = await reader.read();
   assert.deepEqual(Array.from(value!), [1], "the bytes must pass through untouched");
@@ -506,7 +548,7 @@ await test("FetchTransport with custom fetch function", async () => {
   // positional-function constructor is that it is used, so a failure here is
   // a failure.
   const raw = await t.send({
-    url: "https://httpbin.org/get",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
     method: "GET",
     headers: {},
     body: null,
@@ -519,7 +561,7 @@ await test("FetchTransport with custom fetch function", async () => {
 });
 
 await test("FetchTransport with options object only", () => {
-  // `assert.notEqual(t, null)` is true of any value a constructor returns,
+  // `assert.ok(t !== null)` is true of any value a constructor returns,
   // including `undefined`. The options have to be shown to land: a transport
   // that silently dropped `strict` would still pass.
   const t = new FetchTransport({ strict: true });
@@ -537,40 +579,30 @@ await test("FetchTransport with options object only", () => {
 
 suite("HTTP version detection");
 
-await test("Cloudflare returns HTTP/2 via FetchTransport", async () => {
-  const t = new FetchTransport();
+await test("FetchTransport reports the protocol it actually got", async () => {
+  // This dialled www.cloudflare.com and www.google.com to observe real ALPN.
+  // FetchTransport cannot verify a self-signed origin — TLS trust belongs to
+  // the Node transports, which is why `ca` is not one of its options — so the
+  // local *TLS* fixture cannot serve this case. What the two public hosts were
+  // really proving is that `httpVersion` reports what was negotiated rather
+  // than what was asked for, and that holds over cleartext: ask for HTTP/2 from
+  // an HTTP/1.1 origin and it must report HTTP/1.1.
+  const t = new FetchTransport({ allowPrivateNetwork: true });
   const raw = await t.send({
-    url: "https://www.cloudflare.com/",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
     method: "GET",
     headers: {},
     body: null,
     signal: null,
     meta: {},
-    httpVersion: "HTTP/1.1",
+    httpVersion: "HTTP/2",
   });
-  assert.equal(raw.httpVersion, "HTTP/2");
-});
-
-await test("Google returns HTTP/2 with h3 alt-svc via FetchTransport", async () => {
-  const t = new FetchTransport();
-  const raw = await t.send({
-    url: "https://www.google.com/",
-    method: "GET",
-    headers: {},
-    body: null,
-    signal: null,
-    meta: {},
-    httpVersion: "HTTP/1.1",
-  });
-  // Google serves HTTP/1.1 from some edges (ALPN/geo dependent). Accept either
-  // version but require the transport to report a valid detected protocol.
   assert.equal(
-    ["HTTP/2", "HTTP/1.1"].includes(raw.httpVersion),
-    true,
-    `unexpected httpVersion: ${raw.httpVersion}`,
+    raw.httpVersion,
+    "HTTP/1.1",
+    "must report the negotiated protocol, not the requested one",
   );
 });
-
 // ============================================================================
 // §11  NodeHTTP2Transport — edge cases
 // ============================================================================
@@ -640,14 +672,18 @@ await test("custom session options", () => {
 });
 
 await test("redirect: error throws", async () => {
-  const t = new NodeHTTP2Transport();
+  // HTTP/2 cannot speak cleartext, so this reaches the local *TLS* fixture. It
+  // used to reach a public httpbin over plain HTTP, where the request died at
+  // the protocol rather than at the redirect — the failure it asserted was an
+  // accident of the wrong transport talking to the wrong server.
+  const t = new NodeHTTP2Transport({ ca: LOCAL_TLS_CA, allowPrivateNetwork: true });
   try {
     // `assert.rejects(fn)` with no matcher is satisfied by a DNS failure, a
     // connection reset or a timeout — none of which is a redirect refusal.
     await assert.rejects(
       () =>
         t.send({
-          url: "https://httpbin.org/redirect/1",
+          url: `${HTTPBIN_LOCAL_TLS_ORIGIN}/redirect/1`,
           method: "GET",
           headers: {},
           body: null,
@@ -767,8 +803,8 @@ await test("regression: parseBody reads a +json content type", async () => {
   // opaque bytes turns a structured response into a Uint8Array, and the
   // caller sees a different type for the same JSON.
   const body = new TextEncoder().encode(JSON.stringify({ data: { id: 7 } }));
-  const parsed = parseBody<{ data: { id: number } }>(body, "application/vnd.api+json");
-  assert.equal(parsed.data.id, 7);
+  const parsed = await parseBody<{ data: { id: number } }>(body, "application/vnd.api+json");
+  assert.equal(parsed?.data.id, 7);
 });
 
 await test("regression: an empty body parses to null, not empty bytes", async () => {

@@ -3,6 +3,7 @@ dist/
 tmp/
 docs/
 coverage/
+sbom.cdx.json
 .c8_tmp/
 *.tsbuildinfo
 

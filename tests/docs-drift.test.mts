@@ -362,7 +362,7 @@ test("package.json, deno.json and the changelog agree on the version", () => {
   );
 
   const top = changelogTopVersion(CHANGELOG);
-  assert.notEqual(top, null, "CHANGELOG.md must start its entries with a `## [version]` heading");
+  assert.ok(top !== null, "CHANGELOG.md must start its entries with a `## [version]` heading");
   assert.equal(
     top,
     pkgVersion,
@@ -403,29 +403,39 @@ test("every CHANGELOG entry has a date and a recognised section", () => {
   assert.deepEqual(problems, [], problems.join("\n"));
 });
 
-test("the current release documents the features this version added", () => {
-  // Each of these shipped in 1.4.0. If a rename or a revert lands, the
-  // changelog must be updated in the same commit — that is the point.
-  const top = changelogTopVersion(CHANGELOG);
-  assert.notEqual(top, null);
-  const start = CHANGELOG.indexOf(`## [${top}]`);
-  const rest = CHANGELOG.slice(start);
-  const next = /^## /m.exec(rest.slice(1));
-  const entry = next ? rest.slice(0, next.index) : rest;
-
-  for (const symbol of [
-    "sessionPool",
-    "concurrencyLimit",
-    "ConcurrencyLimiter",
-    "ECONCURRENCY",
-    "proxy",
-    "EPROXY",
-    "dispatcher",
-    "zstd",
-    "recordHistogram",
-    "incrementCounter",
-    "idempotencyKey",
-  ]) {
-    assert.ok(entry.includes(symbol), `the ${top} changelog entry must document \`${symbol}\``);
+test("each release documents the features that version added", () => {
+  // Keyed by the version that shipped the symbols, not by the top of the file:
+  // this used to read whatever the newest heading was, so the guard silently
+  // changed subject at every release and demanded that 1.5.0 re-document the
+  // features 1.4.0 shipped. A rename or a revert must still be caught — just
+  // in the entry it belongs to.
+  const byVersion: Record<string, string[]> = {
+    "1.4.0": [
+      "sessionPool",
+      "concurrencyLimit",
+      "ConcurrencyLimiter",
+      "ECONCURRENCY",
+      "proxy",
+      "EPROXY",
+      "dispatcher",
+      "zstd",
+      "recordHistogram",
+      "incrementCounter",
+      "idempotencyKey",
+    ],
+    "1.5.0": ["totalTimeoutMs", "maxResponseSize", "EBLOCKEDHOST", "URLBuilderOptions"],
+  };
+  for (const [version, symbols] of Object.entries(byVersion)) {
+    const start = CHANGELOG.indexOf(`## [${version}]`);
+    assert.notEqual(start, -1, `CHANGELOG.md must have a section for ${version}`);
+    const rest = CHANGELOG.slice(start);
+    const next = /^## /m.exec(rest.slice(1));
+    const entry = next ? rest.slice(0, next.index) : rest;
+    for (const symbol of symbols) {
+      assert.ok(
+        entry.includes(symbol),
+        `the ${version} changelog entry must document \`${symbol}\``,
+      );
+    }
   }
 });

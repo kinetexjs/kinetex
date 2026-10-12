@@ -23,6 +23,9 @@ import { describe, it as nodeIt } from "node:test";
 import { isSafeURL, randomBytes, sanitizeParsedJSON } from "../src/utils.ts";
 import { Kinetex } from "../src/client.ts";
 import { jsonSSE, parseSSEText, SSERouter } from "../src/sse.ts";
+import type { SSEEvent } from "../src/sse.ts";
+import { fromKinetexResponse, makeInterceptorRequest } from "./fixtures.ts";
+import { blockedHostError, FetchTransport, filterSafeAddresses } from "../src/core.ts";
 import { deserializePaginationState, serializePaginationState } from "../src/pagination.ts";
 import { Redactor } from "../src/logging.ts";
 import { CookieJar } from "../src/cookie-store.ts";
@@ -87,8 +90,11 @@ describe("sanitizeParsedJSON battle", () => {
 describe("SSE JSON battle", () => {
   const HOSTILE = '{"ok":true,"__proto__":{"x":1},"data":{"constructor":{"y":2}}}';
 
-  function eventsOf(raw: string) {
-    return parseSSEText(raw);
+  function eventsOf(raw: string): SSEEvent[] & AsyncIterable<SSEEvent> {
+    // Arrays are async-iterable at runtime; TypeScript only advertises the
+    // symbol on Array under `lib: esnext.asynciterable`, so the intersection is
+    // what actually describes this value.
+    return parseSSEText(raw) as SSEEvent[] & AsyncIterable<SSEEvent>;
   }
 
   it("jsonSSE strips pollution keys from event data", async () => {
@@ -233,25 +239,30 @@ describe("Redactor battle", () => {
 describe("CookieJar.toJSON/fromJSON battle", () => {
   it("round-trips cookies and drops expired ones", () => {
     const jar = new CookieJar();
-    // `sameSite` is a closed union — `"Lax"`, not `"lax"`. A value outside it
-    // is a fixture the library can never produce, and it silently disables the
-    // cookie (see the normalizeSameSite regression below), so a count-only
-    // assertion here would have passed over a jar that sends nothing.
-    jar.putCookie({
-      name: "sid",
-      value: "abc",
-      domain: "example.com",
-      path: "/",
-      expires: Infinity,
-      maxAge: null,
-      secure: true,
-      httpOnly: true,
-      sameSite: "Lax",
-      createdAt: Date.now(),
-      lastAccessed: Date.now(),
-      hostOnly: true,
-    });
-    const json = jar.toJSON();
+    // A host-only, secure, non-expiring Lax cookie. `putCookie` is private, and
+    // `setCookie` cannot express all of this (it always derives hostOnly from
+    // the absence of a Domain attribute) — so the entry is forged through the
+    // public `fromJSON` import path, which is the same route a real reload
+    // takes. `sameSite` is a closed union: `"Lax"`, not `"lax"`.
+    const forged = CookieJar.fromJSON(
+      JSON.stringify([
+        {
+          name: "sid",
+          value: "abc",
+          domain: "example.com",
+          path: "/",
+          expires: Infinity,
+          maxAge: null,
+          secure: true,
+          httpOnly: false,
+          sameSite: "Lax",
+          createdAt: Date.now(),
+          lastAccessed: Date.now(),
+          hostOnly: true,
+        },
+      ]),
+    );
+    const json = forged.toJSON();
     assert.equal(json.length, 1);
     const jar2 = CookieJar.fromJSON(JSON.stringify(json));
     assert.equal(jar2.count, 1);
@@ -293,23 +304,28 @@ describe("CookieJar.toJSON/fromJSON battle", () => {
   });
 
   it("__Host- cookies that lost their contract are not re-emitted", () => {
-    const jar = new CookieJar();
-    // Forged store entry claiming __Host- prefix but violating prefix rules.
-    jar.putCookie({
-      name: "__Host-forged",
-      value: "v",
-      domain: "example.com",
-      path: "/deep",
-      expires: Infinity,
-      maxAge: null,
-      secure: false,
-      httpOnly: false,
-      sameSite: "lax",
-      createdAt: Date.now(),
-      lastAccessed: Date.now(),
-      hostOnly: false,
-    });
-    const cookies = jar.getCookies("https://example.com/deep");
+    // Forged store entry claiming the __Host- prefix while carrying an explicit
+    // Domain and no Secure flag — both violations the parser would have
+    // rejected. Injected through the public import path for the same reason.
+    const forged = CookieJar.fromJSON(
+      JSON.stringify([
+        {
+          name: "__Host-forged",
+          value: "1",
+          domain: "example.com",
+          path: "/",
+          expires: Infinity,
+          maxAge: null,
+          secure: false,
+          httpOnly: false,
+          sameSite: "Lax",
+          createdAt: Date.now(),
+          lastAccessed: Date.now(),
+          hostOnly: false,
+        },
+      ]),
+    );
+    const cookies = forged.getCookies({ url: "https://example.com/deep" });
     assert.equal(
       cookies.find((c) => c.name === "__Host-forged"),
       undefined,
@@ -320,6 +336,207 @@ describe("CookieJar.toJSON/fromJSON battle", () => {
 // ── HAR recorder redaction ────────────────────────────────────────────────────
 
 describe("HAR redaction battle", () => {
+  it("sensitive fields in a JSON request body never reach the HAR export", async () => {
+    // Headers were redacted and query parameters were redacted, but a JSON
+    // request body was recorded verbatim, so `{"password":"..."}` travelled in
+    // clear text while the same name in a header was masked. HAR files get
+    // attached to bug reports and handed to support teams, which makes the body
+    // the most likely place for a credential to travel.
+    const { kinetex } = await import("../src/mod.ts");
+    const fakeFetch: typeof fetch = (async () =>
+      new Response('{"ok":true}', {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const client = kinetex({
+      baseURL: "https://api.example.com",
+      allowPrivateNetwork: true,
+      har: true,
+      fetch: fakeFetch,
+    });
+    await client.post("/submit", {
+      password: "BODYTOKEN",
+      nested: { api_key: "NESTEDSECRET", keep: "keepme" },
+      list: [{ token: "LISTSECRET" }],
+    });
+    const har = JSON.stringify(client.getHAR());
+    assert.equal(har.includes("BODYTOKEN"), false, "top-level password leaked");
+    assert.equal(har.includes("NESTEDSECRET"), false, "nested api_key leaked");
+    assert.equal(har.includes("LISTSECRET"), false, "token inside an array leaked");
+    assert.match(har, /REDACTED/, "the values must be marked, not merely dropped");
+    assert.equal(har.includes("keepme"), true, "non-sensitive data must survive");
+    await client.destroy();
+  });
+
+  it("IPv6 literals with an embedded IPv4 tail are classified correctly", async () => {
+    // `::ffff:127.0.0.1` is the IPv4-mapped form of loopback and must be blocked,
+    // or the SSRF screen is trivially bypassed by rewriting the host. The dotted
+    // tail is only legal as the final group, so the parser has rejection branches
+    // nothing was exercising.
+    const { isSafeURL } = await import("../src/utils.ts");
+    for (const host of ["[::ffff:127.0.0.1]", "[::ffff:7f00:1]", "[::127.0.0.1]"]) {
+      assert.equal(isSafeURL(`http://${host}/x`), false, `${host} is loopback and must be blocked`);
+    }
+    // A public address in the same shape must still be allowed, or the screen
+    // simply refuses every IPv6 literal and callers route around it.
+    assert.equal(isSafeURL("http://[2606:4700:4700::1111]/x"), true);
+    // Malformed forms must be rejected, not coerced into something that parses.
+    assert.equal(isSafeURL("http://[::127.0.0.1:2]/x"), false, "dotted tail must be last");
+    assert.equal(isSafeURL("http://[::ffff:999.1.1.1]/x"), false, "a bad IPv4 tail is not a host");
+    assert.equal(isSafeURL("http://[::gggg]/x"), false, "a non-hex group is not a host");
+  });
+
+  it("the HTTP/2 transport times out and honours abort against a silent server", async () => {
+    // The h2 transport's timeout and abort handlers had no coverage: the
+    // request-timeout timer, the abort listener and its cleanup are three
+    // separate paths, and a server that completes the handshake and then says
+    // nothing is the only way to reach them. Without this, a hung upstream
+    // would hold the request open for the default timeout with nothing to
+    // report and no way to tell whether the caller or the server is at fault.
+    const http2 = await import("node:http2");
+    const { readFileSync } = await import("node:fs");
+    const server = http2.createSecureServer({
+      key: readFileSync("tests/fixtures/localhost-key.pem"),
+      cert: readFileSync("tests/fixtures/localhost-cert.pem"),
+      // The client speaks h2 only; answering h1 would not negotiate.
+      allowHTTP1: false,
+    });
+    // Accept the stream and never answer it.
+    server.on("stream", () => undefined);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as { port: number }).port;
+    const { NodeHTTP2Transport } = await import("../src/core.ts");
+    const { LOCAL_TLS_CA } = await import("./httpbin-local.ts");
+
+    const timed = new NodeHTTP2Transport({
+      ca: LOCAL_TLS_CA,
+      allowPrivateNetwork: true,
+      requestTimeoutMs: 250,
+    });
+    try {
+      await assert.rejects(
+        () =>
+          timed.send({
+            url: `https://127.0.0.1:${port}/hang`,
+            method: "GET",
+            headers: {},
+            body: null,
+            signal: null,
+            meta: {},
+            httpVersion: "HTTP/2",
+          } as never),
+        (err: unknown) => {
+          assert.equal(
+            (err as { code?: string }).code,
+            "ETIMEOUT",
+            "a silent server must time out",
+          );
+          assert.match((err as Error).message, /timed out/);
+          return true;
+        },
+      );
+    } finally {
+      timed.destroy();
+    }
+
+    const ac = new AbortController();
+    const aborted = new NodeHTTP2Transport({
+      ca: LOCAL_TLS_CA,
+      allowPrivateNetwork: true,
+      requestTimeoutMs: 30_000,
+    });
+    try {
+      const pending = aborted.send({
+        url: `https://127.0.0.1:${port}/hang`,
+        method: "GET",
+        headers: {},
+        body: null,
+        signal: ac.signal,
+        meta: {},
+        httpVersion: "HTTP/2",
+      } as never);
+      setTimeout(() => ac.abort(), 50);
+      await assert.rejects(pending, (err: unknown) => {
+        assert.equal((err as { code?: string }).code, "EABORT");
+        return true;
+      });
+    } finally {
+      aborted.destroy();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it("a credential echoed into a plain-text body is scrubbed", async () => {
+    // Field-name redaction cannot reach a `text/plain` body — there are no
+    // field names. A server that quotes the token back in an error message, or
+    // echoes a signed query parameter, put it into the export verbatim. The
+    // exact values kinetex already treats as sensitive are matched instead,
+    // which needs no pattern guessing and so cannot mangle ordinary text.
+    const { kinetex } = await import("../src/mod.ts");
+    const TOKEN = "echoed-bearer-token";
+    const fakeFetch: typeof fetch = (async () =>
+      new Response(`error: bad session=${TOKEN}; note=harmless`, {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      })) as unknown as typeof fetch;
+    const client = kinetex({
+      baseURL: "https://api.example.com",
+      allowPrivateNetwork: true,
+      har: true,
+      fetch: fakeFetch,
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    await client.get("/me");
+    const har = JSON.stringify(client.getHAR());
+    assert.equal(har.includes(TOKEN), false, "the echoed bearer token leaked");
+    assert.match(har, /REDACTED/, "and it must be masked, not merely absent");
+    assert.equal(har.includes("harmless"), true, "the surrounding text stays readable");
+    await client.destroy();
+  });
+
+  it("a sensitive query parameter echoed into a body is scrubbed", async () => {
+    const { kinetex } = await import("../src/mod.ts");
+    const TOKEN = "echoed-query-token";
+    const fakeFetch: typeof fetch = (async () =>
+      new Response(`bad token ${TOKEN}`, {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      })) as unknown as typeof fetch;
+    const client = kinetex({
+      baseURL: "https://api.example.com",
+      allowPrivateNetwork: true,
+      har: true,
+      fetch: fakeFetch,
+    });
+    await client.get(`/cb?access_token=${TOKEN}`);
+    const har = JSON.stringify(client.getHAR());
+    assert.equal(har.includes(TOKEN), false, "the echoed query credential leaked");
+    await client.destroy();
+  });
+
+  it("a non-JSON body is recorded unchanged", async () => {
+    // Redaction is a JSON feature; rewriting arbitrary text would corrupt it.
+    const { kinetex } = await import("../src/mod.ts");
+    const fakeFetch: typeof fetch = (async () =>
+      new Response("ok", {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      })) as unknown as typeof fetch;
+    const client = kinetex({
+      baseURL: "https://api.example.com",
+      allowPrivateNetwork: true,
+      har: true,
+      fetch: fakeFetch,
+    });
+    await client.post("/raw", "password=hunter2");
+    assert.equal(
+      JSON.stringify(client.getHAR()).includes("hunter2"),
+      true,
+      "text bodies are untouched",
+    );
+    await client.destroy();
+  });
+
   it("credential headers never appear in HAR exports via the client recorder", async () => {
     // Use the public HAR config surface so we test real client behavior.
     const { kinetex } = await import("../src/mod.ts");
@@ -757,13 +974,11 @@ describe("timeout interceptor merged-signal cleanup", () => {
     const m = await makeManager();
     const external = new AbortController();
     const res = await m.execute(
-      {
-        url: "https://api.example.com/x",
-        method: "GET",
-        headers: {},
-        signal: external.signal,
-      },
-      async () => new Response("ok"),
+      makeInterceptorRequest({ url: "https://api.example.com/x", signal: external.signal }),
+      async () =>
+        fromKinetexResponse(
+          new Response("ok") as unknown as import("../src/types.ts").KinetexResponse<unknown>,
+        ),
     );
     assert.equal(res.status, 200);
     // After the response the request-phase listener must be detached: a late
@@ -777,12 +992,7 @@ describe("timeout interceptor merged-signal cleanup", () => {
     await assert.rejects(
       () =>
         m.execute(
-          {
-            url: "https://api.example.com/x",
-            method: "GET",
-            headers: {},
-            signal: external.signal,
-          },
+          makeInterceptorRequest({ url: "https://api.example.com/x", signal: external.signal }),
           async () => {
             // Abort mid-flight so the timeout interceptor's merged-signal
             // handler runs (clears its timer + forwards the abort reason).
@@ -800,12 +1010,7 @@ describe("timeout interceptor merged-signal cleanup", () => {
     await assert.rejects(
       () =>
         m.execute(
-          {
-            url: "https://api.example.com/x",
-            method: "GET",
-            headers: {},
-            signal: external.signal,
-          },
+          makeInterceptorRequest({ url: "https://api.example.com/x", signal: external.signal }),
           async () => {
             throw new Error("boom");
           },
@@ -824,7 +1029,7 @@ describe("client pre-flight guards", () => {
     const { kinetex } = await import("../src/mod.ts");
     const client = kinetex({
       baseURL: "https://api.example.com",
-      proxy: "http://proxy.example.com:8080",
+      proxy: { url: "http://proxy.example.com:8080" },
     });
     await assert.rejects(
       () => client.get("/x"),
@@ -1158,12 +1363,12 @@ describe("GraphQL external-signal lifecycle", () => {
     const client = createGraphQLClient({
       url: "https://api.example.com/graphql",
       timeoutMs: 0, // isolate propagation: abort comes from the external signal only
-      fetch: (_url: unknown, init?: { signal?: AbortSignal }) =>
+      fetch: (_url: URL | RequestInfo, init?: RequestInit) =>
         new Promise<Response>((_resolve, reject) => {
           init?.signal?.addEventListener("abort", () =>
             reject(new Error("The operation was aborted")),
           );
-        }) as unknown as typeof fetch,
+        }),
     });
     // Abort shortly after the request starts so the merged-signal listener
     // (onExternalAbort) must forward the abort into the client's controller.
@@ -1176,5 +1381,120 @@ describe("GraphQL external-signal lifecycle", () => {
       /timed out|aborted|Network error/i,
     );
     assert.equal(calls.removed, 1, "error path must also detach the listener");
+  });
+});
+
+// ── DNS-rebinding screen on the fetch transport ─────────────────────────────
+//
+// The Node transports resolve once and pin the checked address to the socket.
+// `fetch` exposes no resolver hook, so FetchTransport screens before the call.
+// The decision is a pure function precisely so it can be tested against the
+// answers a hostile resolver would give, which cannot be arranged through a real
+// one offline.
+
+describe("FetchTransport pre-flight DNS screen", () => {
+  it("keeps only addresses outside the blocked ranges", () => {
+    const safe = filterSafeAddresses([
+      { address: "93.184.216.34", family: 4 },
+      { address: "127.0.0.1", family: 4 },
+      { address: "169.254.169.254", family: 4 },
+      { address: "::1", family: 6 },
+      { address: "10.0.0.5", family: 4 },
+    ]);
+    assert.deepEqual(
+      safe.map((a) => a.address),
+      ["93.184.216.34"],
+      "a mixed answer keeps only the public address",
+    );
+  });
+
+  it("drops family 0, which means the resolver failed for that entry", () => {
+    const safe = filterSafeAddresses([
+      { address: "0.0.0.0", family: 0 },
+      { address: "93.184.216.34", family: 4 },
+    ]);
+    assert.deepEqual(
+      safe.map((a) => a.address),
+      ["93.184.216.34"],
+    );
+  });
+
+  it("names the refusal so a caller can tell it from a dial failure", () => {
+    const err = blockedHostError("https://rebind.example/x", [
+      { address: "127.0.0.1" },
+      { address: "169.254.169.254" },
+    ]);
+    assert.equal(err.code, "EBLOCKEDHOST");
+    assert.match(err.message, /resolved only to blocked addresses/);
+    assert.match(err.message, /127\.0\.0\.1/);
+    assert.match(err.message, /169\.254\.169\.254/, "the refused addresses are named");
+  });
+
+  it("refuses a host that resolves to loopback instead of dialling it", async () => {
+    // `localhost` resolves to 127.0.0.1 through the system file, so this is
+    // the same shape as an attacker-controlled name pointing at loopback. No
+    // socket may be opened, which is what distinguishes this from ENETWORK.
+    // The default transport is the one that must refuse: see the custom-fetch
+    // case below for why supplying your own `fetch` changes that.
+    const transport = new FetchTransport();
+    await assert.rejects(
+      () =>
+        transport.send({
+          method: "GET",
+          url: "http://localhost:1/x",
+          headers: {},
+          body: null,
+          signal: null,
+          meta: {},
+        } as never),
+      (err: unknown) => {
+        assert.ok(err instanceof Error);
+        // Either the lexical screen or the DNS screen may be the one to fire;
+        // what matters is that no request was attempted.
+        assert.ok(
+          err.message.includes("blocked") || err.message.includes("safety check"),
+          `expected a refusal, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
+
+  it("does not apply its DNS pre-flight to a caller-supplied fetch", async () => {
+    // The screen resolves the *system* name. A caller-supplied `fetch` owns its
+    // own resolution — its dispatcher, agent or resolver may answer something
+    // entirely different — so screening the system answer would describe a
+    // lookup that never happens and could not observe the connection that
+    // does. The lexical screen still applies; this case proves only that the
+    // resolution half is the transport's job, and documents that handing the
+    // transport over transfers it.
+    const transport = new FetchTransport({
+      fetchFn: async () => new Response("reached"),
+    });
+    const raw = await transport.send({
+      method: "GET",
+      url: "http://rebind.example:1/x",
+      headers: {},
+      body: null,
+      signal: null,
+      meta: {},
+    } as never);
+    assert.equal(raw.status, 200, "the caller's fetch owns its own resolution");
+  });
+
+  it("is disabled by allowPrivateNetwork, which is the documented opt-out", async () => {
+    const transport = new FetchTransport({
+      allowPrivateNetwork: true,
+      fetchFn: async () => new Response("reached"),
+    });
+    const raw = await transport.send({
+      method: "GET",
+      url: "http://localhost:1/x",
+      headers: {},
+      body: null,
+      signal: null,
+      meta: {},
+    } as never);
+    assert.equal(raw.status, 200, "the opt-out reaches the fetch implementation");
   });
 });

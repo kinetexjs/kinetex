@@ -24,6 +24,7 @@ Closes #
 ## Checklist
 
 ### Code Quality
+
 - [ ] `npm run typecheck` passes with 0 errors
 - [ ] `deno task check` passes with 0 errors
 - [ ] `deno lint` passes with 0 errors
@@ -33,23 +34,27 @@ Closes #
 - [ ] No new external dependencies added
 
 ### Tests
+
 - [ ] Existing tests still pass
 - [ ] New tests added for all new/changed functionality
 - [ ] Tests use real HTTP calls (no mocks)
 - [ ] Cross-runtime compatibility tested if applicable (Node, Deno, Bun)
 
 ### Documentation
+
 - [ ] README updated if public API changed (exports, config, new features)
 - [ ] JSDoc / TSDoc added for new public APIs
 - [ ] Changes reflected in relevant type definitions
 
 ### Breaking Changes (if applicable)
+
 - [ ] Breaking change documented in PR description
 - [ ] Migration path / instructions provided
 - [ ] Deprecation warnings added for old API with timeline for removal
 - [ ] Version bump noted (major/minor/patch)
 
 ### Security
+
 - [ ] No credentials, tokens, or secrets exposed
 - [ ] No new prototype pollution vectors introduced
 - [ ] No SSRF or open redirect vectors introduced
@@ -68,11 +73,13 @@ Closes #
 <!-- If this is a breaking change, provide clear before/after examples. -->
 
 **Before:**
+
 ```typescript
 // old usage
 ```
 
 **After:**
+
 ```typescript
 // new usage
 ```

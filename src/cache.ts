@@ -679,6 +679,16 @@ function computeTTL(response: CacheableResponse, defaultTtl: number, honor: bool
     return { ttlMs: 0, swrMs: 0, staleOnError: 0, shouldCache: false };
   }
 
+  // `private` marks a response as belonging to a single user. A browser's cache
+  // *is* per-user, so storing it there is correct — but this cache is a Map in
+  // the calling process, shared by every request that process makes. Honouring
+  // the directive is the difference between one user's `private` response and
+  // another user's. `d.private` was parsed and then never read, so a response
+  // that explicitly asked not to be shared was stored and replayed anyway.
+  if (honor && d.private) {
+    return { ttlMs: 0, swrMs: 0, staleOnError: 0, shouldCache: false };
+  }
+
   // s-maxage takes priority (for shared/proxy caches)
   const maxAgeSecs = d.sMaxAge ?? d.maxAge;
 

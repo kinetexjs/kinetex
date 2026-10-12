@@ -1702,11 +1702,21 @@ function decodePunycode(input: string): string {
     const delim = input.lastIndexOf("-");
     const output: number[] = [];
 
+    // RFC 3492 §6.2: the basic part is everything before the *last* delimiter,
+    // so it may contain any basic code point — "-" included. Testing it for
+    // alphanumerics only rejected legal input: "xn--abc-def-" and "xn--a--"
+    // both carry a hyphen inside their basic part, and were returned
+    // undecoded. That left the A-label and its U-label looking like two
+    // different cookie domains, so one host could be registered twice.
+    //
+    // The decoder only ever inserts code points >= initialN (0x80), so the
+    // result can never contain a "." and cannot re-split the domain. Control
+    // characters and non-ASCII are still refused, since neither is a basic
+    // code point and both would be unsafe in a canonicalized cookie domain.
     const basic = delim >= 0 ? input.slice(0, delim) : "";
     for (let j = 0; j < basic.length; j++) {
       const cp = basic.charCodeAt(j);
-      if (cp > 0x7a || (cp > 0x5a && cp < 0x61) || (cp > 0x39 && cp < 0x41) || cp < 0x30)
-        return input;
+      if (cp >= 0x80 || cp < 0x20 || cp === 0x7f) return input;
       output.push(cp);
     }
 
@@ -1780,6 +1790,23 @@ let _domainToUnicode: ((label: string) => string) | undefined;
  * @returns Decoded label (e.g., "中国") or original if not punycode
  */
 export function decodeIDNLabel(label: string): string {
+  // A dotted input is a domain, not a single label. Split it and decode each
+  // label, so a full domain answers the same however many labels it has and
+  // whichever decoder ends up handling it.
+  //
+  // This has to happen before the `xn--` test below. Previously a dotted input
+  // that did not *begin* with `xn--` — "sub.xn--bcdf-zna1d.co.uk" — returned
+  // untouched, and one that did was handed whole to the single-label decoder,
+  // which failed on the dot. Whether the lazily-imported `node:url` helper had
+  // resolved decided which of those happened, so the same input could decode or
+  // not depending on module load timing.
+  if (label.includes(".")) {
+    return label
+      .split(".")
+      .map((part) => decodeIDNLabel(part))
+      .join(".");
+  }
+
   if (!label.toLowerCase().startsWith("xn--")) {
     return label;
   }

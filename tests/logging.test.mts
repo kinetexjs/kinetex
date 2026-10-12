@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 import { kinetex } from "../src/mod.ts";
 import {
   ConsoleTransport,
@@ -14,9 +15,22 @@ import {
   BatchingTransport,
   toOTelSpan,
 } from "../src/logging.ts";
-import type { ErrorLogEntry, LogLevelName, LogTransport, LogEntry } from "../src/logging.ts";
+import type {
+  ErrorLogEntry,
+  LogLevelName,
+  LogTransport,
+  LogEntry,
+  RequestLogEntry,
+  ResponseLogEntry,
+} from "../src/logging.ts";
 
-const bin = kinetex({ baseURL: "https://httpbin.org", maxAttempts: 1 });
+// The local httpbin server, so these cases stop depending on a third party.
+// `allowPrivateNetwork` is the documented opt-in for reaching loopback.
+const bin = kinetex({
+  baseURL: HTTPBIN_LOCAL_ORIGIN,
+  retry: { maxRetries: 0 },
+  allowPrivateNetwork: true,
+});
 
 let passed = 0,
   failed = 0;
@@ -26,7 +40,7 @@ function suite(name: string) {
   console.log(`\n${name}`);
 }
 
-async function test(name: string, fn: () => Promise<void>) {
+async function test(name: string, fn: () => Promise<void> | void) {
   try {
     await fn();
     console.log(`  ✅ ${name}`);
@@ -38,15 +52,18 @@ async function test(name: string, fn: () => Promise<void>) {
   }
 }
 
-function assertEqual<T>(a: T, b: T) {
-  if (a !== b) throw new Error(`Expected ${JSON.stringify(b)} got ${JSON.stringify(a)}`);
+function assertEqual<T>(a: T, b: T, note?: string) {
+  if (a !== b)
+    throw new Error(
+      `Expected ${JSON.stringify(b)} got ${JSON.stringify(a)}${note ? ` (${note})` : ""}`,
+    );
 }
 
 function assertOk(val: unknown, msg?: string) {
   assert.ok(val, msg);
 }
 
-const makeReq = (o: Partial<LogEntry> = {}): LogEntry => ({
+const makeReq = (o: Partial<RequestLogEntry> = {}): RequestLogEntry => ({
   type: "request",
   requestId: "test-123",
   timestamp: "2024-01-01T00:00:00.000Z",
@@ -62,7 +79,7 @@ const makeReq = (o: Partial<LogEntry> = {}): LogEntry => ({
   ...o,
 });
 
-const makeRes = (o: Partial<LogEntry> = {}): LogEntry =>
+const makeRes = (o: Partial<ResponseLogEntry> = {}): ResponseLogEntry =>
   ({
     type: "response",
     requestId: "test-123",
@@ -79,9 +96,9 @@ const makeRes = (o: Partial<LogEntry> = {}): LogEntry =>
     meta: {},
     durationMs: 150,
     ...o,
-  }) as LogEntry;
+  }) as ResponseLogEntry;
 
-const makeErr = (o: Partial<LogEntry> = {}): LogEntry =>
+const makeErr = (o: Partial<ErrorLogEntry> = {}): ErrorLogEntry =>
   ({
     type: "error",
     requestId: "test-123",
@@ -97,7 +114,7 @@ const makeErr = (o: Partial<LogEntry> = {}): LogEntry =>
     attempt: 1,
     meta: {},
     ...o,
-  }) as LogEntry;
+  }) as ErrorLogEntry;
 
 // ── Log levels ─────────────────────────────────────────────────────────────
 
@@ -488,8 +505,18 @@ suite("MultiTransport");
 
 await test("MultiTransport writes to all transports", async () => {
   let c = 0;
-  const t1: LogTransport = { write: () => c++, flush: async () => {} };
-  const t2: LogTransport = { write: () => c++, flush: async () => {} };
+  const t1: LogTransport = {
+    write: () => {
+      c++;
+    },
+    flush: async () => {},
+  };
+  const t2: LogTransport = {
+    write: () => {
+      c++;
+    },
+    flush: async () => {},
+  };
   new MultiTransport([t1, t2]).write(makeReq());
   assertEqual(c, 2);
 });
@@ -998,7 +1025,9 @@ await test("regression: ConsoleTransport works with partial options", async () =
   // reaches — threw "this.onWrite is not a function" on the first write.
   const origLog = console.log;
   const seen: string[] = [];
-  console.log = (s: string) => seen.push(s);
+  console.log = (s: string) => {
+    seen.push(s);
+  };
   try {
     const t = new ConsoleTransport({});
     assert.doesNotThrow(() => t.write(makeReq()), "a bare options object must not throw");
@@ -1027,7 +1056,9 @@ await test("regression: ConsoleTransport pretty default does not depend on the c
   // "Defaults to true in non-production".
   const origLog = console.log;
   const seen: string[] = [];
-  console.log = (s: string) => seen.push(s);
+  console.log = (s: string) => {
+    seen.push(s);
+  };
   try {
     new ConsoleTransport().write(makeReq());
   } finally {

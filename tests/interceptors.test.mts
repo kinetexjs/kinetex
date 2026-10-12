@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
+import { fromKinetexResponse, makeInterceptorRequest } from "./fixtures.ts";
+import type { Dispatcher, InterceptorRequest, InterceptorResponse } from "../src/interceptors.ts";
+import type { RequestInterceptor, ResponseInterceptor } from "../src/types.ts";
 import process from "node:process";
 import {
   kinetex,
@@ -20,9 +24,24 @@ import {
 
 let passed = 0,
   failed = 0;
+
+/**
+ * The parsed body of a response the manager passed through.
+ *
+ * `InterceptorManager.execute()` is declared to return `InterceptorResponse`,
+ * the pipeline's own view of a response — which carries no parsed body and no
+ * cache flag. The dispatcher underneath returns a real `KinetexResponse`, which
+ * does. These assertions are about the response the caller actually received,
+ * so read them through here rather than repeating the cast.
+ */
+type Body<T> = T & { data?: Record<string, unknown>; cached?: boolean };
+
+function body<T extends Record<string, unknown>>(response: InterceptorResponse): Body<T> {
+  return response as unknown as Body<T>;
+}
 const failures: Array<{ name: string; err: unknown }> = [];
 
-async function test(name: string, fn: () => Promise<void>): Promise<void> {
+async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
     await fn();
     console.log(`  ✅  ${name}`);
@@ -39,15 +58,15 @@ function suite(name: string): void {
 }
 
 const T = 30_000;
-const bin = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+const bin = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
 
 // ── REAL HTTP ────────────────────────────────────────────────────────────
 suite("REAL HTTP");
 await test("GET /get", async () => assert.equal((await bin.get("/get")).status, 200));
 await test("POST echoes JSON", async () =>
-  assert.deepEqual((await bin.post("/post", { a: 1 })).data.json, { a: 1 }));
+  assert.deepEqual((await bin.post<{ json: unknown }>("/post", { a: 1 })).data.json, { a: 1 }));
 test("/uuid", async () => {
-  const res = await bin.get("/uuid");
+  const res = await bin.get<{ uuid: string }>("/uuid");
   assert.equal(res.status, 200);
   // Must be a well-formed v4 UUID, not merely a truthy string.
   assert.match(
@@ -56,21 +75,24 @@ test("/uuid", async () => {
   );
 });
 test("/ip", async () => {
-  const res = await bin.get("/ip");
+  const res = await bin.get<{ origin: string }>("/ip");
   assert.equal(res.status, 200);
   assert.match(res.data.origin, /^[0-9a-f:.]+$/i);
 });
 test("/headers", async () => {
-  const res = await bin.get("/headers");
+  const res = await bin.get<{ headers: Record<string, string> }>("/headers");
   assert.equal(res.status, 200);
   assert.equal(typeof res.data.headers, "object");
-  // httpbin echoes the request headers it received; Host is always present
-  // and proves the request actually carried headers end to end.
-  assert.ok(res.data.headers["Host"], "expected the Host header to be echoed");
-  assert.equal(typeof res.data.headers["Host"], "string");
+  // httpbin echoes the request headers it received; Host is always present and
+  // proves the request actually carried headers end to end. Looked up
+  // lower-cased: header names are case-insensitive on the wire and kinetex
+  // sends them that way, which is correct. httpbin echoes the casing its own
+  // client chose, so asserting "Host" here would pin the test to that accident.
+  assert.ok(res.data.headers["host"], "expected the Host header to be echoed");
+  assert.equal(typeof res.data.headers["host"], "string");
 });
 test("/json", async () => {
-  const res = await bin.get("/json");
+  const res = await bin.get<{ slideshow: { slides: unknown[] } }>("/json");
   assert.equal(res.status, 200);
   assert.equal(typeof res.data.slideshow, "object");
   assert.ok(Array.isArray(res.data.slideshow.slides), "expected slideshow.slides to be an array");
@@ -140,8 +162,8 @@ await test("priority ordering", async () => {
     { priority: 1 },
   );
   await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
-    async () => await bin.get("/get"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    (async () => await bin.get("/get")) as unknown as Dispatcher,
   );
   assert.deepEqual(order, [1, 10]);
 });
@@ -155,12 +177,12 @@ await test("once auto-ejects", async () => {
     { once: true },
   );
   await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
-    async () => await bin.get("/get"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    (async () => await bin.get("/get")) as unknown as Dispatcher,
   );
   await m.execute(
-    { url: "https://httpbin.org/uuid", method: "GET", headers: {} },
-    async () => await bin.get("/uuid"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/uuid`, method: "GET", headers: {} }),
+    (async () => await bin.get("/uuid")) as unknown as Dispatcher,
   );
   assert.equal(count, 1);
 });
@@ -174,13 +196,13 @@ await test("condition filters", async () => {
     { condition: (ctx) => ctx.request.url.includes("/uuid") },
   );
   await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
-    async () => await bin.get("/get"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    (async () => await bin.get("/get")) as unknown as Dispatcher,
   );
   assert.equal(count, 0);
   await m.execute(
-    { url: "https://httpbin.org/uuid", method: "GET", headers: {} },
-    async () => await bin.get("/uuid"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/uuid`, method: "GET", headers: {} }),
+    (async () => await bin.get("/uuid")) as unknown as Dispatcher,
   );
   assert.equal(count, 1);
 });
@@ -193,8 +215,8 @@ await test("retry passes on 200", async () => {
   m.useResponse(retry.responseInterceptor);
   m.useError(retry.errorInterceptor);
   const res = await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
-    async () => await bin.get("/get"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    (async () => await bin.get("/get")) as unknown as Dispatcher,
   );
   assert.equal(res.status, 200);
 });
@@ -213,7 +235,11 @@ await test("retry with status 500 exhausts retries", async () => {
   // is 500 whether the retry fired once or not at all.
   let calls = 0;
   const res = await m.execute(
-    { url: "https://httpbin.org/status/500", method: "GET", headers: {} },
+    makeInterceptorRequest({
+      url: `${HTTPBIN_LOCAL_ORIGIN}/status/500`,
+      method: "GET",
+      headers: {},
+    }),
     async () => {
       calls++;
       return {
@@ -234,7 +260,11 @@ await test("retry with status 500 exhausts retries", async () => {
   );
   assert.equal(res.status, 500);
   assert.equal(calls, 2, "maxRetries: 1 means exactly one retry, i.e. two dispatches");
-  assert.equal(res.data.attempt, 2, "the final response must come from the second dispatch");
+  assert.equal(
+    body<{ attempt: number }>(res).data?.attempt,
+    2,
+    "the final response must come from the second dispatch",
+  );
 });
 
 // ── TIMEOUT INTERCEPTOR with real HTTP ───────────────────────────────────
@@ -246,8 +276,8 @@ await test("timeout on fast request", async () => {
   m.useResponse(timeout.responseInterceptor);
   m.useError(timeout.errorInterceptor);
   const res = await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
-    async () => await bin.get("/get"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    (async () => await bin.get("/get")) as unknown as Dispatcher,
   );
   assert.equal(res.status, 200);
 });
@@ -268,15 +298,16 @@ await test("auth injects Bearer token", async () => {
   // dispatcher actually receives and assert the token is on it.
   let seen: Record<string, string> | null = null;
   const res = await m.execute(
-    { url: "https://httpbin.org/headers", method: "GET", headers: {} },
-    async (req) => {
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/headers`, method: "GET", headers: {} }),
+    async (req: InterceptorRequest) => {
       seen = req.headers;
-      return await bin.get<{ headers: Record<string, string> }>("/headers");
+      const real = await bin.get<{ headers: Record<string, string> }>("/headers");
+      return real as unknown as InterceptorResponse;
     },
   );
   assert.equal(res.status, 200);
-  assert.ok(seen, "the dispatcher must have been called");
-  assert.equal(seen.authorization, "Bearer test-token");
+  assert.ok(seen !== null, "the dispatcher must have been called");
+  assert.equal((seen as Record<string, string>).authorization, "Bearer test-token");
 });
 
 // ── LOGGING INTERCEPTOR with real HTTP ───────────────────────────────────
@@ -294,8 +325,8 @@ await test("logging fires", async () => {
   m.useRequest(logging.requestInterceptor);
   m.useResponse(logging.responseInterceptor);
   const res = await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
-    async () => await bin.get("/get"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    (async () => await bin.get("/get")) as unknown as Dispatcher,
   );
   console.log("    Logs count:", logs.length, "Response status:", res.status);
   // `>= 1 || status === 200` is satisfied by a successful call alone, so it
@@ -308,16 +339,16 @@ await test("logging fires", async () => {
 suite("HAR interceptor");
 await test("HAR records entries", async () => {
   const har = createHARInterceptor();
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
-  client.useRequest(har.requestInterceptor);
-  client.useResponse(har.responseInterceptor);
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
+  client.useRequest(har.requestInterceptor as unknown as RequestInterceptor);
+  client.useResponse(har.responseInterceptor as unknown as ResponseInterceptor);
   await client.get("/get");
   await client.get("/uuid");
   const entries = har.getHAR().entries;
   // Exactly the two requests made — no duplicates, none dropped.
   assert.equal(entries.length, 2);
-  assert.equal(entries[0]!.request.url, "https://httpbin.org/get");
-  assert.equal(entries[1]!.request.url, "https://httpbin.org/uuid");
+  assert.equal(entries[0]!.request.url, `${HTTPBIN_LOCAL_ORIGIN}/get`);
+  assert.equal(entries[1]!.request.url, `${HTTPBIN_LOCAL_ORIGIN}/uuid`);
   for (const e of entries) {
     assert.equal(e.response.status, 200);
     assert.ok(e.startedDateTime, "entry must record startedDateTime");
@@ -328,7 +359,7 @@ await test("HAR records entries", async () => {
 suite("Metrics interceptor");
 await test("metrics snapshot", async () => {
   const metrics = createMetricsInterceptor();
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   client.useRequest(metrics.requestInterceptor);
   client.useResponse(metrics.responseInterceptor);
   await client.get("/get");
@@ -346,15 +377,21 @@ await test("dedupe coalesces concurrent GETs", async () => {
   m.useResponse(d.responseInterceptor);
   m.useError(d.errorInterceptor);
   let callCount = 0;
-  const dispatcher = async () => {
+  const dispatcher = async (_req: InterceptorRequest): Promise<InterceptorResponse> => {
     callCount++;
-    return await bin.get<{ uuid: string }>("/uuid");
+    return (await bin.get<{ uuid: string }>("/uuid")) as unknown as InterceptorResponse;
   };
   const [a, b] = await Promise.all([
-    m.execute({ url: "https://httpbin.org/uuid", method: "GET", headers: {} }, dispatcher),
-    m.execute({ url: "https://httpbin.org/uuid", method: "GET", headers: {} }, dispatcher),
+    m.execute(
+      makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/uuid`, method: "GET", headers: {} }),
+      dispatcher,
+    ),
+    m.execute(
+      makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/uuid`, method: "GET", headers: {} }),
+      dispatcher,
+    ),
   ]);
-  assert.equal((a as any).data.uuid, (b as any).data.uuid);
+  assert.equal(body(a).data?.uuid, body(b).data?.uuid);
   // Both responses are equal, but only if the leader's promise was shared.
   assert.equal(callCount, 1, "two concurrent GETs of the same URL must dispatch once");
 });
@@ -363,27 +400,36 @@ await test("dedupe coalesces concurrent GETs", async () => {
 suite("Cache interceptor");
 await test("cache interceptor caches responses", async () => {
   const m = new InterceptorManager();
-  const cache = createCacheInterceptor({ ttlMs: 5000 });
+  const cache = createCacheInterceptor({ defaultTtlMs: 5000 });
   m.useRequest(cache.requestInterceptor);
   m.useResponse(cache.responseInterceptor);
   let callCount = 0;
-  const dispatcher = async () => {
+  const dispatcher = async (_req: InterceptorRequest): Promise<InterceptorResponse> => {
     callCount++;
-    return await bin.get<{ uuid: string }>("/uuid");
+    return (await bin.get<{ uuid: string }>("/uuid")) as unknown as InterceptorResponse;
   };
   const r1 = await m.execute(
-    { url: "https://httpbin.org/uuid", method: "GET", headers: {} },
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/uuid`, method: "GET", headers: {} }),
     dispatcher,
   );
   assert.equal(callCount, 1);
   // A single execute cannot distinguish "cached" from "never cached", so make a
   // second one: the dispatcher must not run again and the hit must be flagged.
   const r2 = await m.execute(
-    { url: "https://httpbin.org/uuid", method: "GET", headers: {} },
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/uuid`, method: "GET", headers: {} }),
     dispatcher,
   );
   assert.equal(callCount, 1, "the second execute must be served from the cache");
-  assert.equal(r1.data?.uuid, r2.data?.uuid, "the cached response must be replayed");
+  // `execute()` returns an `InterceptorResponse`, which carries the *raw* body
+  // rather than a parsed `data` field, so decode it. Reading `.data` returned
+  // undefined for both responses and the equality check passed vacuously.
+  const body = (r: unknown): { uuid?: string } | undefined => {
+    const raw = (r as { body?: string | Uint8Array | null }).body;
+    if (raw === null || raw === undefined) return undefined;
+    const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
+    return JSON.parse(text) as { uuid?: string };
+  };
+  assert.equal(body(r1)?.uuid, body(r2)?.uuid, "the cached response must be replayed");
 });
 
 // ── RATE-LIMIT INTERCEPTOR with real HTTP ────────────────────────────────
@@ -392,18 +438,24 @@ await test("rate limit passes through", async () => {
   const m = new InterceptorManager();
   m.useRequest(createRateLimitInterceptor({ limit: 50, windowMs: 1000, queue: false }));
   const res = await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
-    async () => await bin.get("/get"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    (async () => await bin.get("/get")) as unknown as Dispatcher,
   );
   assert.equal(res.status, 200);
 });
 await test("rate limit without queue throws on excess", async () => {
   const m = new InterceptorManager();
   m.useRequest(createRateLimitInterceptor({ limit: 1, windowMs: 60000, queue: false }));
-  const dispatcher = async () => await bin.get("/get");
-  await m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, dispatcher);
+  const dispatcher = async () => (await bin.get("/get")) as unknown as InterceptorResponse;
+  await m.execute(
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    dispatcher,
+  );
   try {
-    await m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, dispatcher);
+    await m.execute(
+      makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+      dispatcher,
+    );
     assert.fail("should throw");
   } catch (e: any) {
     assert.ok(e instanceof RateLimitError);
@@ -454,12 +506,18 @@ await test("dedupe error interceptor rejects waiters on leader failure", async (
   m.useResponse(dedupe.responseInterceptor);
   m.useError(dedupe.errorInterceptor);
   const results = await Promise.allSettled([
-    m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, async () => {
-      throw new Error("leader-fail");
-    }),
-    m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, async () => {
-      throw new Error("leader-fail");
-    }),
+    m.execute(
+      makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+      async () => {
+        throw new Error("leader-fail");
+      },
+    ),
+    m.execute(
+      makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+      async () => {
+        throw new Error("leader-fail");
+      },
+    ),
   ]);
   assert.equal(results[0].status, "rejected", "First (leader) should reject");
   assert.equal(
@@ -478,20 +536,18 @@ await test("computeBodySize handles various body types", () => {
 // Cache interceptor SWR + 304 paths: mock-style test
 await test("cache interceptor SWR and 304 paths", async () => {
   // Use cache interceptor with a known endpoint
-  const cache = createCacheInterceptor({ ttlMs: 5000 });
+  const cache = createCacheInterceptor({ defaultTtlMs: 5000 });
   const m = new InterceptorManager();
   m.useRequest(cache.requestInterceptor);
   m.useResponse(cache.responseInterceptor);
   // First call caches
   const r1 = await m.execute(
-    { url: "https://httpbin.org/uuid", method: "GET", headers: {} },
-    async () => await bin.get<{ uuid: string }>("/uuid"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/uuid`, method: "GET", headers: {} }),
+    (async () => await bin.get<{ uuid: string }>("/uuid")) as unknown as Dispatcher,
   );
-  assert.equal(typeof r1.data?.uuid, "string");
-  assert.match(
-    r1.data?.uuid as string,
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
-  );
+  const body = (r1 as unknown as { data?: { uuid?: string } }).data;
+  assert.equal(typeof body?.uuid, "string");
+  assert.match(body?.uuid ?? "", /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
 });
 
 // Rate-limit interval cleanup (lines 1175-1177): mock setTimeout to fire once
@@ -500,8 +556,8 @@ await test("rate-limit interval cleanup on empty pending", async () => {
   const rateLimit = createRateLimitInterceptor({ limit: 50, windowMs: 1000, queue: false });
   m.useRequest(rateLimit);
   const res = await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
-    async () => await bin.get("/get"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    (async () => await bin.get("/get")) as unknown as Dispatcher,
   );
   assert.equal(res.status, 200);
 });
@@ -513,13 +569,16 @@ await test("HAR records with string body via execute", async () => {
   m.useRequest(har.requestInterceptor);
   m.useResponse(har.responseInterceptor);
   await m.execute(
-    {
-      url: "https://httpbin.org/post",
+    makeInterceptorRequest({
+      url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
       method: "POST",
       headers: { "content-type": "text/plain" },
       body: "test-body",
-    },
-    async () => await bin.post("/post", "test-body", { headers: { "content-type": "text/plain" } }),
+    }),
+    async () =>
+      fromKinetexResponse(
+        await bin.post("/post", "test-body", { headers: { "content-type": "text/plain" } }),
+      ),
   );
   const entries = har.getHAR().entries;
   assert.equal(entries.length, 1);
@@ -529,11 +588,20 @@ await test("HAR records with string body via execute", async () => {
 await test("rate limit queues excess", async () => {
   const m = new InterceptorManager();
   m.useRequest(createRateLimitInterceptor({ limit: 2, windowMs: 1000, queue: true, maxQueue: 10 }));
-  const dispatcher = async () => await bin.get("/get");
+  const dispatcher = async () => (await bin.get("/get")) as unknown as InterceptorResponse;
   const results = await Promise.allSettled([
-    m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, dispatcher),
-    m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, dispatcher),
-    m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, dispatcher),
+    m.execute(
+      makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+      dispatcher,
+    ),
+    m.execute(
+      makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+      dispatcher,
+    ),
+    m.execute(
+      makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+      dispatcher,
+    ),
   ]);
   assert.equal(results.filter((r) => r.status === "fulfilled").length, 3);
 });
@@ -546,12 +614,12 @@ await test("HAR records entries", async () => {
   m.useRequest(har.requestInterceptor);
   m.useResponse(har.responseInterceptor);
   await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
-    async () => await bin.get("/get"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    (async () => await bin.get("/get")) as unknown as Dispatcher,
   );
   await m.execute(
-    { url: "https://httpbin.org/uuid", method: "GET", headers: {} },
-    async () => await bin.get("/uuid"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/uuid`, method: "GET", headers: {} }),
+    (async () => await bin.get("/uuid")) as unknown as Dispatcher,
   );
   const entries = har.getHAR().entries;
   assert.equal(entries.length, 2);
@@ -569,8 +637,8 @@ await test("metrics snapshot", async () => {
   m.useRequest(metrics.requestInterceptor);
   m.useResponse(metrics.responseInterceptor);
   await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
-    async () => await bin.get("/get"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    (async () => await bin.get("/get")) as unknown as Dispatcher,
   );
   const s = metrics.snapshot();
   assert.equal(typeof s.totalRequests, "number");
@@ -581,20 +649,20 @@ await test("metrics snapshot", async () => {
 suite("Cache interceptor");
 await test("cache interceptor caches responses", async () => {
   const m = new InterceptorManager();
-  const cache = createCacheInterceptor({ ttlMs: 5000 });
+  const cache = createCacheInterceptor({ defaultTtlMs: 5000 });
   m.useRequest(cache.requestInterceptor);
   m.useResponse(cache.responseInterceptor);
   let callCount = 0;
-  const dispatcher = async () => {
+  const dispatcher = async (_req: InterceptorRequest): Promise<InterceptorResponse> => {
     callCount++;
-    return await bin.get<{ uuid: string }>("/uuid");
+    return (await bin.get<{ uuid: string }>("/uuid")) as unknown as InterceptorResponse;
   };
   const r1 = await m.execute(
-    { url: "https://httpbin.org/uuid", method: "GET", headers: {} },
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/uuid`, method: "GET", headers: {} }),
     dispatcher,
   );
   assert.equal(callCount, 1);
-  assert.ok(r1.data?.uuid);
+  assert.ok(body(r1).data?.uuid);
 });
 
 // Cache SWR: a stale entry is revalidated with a conditional request, and the
@@ -647,7 +715,7 @@ await test("cache SWR revalidates and restores the stale body on 304", async () 
   };
 
   const r1 = await m.execute(
-    { url: "https://x.test/v", method: "GET", headers: {} } as any,
+    makeInterceptorRequest({ url: "https://x.test/v", method: "GET", headers: {} }) as any,
     dispatcher,
   );
   assert.equal(r1.status, 200);
@@ -658,7 +726,7 @@ await test("cache SWR revalidates and restores the stale body on 304", async () 
   // stale-while-revalidate window, so it is revalidated rather than discarded.
   await new Promise((r) => setTimeout(r, 1200));
   const r2 = await m.execute(
-    { url: "https://x.test/v", method: "GET", headers: {} } as any,
+    makeInterceptorRequest({ url: "https://x.test/v", method: "GET", headers: {} }) as any,
     dispatcher,
   );
   assert.equal(dispatches, 2, "a stale-but-revalidatable entry must be revalidated, not dropped");
@@ -668,31 +736,33 @@ await test("cache SWR revalidates and restores the stale body on 304", async () 
     "revalidation must send if-none-match from the stored etag",
   );
   assert.equal(r2.status, 200, "a 304 with a stale entry must be restored to the cached response");
-  assert.deepEqual(r2.data, { v: 1 }, "the stale body must be replayed");
+  assert.deepEqual(body(r2).data, { v: 1 }, "the stale body must be replayed");
 
   // The 304 refresh reset createdAt, so the entry is fresh again (max-age=1
   // from the stale entry's own cache-control) and must be served from cache.
   const r3 = await m.execute(
-    { url: "https://x.test/v", method: "GET", headers: {} } as any,
+    makeInterceptorRequest({ url: "https://x.test/v", method: "GET", headers: {} }) as any,
     dispatcher,
   );
   assert.equal(dispatches, 2, "the refreshed entry is fresh and must not be refetched");
-  assert.deepEqual(r3.data, { v: 1 });
+  assert.deepEqual(body(r3).data, { v: 1 });
 });
 
 // Cache 304: mock 304 response — the response returns 304 (restoration is internal)
 await test("cache 304 response is handled", async () => {
-  const cache = createCacheInterceptor({ ttlMs: 5000 });
+  const cache = createCacheInterceptor({ defaultTtlMs: 5000 });
   const m = new InterceptorManager();
   m.useRequest(cache.requestInterceptor);
   m.useResponse(cache.responseInterceptor);
   let callNum = 0;
-  const dispatcher = async () => {
+  // The manager's dispatcher must return an `InterceptorResponse`; a
+  // KinetexResponse carries `data`/`rawBody` and the manager reads `body`.
+  const dispatcher = async (req: InterceptorRequest): Promise<InterceptorResponse> => {
     callNum++;
     if (callNum === 1) {
       const res = await bin.get("/get");
       return {
-        ...res,
+        ...fromKinetexResponse(res),
         headers: {
           ...res.headers,
           etag: '"x"',
@@ -704,20 +774,17 @@ await test("cache 304 response is handled", async () => {
       status: 304,
       statusText: "Not Modified",
       headers: { etag: '"x"' },
-      data: null,
-      rawBody: null,
-      url: "",
-      cached: false,
-      redirected: false,
-      httpVersion: "HTTP/1.1",
-      durationMs: 0,
-      request: null as any,
-      attempt: 0,
+      body: null,
+      raw: null,
+      request: req,
     };
   };
-  await m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, dispatcher);
+  await m.execute(
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    dispatcher,
+  );
   const r2 = await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
     dispatcher,
   );
   // `max-age=0` means the response is never stored (the interceptor skips
@@ -725,19 +792,23 @@ await test("cache 304 response is handled", async () => {
   // is surfaced as-is. This is the "server answered 304 with nothing to restore"
   // path; the real revalidation path is covered by the SWR test above.
   assert.equal(r2.status, 304);
-  assert.equal(r2.cached, false);
+  // There is no `cached` flag on an InterceptorResponse, and reading one off the
+  // parsed body asserted `undefined === false` — a failure, but for the wrong
+  // reason. What "not restored from the cache" actually means here is that the
+  // second execute still reached the dispatcher.
+  assert.equal(callNum, 2, "with no stale entry the second execute must hit the dispatcher");
   assert.equal(callNum, 2, "the second execute must revalidate rather than serve the entry");
 });
 
 // ── RATE-LIMIT INTERCEPTOR with real HTTP ────────────────────────────────
 suite("Rate-limit interceptor");
 await test("rate limit passes through", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   client.useRequest(createRateLimitInterceptor({ limit: 50, windowMs: 1000, queue: false }));
   assert.equal((await client.get("/get")).status, 200);
 });
 await test("rate limit queues excess requests", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   client.useRequest(
     createRateLimitInterceptor({ limit: 2, windowMs: 1000, queue: true, maxQueue: 10 }),
   );
@@ -776,13 +847,17 @@ await test("suite with rateLimit config", () => {
     rateLimit: { limit: 10, windowMs: 1000, queue: true, maxQueue: 5 },
   });
   assert.equal(s.manager instanceof InterceptorManager, true);
-  assert.equal(s.rateLimit, undefined, "rateLimit is folded into the manager, not returned");
+  assert.equal(
+    (s as unknown as Record<string, unknown>).rateLimit,
+    undefined,
+    "rateLimit is folded into the manager, not returned",
+  );
 });
 await test("suite with auth config", () => {
   const s = createInterceptorSuite({
     timeout: { timeoutMs: 5000 },
     retry: { maxRetries: 1 },
-    auth: { type: "bearer", token: "test" },
+    auth: { scheme: "Bearer ", getToken: () => "test" },
   });
   assert.equal(s.manager instanceof InterceptorManager, true);
   assert.equal(s.auth !== null, true, "auth config must produce an auth interceptor");
@@ -824,13 +899,13 @@ await test("HAR handles Uint8Array request body", async () => {
   m.useRequest(har.requestInterceptor);
   m.useResponse(har.responseInterceptor);
   await m.execute(
-    {
-      url: "https://httpbin.org/post",
+    makeInterceptorRequest({
+      url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
       method: "POST",
       headers: { "content-type": "application/json" },
       body: new TextEncoder().encode(JSON.stringify({ a: 1 })),
-    },
-    async () => await bin.post("/post", { a: 1 }),
+    }),
+    async () => fromKinetexResponse(await bin.post("/post", { a: 1 })),
   );
   const log = har.getHAR();
   assert.equal(log.entries.length, 1);
@@ -846,13 +921,13 @@ await test("HAR handles ArrayBuffer request body", async () => {
   m.useResponse(har.responseInterceptor);
   const buf = new TextEncoder().encode(JSON.stringify({ b: 2 })).buffer as ArrayBuffer;
   await m.execute(
-    {
-      url: "https://httpbin.org/post",
+    makeInterceptorRequest({
+      url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: buf,
-    },
-    async () => await bin.post("/post", { b: 2 }),
+      body: new TextEncoder().encode(JSON.stringify({ b: 2 })).buffer,
+    }),
+    async () => fromKinetexResponse(await bin.post("/post", { b: 2 })),
   );
   const log = har.getHAR();
   assert.equal(log.entries.length, 1);
@@ -865,14 +940,16 @@ await test("HAR handles string request body", async () => {
   m.useRequest(har.requestInterceptor);
   m.useResponse(har.responseInterceptor);
   await m.execute(
-    {
-      url: "https://httpbin.org/post",
+    makeInterceptorRequest({
+      url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
       method: "POST",
       headers: { "content-type": "text/plain" },
       body: "plain string",
-    },
+    }),
     async () =>
-      await bin.post("/post", "plain string", { headers: { "content-type": "text/plain" } }),
+      fromKinetexResponse(
+        await bin.post("/post", "plain string", { headers: { "content-type": "text/plain" } }),
+      ),
   );
   const log = har.getHAR();
   assert.equal(log.entries.length, 1);
@@ -887,17 +964,20 @@ await test("HAR reads uppercase Content-Type", async () => {
   const m = new InterceptorManager();
   m.useRequest(har.requestInterceptor);
   m.useResponse(har.responseInterceptor);
-  await m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, async () => {
-    const r = await bin.get("/get");
-    // Construct response with ONLY uppercase Content-Type header
-    const upperHeaders: Record<string, string> = {};
-    for (const [k, v] of Object.entries(r.headers)) {
-      upperHeaders[k.toUpperCase()] = v;
-    }
-    delete upperHeaders["CONTENT-TYPE"]; // ensure lowercase is missing
-    upperHeaders["Content-Type"] = "application/json";
-    return { ...r, headers: upperHeaders };
-  });
+  await m.execute(
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    async () => {
+      const r = fromKinetexResponse(await bin.get("/get"));
+      // Construct response with ONLY uppercase Content-Type header
+      const upperHeaders: Record<string, string> = {};
+      for (const [k, v] of Object.entries(r.headers)) {
+        upperHeaders[k.toUpperCase()] = v;
+      }
+      delete upperHeaders["CONTENT-TYPE"]; // ensure lowercase is missing
+      upperHeaders["Content-Type"] = "application/json";
+      return { ...r, headers: upperHeaders };
+    },
+  );
   const entries = har.getHAR().entries;
   assert.equal(entries.length, 1);
   assert.equal(entries[0].response.content.mimeType, "application/json");
@@ -912,12 +992,18 @@ await test("rate-limit refill processes queue", async () => {
   let callCount = 0;
   const dispatcher = async () => {
     callCount++;
-    return await bin.get("/get");
+    return (await bin.get("/get")) as unknown as InterceptorResponse;
   };
   // First request consumes the token, second queues, third queues
   const results = await Promise.allSettled([
-    m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, dispatcher),
-    m.execute({ url: "https://httpbin.org/get", method: "GET", headers: {} }, dispatcher),
+    m.execute(
+      makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+      dispatcher,
+    ),
+    m.execute(
+      makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+      dispatcher,
+    ),
   ]);
   assert.equal(results.filter((r) => r.status === "fulfilled").length, 2);
   assert.equal(callCount, 2);
@@ -933,8 +1019,8 @@ await test("retry interceptor response/error paths", async () => {
   m.useResponse(retry.responseInterceptor);
   m.useError(retry.errorInterceptor);
   const res = await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
-    async () => await bin.get("/get"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    (async () => await bin.get("/get")) as unknown as Dispatcher,
   );
   assert.equal(res.status, 200);
 });
@@ -947,8 +1033,8 @@ await test("timeout interceptor via manager", async () => {
   m.useResponse(to.responseInterceptor);
   m.useError(to.errorInterceptor);
   const res = await m.execute(
-    { url: "https://httpbin.org/get", method: "GET", headers: {} },
-    async () => await bin.get("/get"),
+    makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+    (async () => await bin.get("/get")) as unknown as Dispatcher,
   );
   assert.equal(res.status, 200);
 });
@@ -962,12 +1048,12 @@ await test("dedupe different URLs are independent", async () => {
   m.useError(d.errorInterceptor);
   const results = await Promise.allSettled([
     m.execute(
-      { url: "https://httpbin.org/get", method: "GET", headers: {} },
-      async () => await bin.get("/get"),
+      makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/get`, method: "GET", headers: {} }),
+      (async () => await bin.get("/get")) as unknown as Dispatcher,
     ),
     m.execute(
-      { url: "https://httpbin.org/uuid", method: "GET", headers: {} },
-      async () => await bin.get("/uuid"),
+      makeInterceptorRequest({ url: `${HTTPBIN_LOCAL_ORIGIN}/uuid`, method: "GET", headers: {} }),
+      (async () => await bin.get("/uuid")) as unknown as Dispatcher,
     ),
   ]);
   assert.equal(results.filter((r) => r.status === "fulfilled").length, 2);
@@ -979,8 +1065,8 @@ await test("suite full config works", () => {
     timeout: { timeoutMs: 5000 },
     retry: { maxRetries: 1 },
     rateLimit: { limit: 50, windowMs: 60000, queue: false, maxQueue: 100 },
-    auth: { type: "bearer", token: "test" },
-    cache: { ttlMs: 1000 },
+    auth: { scheme: "Bearer ", getToken: () => "test" },
+    cache: { defaultTtlMs: 1000 },
     logging: { logRequests: true, logResponses: true },
   });
   assert.equal(s.manager instanceof InterceptorManager, true);
@@ -1059,7 +1145,9 @@ await test("regression: Retry-After accepts only delta-seconds or an HTTP-date",
       baseDelayMs: 120,
       jitter: 0,
       maxDelayMs: 60_000,
-      onRetry: (_ctx, delayMs) => seen.push(delayMs),
+      onRetry: (_ctx, delayMs) => {
+        seen.push(delayMs);
+      },
     });
     await responseInterceptor({
       attempt: 1,
@@ -1096,7 +1184,9 @@ await test("regression: maxDelayMs is a hard cap even with jitter", async () => 
       baseDelayMs: 10_000,
       maxDelayMs: 500,
       jitter: 1,
-      onRetry: (_ctx, delayMs) => seen.push(delayMs),
+      onRetry: (_ctx, delayMs) => {
+        seen.push(delayMs);
+      },
     });
     await retry.responseInterceptor({
       attempt: 3,
@@ -1113,7 +1203,9 @@ await test("regression: maxDelayMs is a hard cap even with jitter", async () => 
 await test("regression: logging redacts the configured header names", async () => {
   const entries: any[] = [];
   const logging = createLoggingInterceptor({
-    logger: (e) => entries.push(e),
+    logger: (e) => {
+      entries.push(e);
+    },
     redactHeaders: ["Authorization", "X-Api-Key"],
   });
   const m = new InterceptorManager();
@@ -1142,7 +1234,11 @@ await test("regression: logging redacts the configured header names", async () =
 
 await test("regression: logging redacts by default and on the error phase", async () => {
   const entries: any[] = [];
-  const logging = createLoggingInterceptor({ logger: (e) => entries.push(e) });
+  const logging = createLoggingInterceptor({
+    logger: (e) => {
+      entries.push(e);
+    },
+  });
   const m = new InterceptorManager();
   m.useRequest(logging.requestInterceptor);
   m.useError(logging.errorInterceptor);
@@ -1183,6 +1279,144 @@ await test("regression: HAR response bodySize counts UTF-8 bytes", async () => {
   assert.equal(entry.response.bodySize, 9);
   assert.equal(entry.response.content.size, 9);
   assert.equal(entry.response.content.text, "日本語");
+});
+
+// The auth interceptor's refresh machinery — the single-flight queue, the
+// failure path and the refresh circuit breaker — had no coverage at all, and it
+// is the part that decides whether a 401 storm becomes one token refresh or
+// hundreds.
+const mkCtx401 = (): any => {
+  const request: any = {
+    headers: {},
+    url: "https://api.example/x",
+    method: "GET",
+    body: null,
+    signal: null,
+    meta: {},
+  };
+  return {
+    request,
+    response: { status: 401, statusText: "Unauthorized", headers: {}, body: null, request },
+    error: null,
+    startedAt: 0,
+    attempt: 1,
+    aborted: false,
+  };
+};
+
+await test("concurrent 401s share one token refresh", async () => {
+  let calls = 0;
+  let token = "v1";
+  const auth = createAuthInterceptor({
+    getToken: () => token,
+    refreshToken: async () => {
+      calls++;
+      await new Promise((r) => setTimeout(r, 20));
+      token = "v2";
+      return "v2";
+    },
+  });
+  const outs = await Promise.all(
+    Array.from({ length: 8 }, () => auth.responseInterceptor(mkCtx401())),
+  );
+  assert.equal(calls, 1, "8 concurrent 401s must not become 8 refreshes");
+  const headers = outs.map((o: any) => o?.headers?.authorization);
+  assert.ok(
+    headers.every((h) => h === "Bearer v2"),
+    "every waiter gets the new token",
+  );
+});
+
+await test("a failed refresh rejects every waiter and records the failure", async () => {
+  let calls = 0;
+  const auth = createAuthInterceptor({
+    getToken: () => "v1",
+    refreshToken: async () => {
+      calls++;
+      await new Promise((r) => setTimeout(r, 10));
+      throw new Error("refresh endpoint down");
+    },
+    refreshRetryDelay: 30_000,
+  });
+  const results = await Promise.allSettled(
+    Array.from(
+      { length: 4 },
+      () => auth.responseInterceptor(mkCtx401() as never) as Promise<unknown>,
+    ),
+  );
+  assert.equal(calls, 1, "the refresh is attempted once for the whole burst");
+  for (const r of results) {
+    assert.equal(r.status, "rejected", "a failed refresh must reject, not hang");
+  }
+
+  // The circuit breaker must then refuse a retry outright rather than hammering
+  // a dead refresh endpoint on every 401.
+  let second = 0;
+  const auth2 = createAuthInterceptor({
+    getToken: () => "v1",
+    refreshToken: async () => {
+      second++;
+      throw new Error("again");
+    },
+    refreshRetryDelay: 30_000,
+  });
+  await Promise.resolve(auth2.responseInterceptor(mkCtx401() as never)).catch(() => undefined);
+  await assert.rejects(
+    () => Promise.resolve(auth2.responseInterceptor(mkCtx401() as never)),
+    /circuit breaker/i,
+    "a second refresh inside the window must be refused by the breaker",
+  );
+  assert.equal(second, 1, "and must not have called refreshToken again");
+});
+
+await test("the refresh queue is bounded and refuses to grow without limit", async () => {
+  // An explicitly-typed holder: assigning a resolver inside a Promise executor
+  // leaves TS narrowing `release` to `null` at every use site, which is a
+  // property of control-flow analysis, not of the code.
+  const gate = { release: (): void => {} };
+  const opened = new Promise<void>((r) => {
+    gate.release = r;
+  });
+  const auth = createAuthInterceptor({
+    getToken: () => "v1",
+    refreshToken: async () => {
+      await opened;
+      return "v2";
+    },
+    maxQueue: 3,
+  });
+  const inFlight = auth.responseInterceptor(mkCtx401() as never) as Promise<unknown>;
+  const queued = [
+    auth.responseInterceptor(mkCtx401() as never) as Promise<unknown>,
+    auth.responseInterceptor(mkCtx401() as never) as Promise<unknown>,
+    auth.responseInterceptor(mkCtx401() as never) as Promise<unknown>,
+  ];
+  // `responseInterceptor` is typed as possibly returning a value rather than a
+  // promise, so the rejection is observed through a wrapper fn.
+  await assert.rejects(
+    async () => {
+      await auth.responseInterceptor(mkCtx401() as never);
+    },
+    /queue full/i,
+    "the queue must refuse rather than grow",
+  );
+  gate.release();
+  await Promise.allSettled([inFlight, ...queued]);
+});
+
+await test("no 401 status, no refresh", async () => {
+  let calls = 0;
+  const auth = createAuthInterceptor({
+    getToken: () => "v1",
+    refreshToken: async () => {
+      calls++;
+      return "v2";
+    },
+  });
+  const ctx = mkCtx401();
+  ctx.response = { ...ctx.response, status: 403 };
+  assert.equal(await auth.responseInterceptor(ctx as never), undefined);
+  assert.equal(calls, 0, "a non-401 must never trigger a refresh");
 });
 
 await test("regression: s-maxage never sets the stored TTL", async () => {

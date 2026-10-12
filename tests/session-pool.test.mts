@@ -30,7 +30,7 @@
 
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:https";
-import { createSecureServer, type SecureServer } from "node:http2";
+import { createSecureServer, constants, type Http2SecureServer } from "node:http2";
 import type { AddressInfo } from "node:net";
 import type { TLSSocket } from "node:tls";
 import { execFileSync } from "node:child_process";
@@ -140,7 +140,9 @@ async function startEchoServer(): Promise<Harness> {
       res.end("ok");
     },
   );
-  server.on("secureConnection", (s: TLSSocket) => sockets.push(s));
+  server.on("secureConnection", (s: TLSSocket) => {
+    sockets.push(s);
+  });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const { port } = server.address() as AddressInfo;
   return {
@@ -148,7 +150,7 @@ async function startEchoServer(): Promise<Harness> {
     sockets,
     close: () =>
       new Promise<void>((r) => {
-        server.closeAllConnections?.();
+        (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
         server.close(() => r());
       }),
   };
@@ -168,16 +170,19 @@ interface H2Harness {
  * origins — enough to drive the LRU cap without standing up a second listener.
  */
 async function startH2Server(): Promise<H2Harness> {
-  const server: SecureServer = createSecureServer({
+  const server: Http2SecureServer = createSecureServer({
     key: readFileSync(join(tmpDir as string, "localhost-key.pem")),
     cert: ca as string,
     allowHTTP1: false,
   });
-  server.on("stream", (stream, headers) => {
-    void headers;
-    stream.respond({ ":status": 200, "content-type": "text/plain" });
-    stream.end("ok");
-  });
+  server.on(
+    "stream",
+    (stream: import("node:http2").ServerHttp2Stream, headers: Record<string, unknown>) => {
+      void headers;
+      stream.respond({ ":status": 200, "content-type": "text/plain" });
+      stream.end("ok");
+    },
+  );
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const { port } = server.address() as AddressInfo;
   return {
@@ -191,7 +196,7 @@ async function startH2Server(): Promise<H2Harness> {
         // never exited — it printed "17 passed, 0 failed" and then hung until
         // the runner killed it. `server.close()` is what actually releases the
         // listening handle; the HTTPS harness above already does both.
-        server.closeAllConnections?.();
+        (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
         server.close(() => r());
       }),
   };
@@ -301,7 +306,7 @@ await test("createTransport forwards every option it claims to", () => {
     assert.equal(priv<number>(t, "_connectTimeoutMs"), 55);
     assert.equal(priv<number>(t, "_requestTimeoutMs"), 66);
   } finally {
-    t.destroy();
+    (t as unknown as { destroy: () => void }).destroy();
   }
 });
 
@@ -323,7 +328,7 @@ await test("createTransport forwards ca, strict, onDroppedHeader and proxy", () 
     assert.equal(priv<unknown>(t, "_onDroppedHeader"), onDroppedHeader);
     assert.deepEqual(priv<unknown>(t, "_proxy"), proxy);
   } finally {
-    t.destroy();
+    (t as unknown as { destroy: () => void }).destroy();
   }
 });
 
@@ -343,7 +348,7 @@ if (!HAVE_OPENSSL) {
 } else {
   await test("reuses one TLS socket across sequential requests", async () => {
     const h = await startEchoServer();
-    const transport = new NodeHTTP2Transport({ ca: ca as string });
+    const transport = new NodeHTTP2Transport({ ca: ca as string, allowPrivateNetwork: true });
     try {
       await withoutFetch(async () => {
         for (let i = 0; i < 4; i++) {
@@ -366,7 +371,11 @@ if (!HAVE_OPENSSL) {
 
   await test("the keep-alive agent is built lazily and only once", async () => {
     const h = await startEchoServer();
-    const transport = new NodeHTTP2Transport({ ca: ca as string, http1MaxSockets: 4 });
+    const transport = new NodeHTTP2Transport({
+      ca: ca as string,
+      http1MaxSockets: 4,
+      allowPrivateNetwork: true,
+    });
     try {
       assert.equal(priv(transport, "_http1Agent"), null, "no agent before the first request");
       await withoutFetch(async () => {
@@ -392,7 +401,11 @@ if (!HAVE_OPENSSL) {
 
   await test("http1KeepAlive:false builds no agent", async () => {
     const h = await startEchoServer();
-    const transport = new NodeHTTP2Transport({ ca: ca as string, http1KeepAlive: false });
+    const transport = new NodeHTTP2Transport({
+      ca: ca as string,
+      http1KeepAlive: false,
+      allowPrivateNetwork: true,
+    });
     try {
       // Socket counts cannot prove this: on Node 19+ the global agent we fall
       // back to keeps sockets alive anyway. Assert we build no agent instead.
@@ -410,7 +423,7 @@ if (!HAVE_OPENSSL) {
     // Without `ca` reaching this path, the self-signed cert would be rejected
     // and the request would fail rather than return 200.
     const h = await startEchoServer();
-    const transport = new NodeHTTP2Transport({ ca: ca as string });
+    const transport = new NodeHTTP2Transport({ ca: ca as string, allowPrivateNetwork: true });
     try {
       const raw = await withoutFetch(() => transport.send(echoRequest(h.url)));
       if (raw.body) await readRawBody(raw.body, 0, h.url, null);
@@ -423,7 +436,7 @@ if (!HAVE_OPENSSL) {
 
   await test("destroy() drains the legacy keep-alive pool", async () => {
     const h = await startEchoServer();
-    const transport = new NodeHTTP2Transport({ ca: ca as string });
+    const transport = new NodeHTTP2Transport({ ca: ca as string, allowPrivateNetwork: true });
     await withoutFetch(async () => {
       const raw = await transport.send(echoRequest(h.url));
       if (raw.body) await readRawBody(raw.body, 0, h.url, null);
@@ -452,7 +465,7 @@ await test("createTransport forwards strict and onDroppedHeader to the fetch tra
     assert.equal(priv<boolean>(t, "strict"), true, "strict must reach FetchTransport");
     assert.equal(priv<unknown>(t, "onDroppedHeader"), onDroppedHeader);
   } finally {
-    t.destroy?.();
+    (t as unknown as { destroy?: () => void }).destroy?.();
   }
 });
 
@@ -465,7 +478,11 @@ if (!HAVE_OPENSSL) {
 } else {
   await test("evicts the least-recently-used session once maxSessions is reached", async () => {
     const h = await startH2Server();
-    const transport = new NodeHTTP2Transport({ ca: ca as string, maxSessions: 1 });
+    const transport = new NodeHTTP2Transport({
+      ca: ca as string,
+      maxSessions: 1,
+      allowPrivateNetwork: true,
+    });
     try {
       const first = await transport.send(h2Request(h.urlA, ca as string));
       if (first.body) await readRawBody(first.body, 0, h.urlA, null);
@@ -499,6 +516,9 @@ if (!HAVE_OPENSSL) {
       ca: ca as string,
       maxSessions: 10,
       sessionTTLMs: 1,
+      // Loopback server started by this suite; see the note in `mkTransport`
+      // in h2-header-drop.test.mts for why this opt-in is explicit.
+      allowPrivateNetwork: true,
     });
     try {
       const first = await transport.send(h2Request(h.urlA, ca as string));
@@ -520,7 +540,11 @@ if (!HAVE_OPENSSL) {
 
   await test("a repeated request reuses the cached session instead of evicting", async () => {
     const h = await startH2Server();
-    const transport = new NodeHTTP2Transport({ ca: ca as string, maxSessions: 1 });
+    const transport = new NodeHTTP2Transport({
+      ca: ca as string,
+      maxSessions: 1,
+      allowPrivateNetwork: true,
+    });
     try {
       for (let i = 0; i < 3; i++) {
         const raw = await transport.send(h2Request(h.urlA, ca as string));

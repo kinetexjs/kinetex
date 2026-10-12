@@ -728,6 +728,7 @@ function isBlockedIPv6(b: Uint8Array): boolean {
 export function isSafeURL(
   url: string | URL,
   allowedSchemes: string[] = ["http", "https"],
+  options: { allowPrivateNetwork?: boolean } = {},
 ): boolean {
   try {
     const parsed = typeof url === "string" ? new URL(url) : url;
@@ -743,22 +744,28 @@ export function isSafeURL(
       return false;
     }
 
-    let host = parsed.hostname.toLowerCase();
-    const isV6Literal = host.startsWith("[") && host.endsWith("]");
-    if (isV6Literal) host = host.slice(1, -1);
+    // `allowPrivateNetwork` relaxes *only* the address checks below. Scheme,
+    // path traversal, hostname length, URL length and port validation are not
+    // about where the socket lands, so they still apply — otherwise opting in to
+    // a loopback fixture would also silently opt in to `file:` and `../`.
+    if (!options.allowPrivateNetwork) {
+      let host = parsed.hostname.toLowerCase();
+      const isV6Literal = host.startsWith("[") && host.endsWith("]");
+      if (isV6Literal) host = host.slice(1, -1);
 
-    // Block loopback hostnames (including *.localhost subdomains)
-    if (host === "localhost" || host.endsWith(".localhost") || host === "0.0.0.0") return false;
+      // Block loopback hostnames (including *.localhost subdomains)
+      if (host === "localhost" || host.endsWith(".localhost") || host === "0.0.0.0") return false;
 
-    // Block private/reserved IPs (SSRF prevention) — numeric comparison over
-    // expanded bytes so every IPv6 spelling and numeric IPv4 form is covered.
-    if (isV6Literal || host.includes(":")) {
-      const v6 = parseIPv6Host(host);
-      // Unparseable IPv6 literal → reject defensively
-      if (v6 === null || isBlockedIPv6(v6)) return false;
-    } else {
-      const v4 = parseIPv4Host(host);
-      if (v4 !== null && isBlockedIPv4(v4)) return false;
+      // Block private/reserved IPs (SSRF prevention) — numeric comparison over
+      // expanded bytes so every IPv6 spelling and numeric IPv4 form is covered.
+      if (isV6Literal || host.includes(":")) {
+        const v6 = parseIPv6Host(host);
+        // Unparseable IPv6 literal → reject defensively
+        if (v6 === null || isBlockedIPv6(v6)) return false;
+      } else {
+        const v4 = parseIPv4Host(host);
+        if (v4 !== null && isBlockedIPv4(v4)) return false;
+      }
     }
 
     // Check for suspicious patterns (path traversal)
@@ -784,6 +791,35 @@ export function isSafeURL(
   } catch {
     return false;
   }
+}
+
+/**
+ * True when a literal IPv4/IPv6 address falls in a blocked range.
+ *
+ * The same decision `isSafeURL` makes about a hostname, applied to an address
+ * that has already been resolved. Kept separate from `isSafeURL` because the two
+ * answer different questions: `isSafeURL` reads what the caller wrote, this
+ * reads what the resolver returned. Both are needed — see
+ * `createPinnedLookup` in `core.ts`, which is the only thing that stops a
+ * hostname that resolves to a private address from being dialled.
+ *
+ * IPv4 literals are accepted in every form a resolver can return (dotted-quad
+ * and numeric); anything unparseable is treated as blocked, so an address this
+ * cannot understand fails closed rather than open.
+ */
+export function isBlockedAddress(address: string): boolean {
+  const host = address.trim().toLowerCase();
+  if (host.startsWith("[") && host.endsWith("]")) return true;
+  if (host === "" || host === "localhost" || host.endsWith(".localhost")) return true;
+
+  if (host.includes(":")) {
+    const v6 = parseIPv6Host(host);
+    return v6 === null || isBlockedIPv6(v6);
+  }
+  // A resolver returns dotted-quad, but `parseIPv4Host` also accepts the
+  // numeric spellings, and a non-IP string must not be read as "safe".
+  const v4 = parseIPv4Host(host);
+  return v4 === null || isBlockedIPv4(v4);
 }
 
 /**
@@ -963,14 +999,14 @@ export function formatError(error: unknown): string {
  * another, so the function whose entire job is to turn an error into a string
  * threw instead, taking the `catch` that was logging it down with it.
  */
-function safeStringify(value: unknown): string {
+export function safeStringify(value: unknown, circularMarker = "[Circular]"): string {
   const seen = new Set<object>();
   try {
     return (
       JSON.stringify(value, (_key, v: unknown) => {
         if (typeof v === "bigint") return v.toString();
         if (typeof v === "object" && v !== null) {
-          if (seen.has(v)) return "[Circular]";
+          if (seen.has(v)) return circularMarker;
           seen.add(v);
         }
         return v;
@@ -1044,13 +1080,13 @@ export function perfNow(): number {
  */
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) {
-    return Promise.reject(_abortError());
+    return Promise.reject(abortError());
   }
 
   return new Promise((resolve, reject) => {
     const onAbort = () => {
       clearTimeout(timer);
-      reject(_abortError());
+      reject(abortError());
     };
 
     const timer = setTimeout(() => {
@@ -1120,6 +1156,57 @@ export function toUint8Array(data: string | Uint8Array | ArrayBuffer | unknown):
  * @param bytes The buffer to encode.
  * @returns Base64-encoded string.
  */
+/**
+ * SHA-256 of a string or byte array, as lowercase hex.
+ *
+ * The `ArrayBuffer` slice is not optional. `crypto.subtle.digest` takes an
+ * `ArrayBuffer`, and a `Uint8Array`'s `.buffer` is the whole backing store —
+ * pass it directly and a view that starts partway into a larger buffer gets
+ * hashed from offset zero, hashing the wrong bytes. Three copies of this
+ * function existed and one of them made exactly that mistake.
+ */
+/**
+ * Copy `headers`, replacing the value of any name in `sensitive` with `mask`.
+ *
+ * The comparison is case-insensitive because HTTP header names are, and the
+ * caller's set is folded once here rather than at each call site — which is
+ * what `noUncheckedIndexedAccess` makes expensive elsewhere, where every
+ * consumer ends up writing `headers["x"] ?? headers["X"]` to find a header that
+ * was only ever stored under one spelling.
+ *
+ * `mask` is a parameter rather than a constant because four call sites already
+ * disagreed on it: the logger and the lifecycle hooks wrote `"***"`, the
+ * logging interceptor wrote `"**REDACTED**"`, and the HAR recorder wrote
+ * `"***REDACTED***"`. Those strings are observable in log output, so unifying
+ * them is a behaviour change and is deliberately not made here — but they are
+ * now in one function, so a future decision to converge is a one-line edit.
+ */
+/** True when `name` is one of `sensitive`, compared case-insensitively. */
+export function isSensitiveHeader(name: string, sensitive: ReadonlySet<string>): boolean {
+  return sensitive.has(name.toLowerCase());
+}
+
+export function redactHeaders(
+  headers: Record<string, string>,
+  sensitive: ReadonlySet<string>,
+  mask: string,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    out[k] = isSensitiveHeader(k, sensitive) ? mask : v;
+  }
+  return out;
+}
+
+export async function sha256Hex(data: string | Uint8Array): Promise<string> {
+  const raw = typeof data === "string" ? new TextEncoder().encode(data) : data;
+  const buf = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer;
+  const hash = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 export function uint8ArrayToBase64(bytes: Uint8Array): string {
   // Process in 3-byte (24-bit) aligned chunks to avoid padding issues mid-stream.
   // 3 × 2¹³ = 24 576 bytes per chunk — keeps individual strings small.
@@ -1205,7 +1292,7 @@ export function mergeSignals(
   // abort: fire the controller and clean up ALL listeners immediately.
   const abort = () => {
     for (const s of validSignals) s.removeEventListener("abort", abort);
-    controller.abort(_abortError());
+    controller.abort(abortError());
   };
 
   for (const s of validSignals) s.addEventListener("abort", abort, { once: true });
@@ -1265,11 +1352,20 @@ export function randomBytes(byteCount: number): string {
 }
 
 // Cross-runtime error creation: DOMException may not exist in all runtimes.
-function _abortError(): Error {
+/**
+ * A platform-shaped abort rejection: a `DOMException` named `AbortError` where
+ * one exists, and a plain `Error` carrying the same name where it does not.
+ *
+ * `message` is a parameter because two callers need different text for the same
+ * event, and they had each written this function. It is deliberately not
+ * `AbortError` from `types.ts`: that is a `KinetexError` with code `EABORT`, a
+ * different and equally deliberate contract used by the request pipeline.
+ */
+export function abortError(message = "Aborted"): Error {
   if (typeof DOMException !== "undefined") {
-    return new DOMException("Aborted", "AbortError");
+    return new DOMException(message, "AbortError");
   }
-  const err = new Error("Aborted");
+  const err = new Error(message);
   err.name = "AbortError";
   return err;
 }

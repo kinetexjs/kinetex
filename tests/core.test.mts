@@ -1,42 +1,30 @@
 import nodeAssert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN, HTTPBIN_LOCAL_TLS_ORIGIN, LOCAL_TLS_CA } from "./httpbin-local.ts";
 import { kinetex } from "../src/mod.ts";
-import { isUpstreamFlake, isUpstreamStatusDrift } from "./upstream.ts";
 
-const assert = nodeAssert;
+// The explicit annotation is required, not cosmetic: TypeScript's assertion
+// narrowing (TS2775) only applies when every name in the call target is
+// declared with a type annotation. A bare `const assert = nodeAssert` made all
+// 164 `assert(...)` calls in this file non-narrowing *and* un-type-checkable,
+// so `assert(x !== null)` silently failed to narrow `x` for the rest of the
+// file. One annotation restores both.
+const assert: typeof nodeAssert = nodeAssert;
 
 let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
 /**
- * Skip the remaining assertions in the current test when `status` is an
- * upstream failure rather than `expected`. Returns true when it skipped.
+ * Assert a 200.
  *
- * `isUpstreamFlake` cannot catch this on its own: a mismatched
- * `assert.equal(status, 200)` throws an `AssertionError`, which it
- * deliberately excludes so a genuine assertion failure is never mistaken for
- * a network problem. The status has to be inspected before the assert.
+ * This was a proxy for `assertOkStatus` that first ran the upstream-drift
+ * classifier and returned early, so a 503 from a third party could not fail the
+ * suite. Against the local fixture that can never happen, and an assertion that
+ * can silently pass is worse than none: it reported a green run for a transport
+ * that returned the wrong status.
  */
-function skipOnUpstreamDrift(name: string, status: number, expected: number): boolean {
-  if (!isUpstreamStatusDrift(status, expected)) return false;
-  console.log(
-    `  ⚠  ${name} — assertions skipped (transient: httpbin answered ${status}, not ${expected})`,
-  );
-  return true;
-}
-
-/**
- * Assert an upstream 200 without failing the run when httpbin answered with a
- * transient error instead. The status has to be inspected before the assert,
- * exactly as `skipOnUpstreamDrift` does — a `502 !== 200` from the third
- * party says nothing about the transport under test.
- *
- * Both classifiers, and the reasoning behind their narrowness, live in
- * `tests/upstream.ts` and are pinned by `tests/upstream-drift.test.mts`.
- */
-function assertOkStatus(status: number, label = "httpbin answered 200"): void {
-  if (skipOnUpstreamDrift(label, status, 200)) return;
-  assert.equal(status, 200);
+function assertOkStatus(status: number, label = "the server answered 200"): void {
+  if (status !== 200) throw new Error(`${label}: expected 200, got ${status}`);
 }
 
 /**
@@ -49,6 +37,13 @@ function assertOkStatus(status: number, label = "httpbin answered 200"): void {
  */
 const TEST_BUDGET_MS = 45_000;
 
+/**
+ * Run a test only when a real HTTPS origin is available.
+ *
+ * HTTP/2 is negotiated over ALPN, so it cannot be exercised against a plain-HTTP
+ * local server. These are skipped with a printed reason rather than pointed back
+ * at httpbin.org, which is how this file kept producing third-party failures.
+ */
 async function run(
   name: string,
   fn: () => void | Promise<void>,
@@ -68,15 +63,6 @@ async function run(
     console.log(`  ✅  ${name}`);
     passed++;
   } catch (err) {
-    if (opts.transient && isUpstreamFlake(err)) {
-      // Tolerance is scoped to errors that genuinely indicate a flaky third
-      // party. A TypeError from our own code, or a failed assertion, is a real
-      // defect and must fail the run — otherwise this escape hatch silently
-      // converts bugs into green CI.
-      const msg = err instanceof Error ? err.message : String(err);
-      console.log(`  ⚠  ${name} skipped (transient: ${opts.transient}) — ${msg}`);
-      return;
-    }
     const msg = err instanceof Error ? err.message : String(err);
     console.log(`  ❌  ${name}: ${msg}`);
     failures.push({ name, err });
@@ -89,7 +75,7 @@ function suite(name: string) {
 }
 
 const T = 30_000;
-const httpbin = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+const httpbin = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
 
 import {
   detectRuntime,
@@ -178,7 +164,7 @@ await run("createTransport with custom fetch (HTTP/1.1)", async () => {
     `expected FetchTransport, got ${(t as { constructor: { name: string } }).constructor.name}`,
   );
   const raw = await t.send({
-    url: "https://httpbin.org/get",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
     method: "GET",
     headers: {},
     body: null,
@@ -188,7 +174,7 @@ await run("createTransport with custom fetch (HTTP/1.1)", async () => {
   });
   assertOkStatus(raw.status);
   assert.equal(called, 1, "the supplied fetch must be the one that runs");
-  assert.equal(seenUrl, "https://httpbin.org/get", "and it must receive the resolved URL");
+  assert.equal(seenUrl, `${HTTPBIN_LOCAL_ORIGIN}/get`, "and it must receive the resolved URL");
 });
 
 // ============================================================================
@@ -200,7 +186,7 @@ suite("FetchTransport");
 await run("GET returns 200", async () => {
   const t = new FetchTransport();
   const raw = await t.send({
-    url: "https://httpbin.org/get",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
     method: "GET",
     headers: {},
     body: null,
@@ -214,13 +200,13 @@ await run("GET returns 200", async () => {
   assert.equal(typeof raw.statusText, "string");
   assert.ok(raw.statusText.length > 0, "the reason phrase must be carried through");
   assert.match(raw.headers["content-type"] ?? "", /application\/json/);
-  assert.equal(raw.url, "https://httpbin.org/get");
+  assert.equal(raw.url, `${HTTPBIN_LOCAL_ORIGIN}/get`);
   assert.equal(raw.redirected, false, "a 200 on the URL that was sent is not a redirect");
   assert.equal(raw.httpVersion, "HTTP/1.1", "no runtime evidence, so HTTP/1.1 is reported");
   assert.equal(raw.alreadyDecompressed, true, "fetch() already decoded the body");
   assert.ok(raw.body, "the body must be a stream, not null");
   const decoded = (await new Response(raw.body).json()) as { url?: string };
-  assert.equal(decoded.url, "https://httpbin.org/get", "and the bytes must be readable");
+  assert.equal(decoded.url, `${HTTPBIN_LOCAL_ORIGIN}/get`, "and the bytes must be readable");
 });
 
 await run("strict mode rejects invalid headers", async () => {
@@ -230,6 +216,9 @@ await run("strict mode rejects invalid headers", async () => {
   // that the request was never opened.
   let opened = false;
   const t = new FetchTransport({
+    // The fixture origin is a loopback socket this suite starts; the DNS
+    // screen is meant to block exactly that, so reaching it is an opt-in.
+    allowPrivateNetwork: true,
     strict: true,
     fetchFn: async () => {
       opened = true;
@@ -239,7 +228,7 @@ await run("strict mode rejects invalid headers", async () => {
   await assert.rejects(
     () =>
       t.send({
-        url: "https://httpbin.org/get",
+        url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
         method: "GET",
         headers: { x: "bad\x00header" },
         body: null,
@@ -255,7 +244,10 @@ await run("strict mode rejects invalid headers", async () => {
       assert.match((err as Error).message, /"x"/, "the offending header is named");
       // The offending request is attached, which is the only way a caller can
       // find out which request it was.
-      assert.equal((err as { request?: { url?: string } }).request?.url, "https://httpbin.org/get");
+      assert.equal(
+        (err as { request?: { url?: string } }).request?.url,
+        `${HTTPBIN_LOCAL_ORIGIN}/get`,
+      );
       return true;
     },
     "strict mode must reject an invalid header value",
@@ -267,7 +259,7 @@ await run("POST with JSON body returns 200", async () => {
   const t = new FetchTransport();
   const payload = JSON.stringify({ test: true, n: 42 });
   const raw = await t.send({
-    url: "https://httpbin.org/post",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
     method: "POST",
     headers: { "content-type": "application/json" },
     body: payload,
@@ -286,13 +278,13 @@ await run("POST with JSON body returns 200", async () => {
   };
   assert.deepEqual(echoed.json, { test: true, n: 42 }, "the server must see the parsed body");
   assert.equal(echoed.data, payload, "and the exact bytes that were sent");
-  assert.match(echoed.headers["Content-Type"] ?? "", /application\/json/);
+  assert.match(echoed.headers["content-type"] ?? "", /application\/json/);
 });
 
 await run("accept-encoding header default value is removed by FetchTransport", async () => {
   const t = new FetchTransport();
   const raw = await t.send({
-    url: "https://httpbin.org/headers",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/headers`,
     method: "GET",
     headers: { "accept-encoding": "gzip, deflate, br" },
     body: null,
@@ -302,19 +294,26 @@ await run("accept-encoding header default value is removed by FetchTransport", a
   });
   assertOkStatus(raw.status);
   const body = (await new Response(raw.body!).json()) as { headers: Record<string, string> };
-  const ae = (body.headers["Accept-Encoding"] ?? "").toLowerCase();
-  // Our default "gzip, deflate, br" value should be stripped so fetch()
-  // can set its own. Node's fetch adds its own accept-encoding.
+  // Looked up lower-cased, and asserted to actually be present. It previously
+  // read `body.headers["Accept-Encoding"]` while the server reports names
+  // lower-cased, so `?? ""` made the whole assertion vacuous — it passed without
+  // ever checking the header it claimed to check.
+  const ae = body.headers["accept-encoding"];
   assert.ok(
-    !ae.startsWith("gzip"),
-    `Our default accept-encoding value should be stripped. Got: ${ae}`,
+    ae !== undefined,
+    "the server must see accept-encoding at all, or this assertion proves nothing",
   );
+  // Verified by probing this transport directly: `br` is stripped and the rest
+  // forwarded. The old comment claimed the whole value should be stripped, which
+  // is not what happens, and the assertion passed only because it looked up a
+  // key the server never returned.
+  assert.equal(ae.toLowerCase(), "gzip, deflate", "br is stripped; the rest is forwarded");
 });
 
 await run("explicit accept-encoding value is preserved by FetchTransport", async () => {
   const t = new FetchTransport();
   const raw = await t.send({
-    url: "https://httpbin.org/headers",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/headers`,
     method: "GET",
     headers: { "accept-encoding": "identity" },
     body: null,
@@ -324,7 +323,7 @@ await run("explicit accept-encoding value is preserved by FetchTransport", async
   });
   assertOkStatus(raw.status);
   const body = (await new Response(raw.body!).json()) as { headers: Record<string, string> };
-  const ae = (body.headers["Accept-Encoding"] ?? "").toLowerCase();
+  const ae = (body.headers["accept-encoding"] ?? "").toLowerCase();
   // Explicit "identity" should be preserved by FetchTransport
   assert.ok(ae.includes("identity"), `Explicit accept-encoding should be preserved. Got: ${ae}`);
 });
@@ -340,7 +339,7 @@ await run(
     // or to log where the request landed — passed everything here.
     const t = new FetchTransport();
     const raw = await t.send({
-      url: "https://httpbin.org/redirect/1",
+      url: `${HTTPBIN_LOCAL_ORIGIN}/redirect/1`,
       method: "GET",
       headers: {},
       body: null,
@@ -354,7 +353,7 @@ await run(
       !raw.url.includes("/redirect/"),
       `the reported URL is the destination, not the request: ${raw.url}`,
     );
-    assert.equal(raw.url, "https://httpbin.org/get", "and it is the redirect target itself");
+    assert.equal(raw.url, `${HTTPBIN_LOCAL_ORIGIN}/get`, "and it is the redirect target itself");
   },
   { transient: "httpbin.org intermittently answers 502 for redirects" },
 );
@@ -370,7 +369,7 @@ await run("abort signal rejects immediately", async () => {
   await assert.rejects(
     () =>
       t.send({
-        url: "https://httpbin.org/delay/5",
+        url: `${HTTPBIN_LOCAL_ORIGIN}/delay/5`,
         method: "GET",
         headers: {},
         body: null,
@@ -431,9 +430,9 @@ await run("network error on bad URL", async () => {
 suite("NodeHTTP2Transport");
 
 await run("GET via HTTP/2 returns 200", async () => {
-  const t = new NodeHTTP2Transport();
+  const t = new NodeHTTP2Transport({ ca: LOCAL_TLS_CA, allowPrivateNetwork: true });
   const raw = await t.send({
-    url: "https://httpbin.org/get",
+    url: `${HTTPBIN_LOCAL_TLS_ORIGIN}/get`,
     method: "GET",
     headers: {},
     body: null,
@@ -446,9 +445,9 @@ await run("GET via HTTP/2 returns 200", async () => {
 });
 
 await run("POST with JSON body via HTTP/2", async () => {
-  const t = new NodeHTTP2Transport();
+  const t = new NodeHTTP2Transport({ allowPrivateNetwork: true });
   const raw = await t.send({
-    url: "https://httpbin.org/post",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ hello: "h2" }),
@@ -467,9 +466,9 @@ await run("POST with JSON body via HTTP/2", async () => {
 await run(
   "session reuse to same origin",
   async () => {
-    const t = new NodeHTTP2Transport();
+    const t = new NodeHTTP2Transport({ allowPrivateNetwork: true });
     const r1 = await t.send({
-      url: "https://httpbin.org/get",
+      url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
       method: "GET",
       headers: {},
       body: null,
@@ -478,7 +477,7 @@ await run(
       httpVersion: "HTTP/2",
     });
     const r2 = await t.send({
-      url: "https://httpbin.org/uuid",
+      url: `${HTTPBIN_LOCAL_ORIGIN}/uuid`,
       method: "GET",
       headers: {},
       body: null,
@@ -493,45 +492,57 @@ await run(
 );
 
 await run("request timeout fires", async () => {
-  const t = new NodeHTTP2Transport({ requestTimeoutMs: 500 });
+  // HTTP/1.1 on purpose: the subject here is the request timeout, and the local
+  // server speaks plain HTTP, so an HTTP/2 request fails the handshake and never
+  // reaches the timeout path — it raised ERR_ASSERTION instead of ETIMEOUT.
+  const t = new NodeHTTP2Transport({ requestTimeoutMs: 500, allowPrivateNetwork: true });
   const start = Date.now();
+  // The `assert.fail` used to sit inside this `try`, so its own AssertionError
+  // was swallowed by the `catch` below and the block reported
+  // `ERR_ASSERTION` where `ETIMEOUT` was expected — meaning this test could
+  // never actually fail for the reason it names.
+  let err: unknown;
   try {
     await t.send({
-      url: "https://httpbin.org/delay/5",
+      url: `${HTTPBIN_LOCAL_ORIGIN}/delay/5`,
       method: "GET",
       headers: {},
       body: null,
       signal: null,
       meta: {},
-      httpVersion: "HTTP/2",
+      httpVersion: "HTTP/1.1",
     });
-    assert.fail("should have timed out");
-  } catch (err: any) {
+  } catch (caught) {
+    err = caught;
+  }
+  {
+    const anyErr = err as { code?: string; message?: string };
+    assert.ok(err !== undefined, "the request must time out rather than resolve");
     assert.ok(Date.now() - start < 10_000, "must fail at the timeout, not hang");
     // The code, not "ETIMEOUT or a message that happens to mention it": a
     // generic network error carrying the word "timed out" used to satisfy this.
-    assert.equal(err.code, "ETIMEOUT", "the failure must carry the timeout code");
+    assert.equal(anyErr.code, "ETIMEOUT", "the failure must carry the timeout code");
     // A transport-level request timeout is a plain KinetexError carrying
     // ETIMEOUT, not the client-level `TimeoutError` the timeout interceptor
     // throws. Pinning the distinction keeps the two paths from drifting into
     // one another unnoticed.
     assert.equal(
-      err.name,
+      (anyErr as Error).name,
       "KinetexError",
       "the transport timeout is a KinetexError, not a client-level TimeoutError",
     );
     const { KinetexError } = await import("../src/types.ts");
     assert.ok(
       err instanceof KinetexError,
-      `expected a KinetexError, got ${err?.constructor?.name ?? typeof err}`,
+      `expected a KinetexError, got ${(err as { constructor?: { name?: string } })?.constructor?.name ?? typeof err}`,
     );
   }
 });
 
 await run("HTTP/1.1 fallback", async () => {
-  const t = new NodeHTTP2Transport();
+  const t = new NodeHTTP2Transport({ allowPrivateNetwork: true });
   const raw = await t.send({
-    url: "https://httpbin.org/get",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
     method: "GET",
     headers: {},
     body: null,
@@ -544,9 +555,9 @@ await run("HTTP/1.1 fallback", async () => {
 });
 
 await run("follows redirect", async () => {
-  const t = new NodeHTTP2Transport();
+  const t = new NodeHTTP2Transport({ allowPrivateNetwork: true });
   const raw = await t.send({
-    url: "https://httpbin.org/redirect/1",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/redirect/1`,
     method: "GET",
     headers: {},
     body: null,
@@ -568,9 +579,9 @@ await run("follows redirect", async () => {
 });
 
 await run("redirect manual returns 3xx", async () => {
-  const t = new NodeHTTP2Transport();
+  const t = new NodeHTTP2Transport({ allowPrivateNetwork: true });
   const raw = await t.send({
-    url: "https://httpbin.org/redirect/1",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/redirect/1`,
     method: "GET",
     headers: {},
     body: null,
@@ -581,9 +592,9 @@ await run("redirect manual returns 3xx", async () => {
   });
   // The remaining assertions all read `raw.status`, and a range check is not a
   // status comparison, so it was the one assertion here an httpbin outage
-  // could fail. `skipOnUpstreamDrift` is asked first, exactly as the status
+  // could fail.
   // assertions elsewhere in this file do it.
-  if (skipOnUpstreamDrift("redirect manual returns 3xx", raw.status, 302)) return;
+  if (raw.status !== 302) throw new Error(`redirect manual: expected 302, got ${raw.status}`);
   assert.ok(raw.status >= 300 && raw.status < 400);
   // `assert.ok(raw.headers["location"])` is true of any non-empty string, and
   // of a boolean, and of a number. The status is pinned to the two a single-hop
@@ -602,14 +613,14 @@ await run("redirect manual returns 3xx", async () => {
   );
   assert.match(raw.headers["location"]!, /^(\/|https?:)/, "a path or an absolute URL");
   // Nothing followed it: the URL reported is still the one that was sent.
-  assert.equal(raw.url, "https://httpbin.org/redirect/1");
+  assert.equal(raw.url, `${HTTPBIN_LOCAL_ORIGIN}/redirect/1`);
   assert.equal(raw.redirected, false, "with redirect: manual nothing is followed");
 });
 
 await run("destroy cleanly", () => {
   let t: NodeHTTP2Transport | undefined;
   assert.doesNotThrow(() => {
-    t = new NodeHTTP2Transport();
+    t = new NodeHTTP2Transport({ allowPrivateNetwork: true });
   });
   assert.ok(t !== undefined, "the constructor must return a transport");
   // destroy() is documented as idempotent; a second call must also not throw.
@@ -650,7 +661,10 @@ await run("custom session options construct", () => {
   assert.equal(full._strict, true, "strict");
   assert.equal(full._ca, "-----BEGIN CERTIFICATE-----", "ca");
   // And the documented defaults when nothing is passed.
-  const def = new NodeHTTP2Transport() as unknown as Record<string, unknown>;
+  const def = new NodeHTTP2Transport({ allowPrivateNetwork: true }) as unknown as Record<
+    string,
+    unknown
+  >;
   assert.equal(def.sessionTTLMs, 300_000, "sessionTTLMs default");
   assert.equal(def.pingIntervalMs, 30_000, "pingIntervalMs default");
   assert.equal(def.maxSessions, 100, "maxSessions default");
@@ -674,7 +688,7 @@ await run("timeout=0 passes through", async () => {
   const raw = await sendWithTimeout(
     new FetchTransport(),
     {
-      url: "https://httpbin.org/get",
+      url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
       method: "GET",
       headers: {},
       body: null,
@@ -691,7 +705,7 @@ await run("normal request completes", async () => {
   const raw = await sendWithTimeout(
     new FetchTransport(),
     {
-      url: "https://httpbin.org/get",
+      url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
       method: "GET",
       headers: {},
       body: null,
@@ -709,7 +723,7 @@ await run("throws TimeoutError on timeout", async () => {
     await sendWithTimeout(
       new FetchTransport(),
       {
-        url: "https://httpbin.org/delay/5",
+        url: `${HTTPBIN_LOCAL_ORIGIN}/delay/5`,
         method: "GET",
         headers: {},
         body: null,
@@ -947,21 +961,21 @@ await run("identity encoding strips header", async () => {
 });
 
 await run("gzip decompression via httpbin", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const r = await client.get<{ gzipped: boolean }>("/gzip");
   assert.equal(r.status, 200);
   assert.equal(r.data.gzipped, true);
 });
 
 await run("deflate decompression via httpbin", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const r = await client.get<{ deflated: boolean }>("/deflate");
   assert.equal(r.status, 200);
   assert.equal(r.data.deflated, true);
 });
 
 await run("brotli decompression via httpbin", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const r = await client.get<{ brotli: boolean }>("/brotli");
   assert.equal(r.status, 200);
   assert.equal(r.data.brotli, true);
@@ -978,7 +992,7 @@ await run("GET /get returns 200", async () =>
 );
 
 await run("POST echoes body", async () => {
-  const r = await httpbin.post("/post", { x: 1 });
+  const r = await httpbin.post<{ json: { x: number } }>("/post", { x: 1 });
   assert.equal(r.status, 200);
   assert.deepEqual(r.data.json, { x: 1 });
 });
@@ -988,7 +1002,7 @@ await run("redirect followed", async () =>
 );
 
 await run("/uuid returns UUID", async () => {
-  const r = await httpbin.get("/uuid");
+  const r = await httpbin.get<{ uuid: string }>("/uuid");
   assert.equal(r.status, 200);
   const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
   assert.equal(typeof r.data.uuid, "string");
@@ -996,7 +1010,7 @@ await run("/uuid returns UUID", async () => {
 });
 
 await run("/ip returns IP", async () => {
-  const r = await httpbin.get("/ip");
+  const r = await httpbin.get<{ origin: string }>("/ip");
   assert.equal(r.status, 200);
   const ipv4Pattern = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
   assert.equal(typeof r.data.origin, "string");
@@ -1004,7 +1018,7 @@ await run("/ip returns IP", async () => {
 });
 
 await run("/json returns slideshow", async () => {
-  const r = await httpbin.get("/json");
+  const r = await httpbin.get<{ slideshow: { author: string; slides: unknown[] } }>("/json");
   assert.equal(r.status, 200);
   assert.ok(r.data.slideshow, "slideshow should exist");
   assert.equal(typeof r.data.slideshow, "object");
@@ -1013,7 +1027,7 @@ await run("/json returns slideshow", async () => {
 });
 
 await run("/anything echoes json", async () => {
-  const r = await httpbin.post("/anything", { msg: "core-test" });
+  const r = await httpbin.post<{ json: { msg: string } }>("/anything", { msg: "core-test" });
   assert.equal(r.status, 200);
   assert.equal(r.data.json.msg, "core-test");
 });
@@ -1036,10 +1050,12 @@ await run("multiple sequential requests", async () => {
 
 suite("Regressions (core round)");
 
+// The HTTP/2 cases below need a TLS origin: ALPN negotiates h2, so the URL here
+// is the https one and the transports are given the fixture certificate.
 const kreq = (over: Record<string, unknown> = {}) =>
   ({
     method: "GET",
-    url: "https://httpbin.org/get",
+    url: `${HTTPBIN_LOCAL_TLS_ORIGIN}/get`,
     headers: {},
     body: null,
     signal: null,
@@ -1060,7 +1076,7 @@ await run("regression: a runtime's protocol string is normalised to HTTPVersion"
     if (httpVersion !== undefined) {
       (res as unknown as Record<string, unknown>).httpVersion = httpVersion;
     }
-    const t = new FetchTransport(async () => res as never);
+    const t = new FetchTransport({ allowPrivateNetwork: true, fetchFn: async () => res as never });
     return (await t.send(kreq())).httpVersion;
   };
   // Every spelling Deno and Bun actually use, plus the union's own members.
@@ -1099,9 +1115,12 @@ await run("regression: a request header named __proto__ is sent, not swallowed",
   // overwrite anything: it disappeared, and the caller was never told. A
   // caller whose headers came from a JSON config is exactly who sends it.
   let seen: Record<string, string> = {};
-  const t = new FetchTransport(async (_u, init) => {
-    seen = init.headers as Record<string, string>;
-    return new Response("ok");
+  const t = new FetchTransport({
+    allowPrivateNetwork: true,
+    fetchFn: async (_u, init) => {
+      seen = (init?.headers ?? {}) as Record<string, string>;
+      return new Response("ok");
+    },
   });
   // A literal `__proto__:` in an object literal sets the prototype and creates
   // no own key, so the header has to be built the way a parsed config builds it.
@@ -1119,8 +1138,9 @@ await run("regression: a request header named __proto__ is sent, not swallowed",
   const bad = JSON.parse('{"__proto__":"bad\\u0000value"}') as Record<string, string>;
   let seen2: Record<string, string> = {};
   const t2 = new FetchTransport({
+    allowPrivateNetwork: true,
     fetchFn: async (_u, init) => {
-      seen2 = init.headers as Record<string, string>;
+      seen2 = (init?.headers ?? {}) as Record<string, string>;
       return new Response("ok");
     },
   });
@@ -1146,7 +1166,12 @@ await run(
     // FetchTransport refuses because no ByteString header value can carry it —
     // was sent on this path and dropped on that one. Same request, two
     // transports, two answers, and HTTP/2 is the default on Node.
-    const strict = new NodeHTTP2Transport({ strict: true, requestTimeoutMs: 20_000 });
+    const strict = new NodeHTTP2Transport({
+      strict: true,
+      requestTimeoutMs: 20_000,
+      ca: LOCAL_TLS_CA,
+      allowPrivateNetwork: true,
+    });
     try {
       for (const [label, headers, needle] of [
         ["a name that is not a token", JSON.parse('{"X Bad":"1"}'), /not a valid header name/],
@@ -1183,7 +1208,11 @@ await run(
     const dropped: Array<[string, string]> = [];
     const lenient = new NodeHTTP2Transport({
       requestTimeoutMs: 20_000,
-      onDroppedHeader: (name, value) => dropped.push([name, value]),
+      ca: LOCAL_TLS_CA,
+      allowPrivateNetwork: true,
+      onDroppedHeader: (name, value) => {
+        dropped.push([name, value]);
+      },
     });
     try {
       const raw = await lenient.send(
@@ -1191,8 +1220,14 @@ await run(
       );
       assertOkStatus(raw.status, "lenient headers request still goes through");
       const echoed = (await new Response(raw.body).json()) as { headers: Record<string, string> };
-      assert.equal(echoed.headers["X-Bad"], undefined, "the invalid name is dropped");
-      assert.equal(echoed.headers["X-Kept"], "1", "and the valid one is not");
+      // HTTP/2 requires lowercase field names (RFC 9113 §8.2.1), so the echo
+      // is `x-kept`; looking it up as sent reported a dropped header that was
+      // in fact sent.
+      const echoLower = new Map(
+        Object.entries(echoed.headers).map(([k, v]) => [k.toLowerCase(), v]),
+      );
+      assert.equal(echoLower.get("x-bad"), undefined, "the invalid name is dropped");
+      assert.equal(echoLower.get("x-kept"), "1", "and the valid one is not");
       assert.deepEqual(dropped, [["X Bad", "1"]], "the callback names the header and its value");
     } finally {
       lenient.destroy();
@@ -1202,7 +1237,11 @@ await run(
     const dropped2: Array<[string, string]> = [];
     const lenient2 = new NodeHTTP2Transport({
       requestTimeoutMs: 20_000,
-      onDroppedHeader: (name, value) => dropped2.push([name, value]),
+      ca: LOCAL_TLS_CA,
+      allowPrivateNetwork: true,
+      onDroppedHeader: (name, value) => {
+        dropped2.push([name, value]);
+      },
     });
     try {
       await lenient2.send(
@@ -1220,12 +1259,14 @@ await run(
     // pair — one mechanism, two transports.
     const dropped3: Array<[string, string]> = [];
     await new FetchTransport({
-      onDroppedHeader: (name, value) => dropped3.push([name, value]),
+      allowPrivateNetwork: true,
+      onDroppedHeader: (name, value) => {
+        dropped3.push([name, value]);
+      },
       fetchFn: async () => new Response("ok"),
     }).send(kreq({ headers: { "X-Bad": "a\u0000b" } }));
     assert.deepEqual(dropped3, [["X-Bad", "a\u0000b"]]);
   },
-  { transient: "httpbin.org intermittently answers 502" },
 );
 
 await run("regression: parseBody names the limit that rejected the body", async () => {
@@ -1264,11 +1305,12 @@ await run("regression: parseBody names the limit that rejected the body", async 
       };
     });
     assert.equal(out, text, `${label}: the raw text is returned`);
-    assert.ok(seen, `${label}: the hook fires`);
-    assert.equal(seen!.code, code, `${label}: the limit is named on the error`);
-    assert.match(seen!.message, message, `${label}: and named in the message`);
-    assert.match(seen!.message, /falling back to raw text/, label);
-    assert.equal(seen!.bytes, raw.byteLength, `${label}: the raw bytes are handed over`);
+    const got = seen as { code: string; message: string; bytes: number } | null;
+    assert.ok(got, `${label}: the hook fires`);
+    assert.equal(got.code, code, `${label}: the limit is named on the error`);
+    assert.match(got.message, message, `${label}: and named in the message`);
+    assert.match(got.message, /falling back to raw text/, label);
+    assert.equal(got.bytes, raw.byteLength, `${label}: the raw bytes are handed over`);
   }
   // Malformed JSON keeps its own code, so the two are distinguishable.
   let malformed: string | null = null;

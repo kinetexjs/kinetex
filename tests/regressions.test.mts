@@ -27,6 +27,9 @@
  */
 
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { hasErrorCode, isErrorWithCode } from "./assert-helpers.ts";
 import { describe, it } from "node:test";
 
 import { Kinetex, BatchQueue } from "../src/client.ts";
@@ -43,7 +46,27 @@ import { createDigestAuthorization, createDigestAuthorizer } from "../src/digest
 import { getClientIP, HttpHeaders } from "../src/headers.ts";
 import { domainMatch, isPublicSuffix } from "../src/cookie-parser.ts";
 import { CookieJar } from "../src/cookie-store.ts";
+import type { KinetexResponse } from "../src/types.ts";
 import { nodeTcpConnector } from "../src/socks5.ts";
+
+/**
+ * White-box view of the private members these regressions are written
+ * against. The behaviours under test — replaying a deduped leader's error,
+ * reading a tracker's total, installing an interceptor by hand — have no public
+ * surface to observe, so the tests reach in deliberately. Naming the shape once
+ * keeps that intent explicit instead of spreading `as any`.
+ */
+type Internals = {
+  interceptors: {
+    addResponse: (
+      fn: (ctx: {
+        request: { url: string; headers: Record<string, string>; meta: Record<string, unknown> };
+        response: { status: number } | null;
+      }) => unknown,
+    ) => void;
+  };
+  _cache: unknown;
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -174,7 +197,7 @@ const concat = (parts: Uint8Array[]): Uint8Array => {
   return out;
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 // P0-1 — redirect hops re-run the SSRF gate
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -236,7 +259,7 @@ describe("P0-1 redirect hops re-validate the target (SSRF)", () => {
     }));
     const c = new Kinetex({ baseURL: "https://api.example.test", cookieJar: true });
     const s = withTransport(c, transport);
-    await assert.rejects(() => s.client.get("/start"));
+    await assert.rejects(() => s.client.get("/start"), isErrorWithCode("EVALIDATION"));
     assert.equal(hops.length, 1, "EVALIDATION must not be retried");
   });
 
@@ -565,7 +588,9 @@ describe("P0-2 download-progress wrapper cancels the SOURCE, not itself", () => 
       () =>
         s.client.get("/big", {
           maxResponseSize: 1024,
-          onDownloadProgress: (e) => seen.push(e.loaded),
+          onDownloadProgress: (e) => {
+            seen.push(e.loaded);
+          },
         }),
       (err: unknown) => {
         assert.ok(
@@ -580,14 +605,23 @@ describe("P0-2 download-progress wrapper cancels the SOURCE, not itself", () => 
 
   it("does not raise an unhandled rejection when the download is cancelled", async () => {
     const unhandled: unknown[] = [];
-    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
     process.on("unhandledRejection", onUnhandled);
     try {
       const { transport } = mockTransport(() => ({ body: "y".repeat(20_000) }));
       const c = new Kinetex({ baseURL: "https://api.example.test" });
       const s = withTransport(c, transport);
-      await assert.rejects(() =>
-        s.client.get("/big", { maxResponseSize: 512, onDownloadProgress: () => {} }),
+      await assert.rejects(
+        () => s.client.get("/big", { maxResponseSize: 512, onDownloadProgress: () => {} }),
+        (e: unknown) => {
+          // The size limit is the subject: any other rejection would satisfy a
+          // bare assert.rejects and hide a limit that stopped working.
+          assert.ok(e instanceof SizeLimitError, `expected SizeLimitError, got ${String(e)}`);
+          assert.equal(e.code, "ESIZELIMIT");
+          return true;
+        },
       );
       // Give the microtask queue a chance to surface a rejection.
       await new Promise((r) => setTimeout(r, 25));
@@ -632,6 +666,12 @@ describe("P0-2 download-progress wrapper cancels the SOURCE, not itself", () => 
 // P0-3 — dedupe interceptor auth isolation
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/** Cached bodies may be text or bytes; TextDecoder accepts only the latter. */
+function toBytes(body: string | Uint8Array | null | undefined): Uint8Array {
+  if (body === null || body === undefined) return new Uint8Array();
+  return typeof body === "string" ? new TextEncoder().encode(body) : body;
+}
+
 function dedupeCtx(overrides: Partial<KinetexRequest> = {}, signal: AbortSignal | null = null) {
   const ctx = {
     request: {
@@ -644,11 +684,15 @@ function dedupeCtx(overrides: Partial<KinetexRequest> = {}, signal: AbortSignal 
       ...overrides,
     } as KinetexRequest,
     response: null,
-    error: null,
+    error: null as Error | null,
     startedAt: 0,
     attempt: 1,
     aborted: false,
-    store: new Map<symbol | string, unknown>(),
+    // Map is invariant in its key type, so a Map<string|symbol, unknown> is not
+    // assignable to the Map<symbol, unknown> the interface declares — even
+    // though it is safe to read. Narrowing to the declared key type is what
+    // InterceptorContext actually promises.
+    store: new Map<symbol, unknown>(),
   };
   return ctx;
 }
@@ -902,7 +946,9 @@ describe("P1-7 progress wrappers apply backpressure instead of buffering", () =>
   it("withUploadProgress reports progress across multiple chunks", async () => {
     const seen: number[] = [];
     const { stream } = withUploadProgress(new Uint8Array(300), 300, {
-      onProgress: (s) => seen.push(s.loaded),
+      onProgress: (s) => {
+        seen.push(s.loaded);
+      },
       throttleHz: 0,
     });
     await readAll(stream);
@@ -943,7 +989,7 @@ describe("P1-7 progress wrappers apply backpressure instead of buffering", () =>
       {},
     );
     await readAll(stream);
-    assert.equal(tracker.total, null);
+    assert.equal((tracker as unknown as { total: number | null }).total, null);
   });
 
   it("withUploadProgress on an empty body completes immediately", async () => {
@@ -1115,7 +1161,7 @@ describe("P1-9 cache/dedup auth fingerprint covers every credential header", () 
     // Was a bare truthiness check: any non-null hit passed, including one
     // holding bob's data. Pin the body alice stored.
     assert.ok(hitA, "alice must still hit her own cached entry");
-    assert.equal(new TextDecoder().decode(hitA.entry.response.body), '{"user":"alice"}');
+    assert.equal(new TextDecoder().decode(toBytes(hitA.entry.response.body)), '{"user":"alice"}');
     assert.equal(hitA.stale, false);
   });
 
@@ -1136,7 +1182,7 @@ describe("P1-9 cache/dedup auth fingerprint covers every credential header", () 
     assert.ok(hit, "an identical credential must still hit the shared entry");
     assert.equal(hit.stale, false);
     assert.equal(hit.entry.response.status, 200);
-    assert.equal(new TextDecoder().decode(hit.entry.response.body), "{}");
+    assert.equal(new TextDecoder().decode(toBytes(hit.entry.response.body)), "{}");
   });
 
   it("CREDENTIAL_HEADERS is the single source of truth and is non-empty", () => {
@@ -1181,7 +1227,7 @@ describe("P2 method casing is normalized on the wire", () => {
     const { transport, hops } = mockTransport(() => ({}));
     const c = new Kinetex({ baseURL: "https://api.example.test" });
     const s = withTransport(c, transport);
-    for (const m of ["get", "post", "put", "delete", "head", "options"] as const) {
+    for (const m of ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"] as const) {
       await s.client.send("/x", m);
     }
     assert.deepEqual(
@@ -1237,6 +1283,167 @@ describe("P2 retry refuses to replay a consumed stream body", () => {
     assert.equal(calls, 1, "the replay must never be attempted");
   });
 
+  it("a 307/308 redirect with a stream body is refused clearly, not with ENETWORK", async () => {
+    // The retry loop refuses to replay a consumed stream body with a clear
+    // EVALIDATION. The redirect follower had no equivalent check, so a 307/308
+    // — which preserves the method *and* the body — handed the spent stream to
+    // the transport and surfaced undici's "Response body object should not be
+    // disturbed or locked" as an opaque ENETWORK. Reproduced on both the HTTP/2
+    // and HTTP/1.1 transports.
+    const srv = createServer((q, r) => {
+      q.resume();
+      q.on("end", () => {
+        if ((q.url ?? "") === "/start") {
+          r.writeHead(307, { location: "/target" });
+          r.end();
+          return;
+        }
+        r.writeHead(200, { "content-type": "application/json" });
+        r.end('{"ok":true}');
+      });
+    });
+    await new Promise<void>((res) => srv.listen(0, "127.0.0.1", res));
+    const port = (srv.address() as AddressInfo).port;
+    const client = new Kinetex({
+      baseURL: `http://127.0.0.1:${port}`,
+      allowPrivateNetwork: true,
+      timeout: 10_000,
+    });
+    try {
+      for (const httpVersion of ["HTTP/2", "HTTP/1.1"] as const) {
+        const withV = new Kinetex({
+          baseURL: `http://127.0.0.1:${port}`,
+          allowPrivateNetwork: true,
+          timeout: 10_000,
+          httpVersion,
+        });
+        await assert.rejects(
+          () =>
+            withV.post(
+              "/start",
+              new ReadableStream<Uint8Array>({
+                start(ctrl) {
+                  ctrl.enqueue(new TextEncoder().encode("payload"));
+                  ctrl.close();
+                },
+              }) as never,
+            ),
+          (err: unknown) => {
+            assert.ok(err instanceof KinetexError, `got ${(err as Error)?.name}`);
+            assert.equal(err.code, "EVALIDATION");
+            assert.match(err.message, /Cannot follow this redirect/);
+            return true;
+          },
+          `expected ${httpVersion} to refuse the redirect`,
+        );
+        await withV.destroy();
+      }
+    } finally {
+      await client.destroy();
+      srv.close();
+    }
+  });
+
+  it("timeout bounds the whole request by default, retries and backoff included", async () => {
+    // `timeout` applied per attempt and the backoff was bounded by nothing, so
+    // `timeout: 1_000` with five retries and a growing baseDelayMs held the
+    // caller for ~37s against an instantly-failing endpoint. Anyone reading
+    // `timeout` as "this call must not take longer" was wrong.
+    let attempts = 0;
+    const srv = createServer((_q, r) => {
+      attempts++;
+      setTimeout(() => {
+        r.writeHead(503, { "content-type": "application/json" });
+        r.end("{}");
+      }, 20);
+    });
+    await new Promise<void>((res) => srv.listen(0, "127.0.0.1", res));
+    const port = (srv.address() as AddressInfo).port;
+    const client = new Kinetex({
+      baseURL: `http://127.0.0.1:${port}`,
+      allowPrivateNetwork: true,
+      timeout: 500,
+      retry: { maxRetries: 5, baseDelayMs: 400, maxDelayMs: 400 },
+    });
+    try {
+      const started = Date.now();
+      await client.get("/x").catch(() => undefined);
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed < 5_000, `must stay near the timeout, took ${elapsed}ms`);
+      assert.ok(attempts < 6, `must stop retrying within budget, made ${attempts}`);
+    } finally {
+      await client.destroy();
+      srv.close();
+    }
+  });
+
+  it("totalTimeoutMs: 0 restores the old unbounded retry behaviour", async () => {
+    // The opt-out has to actually work, or the new default is not a choice.
+    let attempts = 0;
+    const srv = createServer((_q, r) => {
+      attempts++;
+      setTimeout(() => {
+        r.writeHead(503, { "content-type": "application/json" });
+        r.end("{}");
+      }, 10);
+    });
+    await new Promise<void>((res) => srv.listen(0, "127.0.0.1", res));
+    const port = (srv.address() as AddressInfo).port;
+    const client = new Kinetex({
+      baseURL: `http://127.0.0.1:${port}`,
+      allowPrivateNetwork: true,
+      timeout: 100,
+      retry: { maxRetries: 3, baseDelayMs: 5, maxDelayMs: 10 },
+      totalTimeoutMs: 0,
+    });
+    try {
+      await client.get("/x").catch(() => undefined);
+      assert.equal(attempts, 4, "1 attempt + 3 retries, unbounded as before");
+    } finally {
+      await client.destroy();
+      srv.close();
+    }
+  });
+
+  it("a 302 redirect still works with a stream body, because it drops the body", async () => {
+    // The guard must not break the case it is not about: 301/302/303 downgrade
+    // to GET and carry no body, so there is nothing to replay.
+    const srv = createServer((q, r) => {
+      q.resume();
+      q.on("end", () => {
+        if ((q.url ?? "") === "/start") {
+          r.writeHead(302, { location: "/target" });
+          r.end();
+          return;
+        }
+        r.writeHead(200, { "content-type": "application/json" });
+        r.end('{"ok":true}');
+      });
+    });
+    await new Promise<void>((res) => srv.listen(0, "127.0.0.1", res));
+    const port = (srv.address() as AddressInfo).port;
+    const client = new Kinetex({
+      baseURL: `http://127.0.0.1:${port}`,
+      allowPrivateNetwork: true,
+      timeout: 10_000,
+    });
+    try {
+      const res = await client.post(
+        "/start",
+        new ReadableStream<Uint8Array>({
+          start(ctrl) {
+            ctrl.enqueue(new TextEncoder().encode("payload"));
+            ctrl.close();
+          },
+        }) as never,
+      );
+      assert.equal(res.status, 200);
+    } finally {
+      await client.destroy();
+      srv.close();
+    }
+  });
+
   it("still retries a replayable string body", async () => {
     let calls = 0;
     const transport = {
@@ -1266,7 +1473,7 @@ describe("P2 response-interceptor re-send is depth-capped", () => {
     const { transport, hops } = mockTransport(() => ({}));
     const c = new Kinetex({ baseURL: "https://api.example.test" });
     const s = withTransport(c, transport);
-    c.interceptors.addResponse(
+    (c as unknown as Internals).interceptors.addResponse(
       (ctx) =>
         ({
           ...ctx.request,
@@ -1294,7 +1501,7 @@ describe("P2 response-interceptor re-send is depth-capped", () => {
     );
     const c = new Kinetex({ baseURL: "https://api.example.test" });
     const s = withTransport(c, transport);
-    c.interceptors.addResponse((ctx) => {
+    (c as unknown as Internals).interceptors.addResponse((ctx) => {
       if (ctx.response?.status !== 401) return;
       if (ctx.request.meta.__interceptorResendDepth) return;
       return {
@@ -1314,9 +1521,11 @@ describe("P2 OTel span is ended even when setup fails", () => {
       setAttribute: () => {},
       setStatus: () => {},
       recordException: () => {},
-      end: () => ended.push("end"),
+      end: () => {
+        ended.push("end");
+      },
     };
-    const c = new Kinetex({ baseURL: "https://api.example.test", dedup: true });
+    const c = new Kinetex({ baseURL: "https://api.example.test" });
     c.setTracer({
       startSpan: () => ({
         ...span,
@@ -1334,7 +1543,22 @@ describe("P2 OTel span is ended even when setup fails", () => {
       configurable: true,
     });
     try {
-      await assert.rejects(() => c.get("/x", { headers: { authorization: "Bearer t" } }));
+      await assert.rejects(
+        () => c.get("/x", { headers: { authorization: "Bearer t" } }),
+        // Which network code comes back depends on how far the request got:
+        // with working DNS but no route it is ENETWORK, and where the name does
+        // not resolve at all it is ENOTFOUND. Both mean the same thing here —
+        // the request failed before dispatch — and the subject of this test is
+        // the span being ended exactly once, asserted below. Pinning one code
+        // made the test report the sandbox's DNS as a failure.
+        (e: unknown) => {
+          assert.ok(
+            hasErrorCode(e, "ENETWORK", "ENOTFOUND"),
+            `expected a network-level rejection, got ${String(e)}`,
+          );
+          return true;
+        },
+      );
     } finally {
       Object.defineProperty(globalThis, "crypto", { value: realCrypto, configurable: true });
     }
@@ -1351,7 +1575,9 @@ describe("P2 OTel span is ended even when setup fails", () => {
         setAttribute: () => {},
         setStatus: () => {},
         recordException: () => {},
-        end: () => ended.push("end"),
+        end: () => {
+          ended.push("end");
+        },
         spanContext: () => ({
           traceId: "0af7651916cd43dd8448eb211c80319c",
           spanId: "b7ad6b7169203331",
@@ -1368,7 +1594,7 @@ describe("P2 destroy() releases resources without purging data", () => {
   it("does not clear the cache it was given", async () => {
     const cache = new HTTPCache({ defaultTtlMs: 60_000 });
     const { transport } = mockTransport(() => ({}));
-    const c = new Kinetex({ baseURL: "https://api.example.test", cache: true });
+    const c = new Kinetex({ baseURL: "https://api.example.test", cache: { maxEntries: 10 } });
     // Inject the instance the way a user would share one across clients.
     (c as unknown as { _cache: HTTPCache })._cache = cache;
     const s = withTransport(c, transport);
@@ -1471,10 +1697,17 @@ describe("P2 circuit breaker contract", () => {
       successThreshold: 1,
       halfOpenConcurrency: 1,
     });
-    await assert.rejects(() =>
-      b.execute(async () => {
-        throw new KinetexError("down", "ENETWORK");
-      }),
+    await assert.rejects(
+      () =>
+        b.execute(async () => {
+          throw new KinetexError("down", "ENETWORK");
+        }),
+      (e: unknown) => {
+        assert.ok(e instanceof KinetexError, `expected KinetexError, got ${String(e)}`);
+        assert.equal(e.code, "ENETWORK");
+        assert.equal(e.message, "down");
+        return true;
+      },
     );
     assert.equal(b.state, "OPEN");
     // The OPEN → HALF_OPEN transition happens on the next execute().
@@ -1497,20 +1730,34 @@ describe("P2 circuit breaker contract", () => {
     // reachable pair keeps the FIFO behaviour under test.
     const b = new CircuitBreaker("k2", { failureThreshold: 4, windowSize: 4 });
     for (let i = 0; i < 3; i++) {
-      await assert.rejects(() =>
-        b.execute(async () => {
-          throw new KinetexError("boom", "ENETWORK");
-        }),
+      await assert.rejects(
+        () =>
+          b.execute(async () => {
+            throw new KinetexError("boom", "ENETWORK");
+          }),
+        (e: unknown) => {
+          assert.ok(e instanceof KinetexError, `expected KinetexError, got ${String(e)}`);
+          assert.equal(e.code, "ENETWORK");
+          assert.equal(e.message, "boom");
+          return true;
+        },
       );
     }
     assert.equal(b.snapshot.failureCount, 3);
     await b.execute(async () => "ok");
     assert.equal(b.snapshot.failureCount, 3, "a success does not erase recorded failures");
     for (let i = 0; i < 3; i++) {
-      await assert.rejects(() =>
-        b.execute(async () => {
-          throw new KinetexError("boom", "ENETWORK");
-        }),
+      await assert.rejects(
+        () =>
+          b.execute(async () => {
+            throw new KinetexError("boom", "ENETWORK");
+          }),
+        (e: unknown) => {
+          assert.ok(e instanceof KinetexError, `expected KinetexError, got ${String(e)}`);
+          assert.equal(e.code, "ENETWORK");
+          assert.equal(e.message, "boom");
+          return true;
+        },
       );
     }
     // 7 results have gone through (3 failures, a success, 3 failures) and the
@@ -1527,10 +1774,18 @@ describe("P2 circuit breaker contract", () => {
 
   it("ignores non-countable failures by default", async () => {
     const b = new CircuitBreaker("k3", { failureThreshold: 1, windowSize: 4 });
-    await assert.rejects(() =>
-      b.execute(async () => {
-        throw new Error("app error");
-      }),
+    await assert.rejects(
+      () =>
+        b.execute(async () => {
+          throw new Error("app error");
+        }),
+      (e: unknown) => {
+        // Not counted as a failure, but still the caller's own error.
+        assert.ok(e instanceof Error, `expected the caller's Error, got ${String(e)}`);
+        assert.equal(e.message, "app error");
+        assert.equal((e as { code?: string }).code, undefined);
+        return true;
+      },
     );
     assert.equal(b.state, "CLOSED");
   });
@@ -1598,21 +1853,13 @@ describe("P2/P3 cookie domain handling", () => {
   });
 
   it("matchDomain is case-insensitive for directly inserted cookies", () => {
+    // `putCookie` is private. A Set-Cookie header carries the same mixed-case
+    // Domain, and parsing it is the path the jar actually uses.
     const jar = new CookieJar();
-    jar.putCookie({
-      name: "a",
-      value: "1",
-      domain: "Example.COM",
-      path: "/",
-      expires: Date.now() + 60_000,
-      maxAge: null,
-      secure: false,
-      httpOnly: false,
-      sameSite: "Unset",
-      createdAt: Date.now(),
-      lastAccessed: Date.now(),
-      hostOnly: false,
-    });
+    assert.equal(
+      jar.setCookie("a=1; Domain=Example.COM; Path=/", { url: "https://example.com/" }),
+      true,
+    );
     assert.equal(jar.getCookies({ url: "https://sub.example.com/" }).length, 1);
   });
 
@@ -1694,7 +1941,7 @@ describe("P3 cache defaults and housekeeping", () => {
       headers: {},
     });
     assert.ok(hit, "param order and the fragment must not affect the cache key");
-    assert.equal(new TextDecoder().decode(hit.entry.response.body), "{}");
+    assert.equal(new TextDecoder().decode(toBytes(hit.entry.response.body)), "{}");
   });
 
   it("cleans tag references for entries that vanish from storage", async () => {
@@ -1845,9 +2092,9 @@ describe("P3 transformResponse receives the real response", () => {
     let seen: Record<string, unknown> | null = null;
     const c = new Kinetex({
       baseURL: "https://api.example.test",
-      transformResponse: (data, res) => {
+      transformResponse: <T,>(data: unknown, res: KinetexResponse<unknown>): T => {
         seen = res as unknown as Record<string, unknown>;
-        return data;
+        return data as T;
       },
     });
     const s = withTransport(c, transport);
@@ -1866,7 +2113,7 @@ describe("P3 transformResponse receives the real response", () => {
     }));
     const c = new Kinetex({
       baseURL: "https://api.example.test",
-      transformResponse: (data) => `<${String(data)}>`,
+      transformResponse: <T,>(data: unknown): T => `<${String(data)}>` as unknown as T,
     });
     const s = withTransport(c, transport);
     assert.equal((await s.client.get("/x")).data, "<abc>");
@@ -1900,7 +2147,7 @@ describe("P2 socks5 Node connector does not leak timers or hang after EOF", () =
       await new Promise((r) => setTimeout(r, 30));
       const afterEof = await Promise.race([
         conn.read(new Uint8Array(16)),
-        new Promise<symbol>((r) => setTimeout(() => r("TIMEOUT"), 500)),
+        new Promise<Uint8Array | "TIMEOUT">((r) => setTimeout(() => r("TIMEOUT"), 500)),
       ]);
       assert.notEqual(afterEof, "TIMEOUT", "a read after EOF must settle");
       assert.equal(afterEof, null, "EOF must be reported as null");
@@ -1931,7 +2178,7 @@ describe("P2 socks5 Node connector does not leak timers or hang after EOF", () =
 });
 
 describe("P2/P3 FetchTransport keeps caller accept-encoding intent", () => {
-  const transport = new FetchTransport(async (_url: string, init: RequestInit) => {
+  const transport = new FetchTransport(async (_url: URL | RequestInfo, _init?: RequestInit) => {
     return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
   });
 
@@ -1939,7 +2186,7 @@ describe("P2/P3 FetchTransport keeps caller accept-encoding intent", () => {
     const sent: string | null = await (async () => {
       let captured: string | null = null;
       const t = new FetchTransport(async (_u, init) => {
-        captured = (init.headers as Record<string, string>)["accept-encoding"] ?? null;
+        captured = ((init?.headers ?? {}) as Record<string, string>)["accept-encoding"] ?? null;
         return new Response("{}", { status: 200 });
       });
       await t.send({
@@ -1958,7 +2205,7 @@ describe("P2/P3 FetchTransport keeps caller accept-encoding intent", () => {
   it("preserves a caller-set encoding list that differs from the default", async () => {
     let captured: string | undefined;
     const t = new FetchTransport(async (_u, init) => {
-      captured = (init.headers as Record<string, string>)["accept-encoding"];
+      captured = ((init?.headers ?? {}) as Record<string, string>)["accept-encoding"];
       return new Response("{}", { status: 200 });
     });
     await t.send({
@@ -1995,9 +2242,11 @@ describe("P2/P3 FetchTransport keeps caller accept-encoding intent", () => {
     const dropped: Array<[string, string]> = [];
     let captured: Record<string, string> = {};
     const t = new FetchTransport({
-      onDroppedHeader: (name, value) => dropped.push([name, value]),
+      onDroppedHeader: (name, value) => {
+        dropped.push([name, value]);
+      },
       fetchFn: async (_u, init) => {
-        captured = init.headers as Record<string, string>;
+        captured = (init?.headers ?? {}) as Record<string, string>;
         return new Response("{}", { status: 200 });
       },
     });

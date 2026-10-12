@@ -1,6 +1,6 @@
 {
   "name": "kinetex",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Feature-rich, universal TypeScript HTTP client.",
   "author": "kinetexjs",
   "license": "MIT",
@@ -35,6 +35,9 @@
     "otel"
   ],
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "main": "./dist/cjs/mod.js",
   "module": "./dist/esm/mod.js",
   "browser": "./dist/browser/kinetex.esm.js",
@@ -196,9 +199,10 @@
     "coverage": "c8 --exclude='dist/**' --report-dir=coverage --reporter=lcov --reporter=text node --import tsx --test --test-concurrency=1 --test-reporter=spec $(find tests -maxdepth 1 -name '*.test.mts' ! -name 'perf.test.mts' | tr '\\n' ' ')",
     "coverage:summary": "c8 --exclude='dist/**' --report-dir=coverage --reporter=text-summary node --import tsx --test --test-concurrency=1 $(find tests -maxdepth 1 -name '*.test.mts' ! -name 'perf.test.mts' | tr '\\n' ' ')",
     "type-coverage": "type-coverage --strict -p tsconfig.check.json",
-    "ts-prune": "ts-prune -p tsconfig.check.json",
     "docs": "typedoc",
-    "prepare": "husky || true"
+    "prepare": "husky || true",
+    "typecheck:tests": "tsx scripts/typecheck-tests.ts",
+    "typecheck:all": "npm run typecheck && npm run typecheck:tests"
   },
   "devDependencies": {
     "@types/node": "^25.9.6",
@@ -207,11 +211,13 @@
     "husky": "^9.1.0",
     "lint-staged": "^17.5.1",
     "prettier": "3.9.6",
-    "ts-prune": "^0.10.3",
     "tsx": "^4.23.13",
     "type-coverage": "^2.30.1",
     "typedoc": "^0.28.20",
     "typedoc-plugin-markdown": "^4.13.0",
     "typescript": "^5.8.3"
+  },
+  "overrides": {
+    "markdown-it": "^14.3.1"
   }
 }

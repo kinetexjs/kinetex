@@ -33,41 +33,20 @@
 // ============================================================================
 
 /** Normalized request passed through the pipeline. */
-export interface InterceptorRequest {
-  /** Target URL */
-  url: string;
-  /** HTTP method (GET, POST, etc.) */
-  method: string;
-  /** Request headers as a flat object */
-  headers: Record<string, string>;
-  /** Request body */
-  body: BodyInit | null;
-  /** AbortSignal for cancellation (may be null) */
-  signal: AbortSignal | null;
-  /**
-   * Arbitrary per-request metadata bag — interceptors may read/write freely.
-   * Simple string-keyed values for request-scoped data.
-   *
-   * Use `meta` for:
-   * - Request-specific data (e.g., user ID, request ID)
-   * - Simple configuration passed between interceptors
-   *
-   * Use `ctx.store` (Map<symbol,>) for:
-   * - Complex objects requiring Symbol keys
-   * - Pipeline-scoped data shared across request/response/error phases
-   * - Avoiding key collisions with other interceptors
-   *
-   * @example
-   * ```ts
-   * // In request interceptor:
-   * ctx.request.meta.userId = "123";
-   *
-   * // In response interceptor:
-   * const userId = ctx.request.meta.userId;
-   * ```
-   */
-  meta: Record<string, unknown>;
-}
+/**
+ * The request an interceptor sees.
+ *
+ * This used to be a second, narrower declaration of the same shape as
+ * {@link KinetexRequest}: url/method/headers/body/signal/meta, with `method`
+ * typed as a bare `string`. Two public request types meant an interceptor
+ * written for the pipeline could not be handed to `client.useRequest`, and the
+ * adapter that bridged them was a cast rather than a type.
+ *
+ * `KinetexRequest` carries strictly more, so aliasing it is a widening — every
+ * previously-valid interceptor still type-checks, and the two families are
+ * finally one.
+ */
+export type InterceptorRequest = import("./types.ts").KinetexRequest;
 
 /** Normalized response passed through the pipeline. */
 export interface InterceptorResponse {
@@ -79,8 +58,14 @@ export interface InterceptorResponse {
   headers: Record<string, string>;
   /** Response body as string or binary */
   body: string | Uint8Array | null;
-  /** Original runtime response (fetch Response, node http.IncomingMessage, etc.) */
-  raw: unknown;
+  /**
+   * Original runtime response (fetch Response, node http.IncomingMessage, etc.).
+   *
+   * Optional: a response the client synthesised — a cache replay, a redirect
+   * the transport already followed — has no underlying runtime object, and
+   * requiring one meant a synthesised response could not be typed as itself.
+   */
+  raw?: unknown;
   /** Reference back to the request that produced this response */
   request: InterceptorRequest;
 }
@@ -113,7 +98,7 @@ export interface InterceptorContext {
    *
    * @see meta For per-request metadata (simpler key-value store)
    */
-  store: Map<symbol, unknown>;
+  store: Map<symbol | string, unknown>;
 }
 
 // ── Interceptor hook return types ────────────────────────────────────────────
@@ -148,7 +133,14 @@ export type ErrorInterceptorResult = void | undefined | InterceptorResponse;
 export type InterceptorFn<T = unknown> = (ctx: InterceptorContext) => Promise<T> | T;
 
 import { getAuthFingerprint } from "./cache.ts";
+import { perfNow, sleep, redactHeaders as redactHeaderValues } from "./utils.ts";
 import { KinetexError } from "./types.ts";
+// `BodyInit` must come from here, not from the global DOM lib. The global one
+// does not accept a `Uint8Array`, so `InterceptorRequest.body` and
+// `KinetexRequest.body` described two different unions for the same field —
+// which made the two request types mutually unassignable, so nothing that built
+// a `KinetexRequest` could be passed where an `InterceptorRequest` was expected.
+import type { BodyInit } from "./types.ts";
 import { parseHTTPDate } from "./headers.ts";
 
 /** A request-phase interceptor function. */
@@ -909,7 +901,7 @@ export function createTimeoutInterceptor(config: Partial<TimeoutConfig> = {}): {
   };
 
   /** Shared cleanup for the response and error phases. */
-  const cleanupTimeout = (ctx: { store: Map<symbol, unknown> }): void => {
+  const cleanupTimeout = (ctx: { store: Map<symbol | string, unknown> }): void => {
     const timer = ctx.store.get(TIMEOUT_TIMER_KEY) as ReturnType<typeof setTimeout> | undefined;
     if (timer) {
       clearTimeout(timer);
@@ -1030,13 +1022,10 @@ export function createLoggingInterceptor(config: Partial<LoggingConfig> = {}): {
   const cfg = { ...LOG_DEFAULTS, ...config };
   const redactSet = new Set(cfg.redactHeaders.map((h) => h.toLowerCase()));
 
-  function redactHeaders(headers: Record<string, string>): Record<string, string> {
-    const out: Record<string, string> = {};
-    for (const [k, v] of Object.entries(headers)) {
-      out[k] = redactSet.has(k.toLowerCase()) ? "**REDACTED**" : v;
-    }
-    return out;
-  }
+  // The mask is "**REDACTED**" rather than the logger's "***" — that string is
+  // observable in this interceptor's own log output, so it is preserved here.
+  const redactHeaders = (headers: Record<string, string>): Record<string, string> =>
+    redactHeaderValues(headers, redactSet, "**REDACTED**");
 
   function makeEntry(type: LogEntry["type"], ctx: InterceptorContext): LogEntry {
     const requestId = (ctx.store.get(REQUEST_ID_KEY) as string) ?? "unknown";
@@ -1975,17 +1964,8 @@ export function createMetricsInterceptor(): {
 // §14  UTILITIES
 // ============================================================================
 
-function now(): number {
-  // Use performance.now() when available (browser, Deno, Node 16+, Bun)
-  // Fall back to Date.now() for edge runtimes that may not expose it
-  return typeof performance !== "undefined" && typeof performance.now === "function"
-    ? performance.now()
-    : Date.now();
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+/** High-resolution monotonic clock — the one `utils.ts` exports, under a local name. */
+const now = perfNow;
 
 /** @internal Compute byte size of a request/response body. Exported for testing. */
 export function computeBodySize(body: BodyInit | string | Uint8Array | null): number {

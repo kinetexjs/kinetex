@@ -576,6 +576,11 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries: number, delayMs: n
   throw lastError;
 }
 
+// Deliberately kept local. This module has no imports at all, so it can be
+// loaded on its own in restricted runtimes where a relative import of
+// `utils.ts` would pull the whole package graph in with it. `sleep(ms)` with
+// no signal is the one shape that cannot diverge from the shared copy — it
+// resolves after `ms` and attaches nothing.
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }

@@ -129,7 +129,10 @@ before(async () => {
       scheme: String(reqHeaders[":scheme"] ?? ""),
       headers,
     });
-    stream.respond({ ":status": 200, "content-type": "text/plain" });
+    (stream as unknown as { respond: (h: Record<string, string | number>) => void }).respond({
+      ":status": 200,
+      "content-type": "text/plain",
+    });
     stream.end("ok");
   });
   await new Promise<void>((resolve, reject) => {
@@ -180,6 +183,10 @@ function mkTransport(
 ): NodeHTTP2Transport {
   return new NodeHTTP2Transport({
     ca: TLS_CERT,
+    // The server is a loopback socket this suite starts itself. The
+    // DNS-rebinding guard blocks loopback by default — that is what it is for —
+    // so reaching a deliberately-local server is an explicit opt-in.
+    allowPrivateNetwork: true,
     pingIntervalMs: 0, // no keepalive timers in tests
     connectTimeoutMs: 10_000,
     requestTimeoutMs: 10_000,
@@ -188,10 +195,7 @@ function mkTransport(
 }
 
 /** True once the callback has fired (it is called synchronously during send). */
-async function waitForDrop(
-  dropped: Array<{ name: string; value: string }>,
-  timeoutMs = 2000,
-): Promise<boolean> {
+async function waitForDrop(dropped: unknown[], timeoutMs = 2000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (dropped.length === 0 && Date.now() < deadline) {
     await new Promise<void>((r) => setTimeout(r, 10));
@@ -224,7 +228,9 @@ h2Test(
   async () => {
     const dropped: Array<{ name: string; value: string }> = [];
     const transport = mkTransport({
-      onDroppedHeader: (name, value) => dropped.push({ name, value }),
+      onDroppedHeader: (name, value) => {
+        dropped.push({ name, value });
+      },
     });
     try {
       // Accounting is relative to what the server has already seen, like every
@@ -338,7 +344,9 @@ function mkReqAt(headers: Record<string, string>, path = "/echo"): KinetexReques
 h2Test("regression: a caller-supplied :path cannot redirect the request", {}, async () => {
   const dropped: Array<{ name: string; value: string }> = [];
   const transport = mkTransport({
-    onDroppedHeader: (name, value) => dropped.push({ name, value }),
+    onDroppedHeader: (name, value) => {
+      dropped.push({ name, value });
+    },
   });
   try {
     const seenBefore = receivedRequests.length;
@@ -363,7 +371,11 @@ h2Test("regression: a caller-supplied :path cannot redirect the request", {}, as
 
 h2Test("regression: a caller-supplied :authority cannot spoof the Host", {}, async () => {
   const dropped: string[] = [];
-  const transport = mkTransport({ onDroppedHeader: (name) => dropped.push(name) });
+  const transport = mkTransport({
+    onDroppedHeader: (name) => {
+      dropped.push(name);
+    },
+  });
   try {
     const seenBefore = receivedRequests.length;
     const raw = await transport.send(mkReq({ ":authority": "evil.example.com" }));
@@ -406,7 +418,11 @@ h2Test("regression: both transports refuse the same pseudo-header", {}, async ()
   // Parity, stated as a contract rather than left to a reader of the two
   // code paths: one request, two transports, one answer.
   const h2Dropped: string[] = [];
-  const h2 = mkTransport({ onDroppedHeader: (name) => h2Dropped.push(name) });
+  const h2 = mkTransport({
+    onDroppedHeader: (name) => {
+      h2Dropped.push(name);
+    },
+  });
   try {
     await h2.send(mkReq({ ":path": "/parity" }));
   } finally {
@@ -416,11 +432,16 @@ h2Test("regression: both transports refuse the same pseudo-header", {}, async ()
 
   const fetchDropped: string[] = [];
   const ft = new FetchTransport({
+    // Same opt-in as mkTransport above: the origin this suite starts is a
+    // loopback socket, and the DNS screen is meant to block exactly that.
+    allowPrivateNetwork: true,
     fetchFn: (async () =>
       new Response("{}", {
         headers: { "content-type": "application/json" },
       })) as unknown as typeof fetch,
-    onDroppedHeader: (name) => fetchDropped.push(name),
+    onDroppedHeader: (name) => {
+      fetchDropped.push(name);
+    },
   });
   await ft.send(mkReq({ ":path": "/parity" }));
   assert.deepEqual(
@@ -439,7 +460,11 @@ h2Test("regression: a __proto__ header is sent, not silently eaten", {}, async (
 
   const dropped: string[] = [];
   const warns: string[] = [];
-  const transport = mkTransport({ onDroppedHeader: (name) => dropped.push(name) });
+  const transport = mkTransport({
+    onDroppedHeader: (name) => {
+      dropped.push(name);
+    },
+  });
   const origWarn = console.warn;
   console.warn = (...args: unknown[]) => {
     warns.push(args.map((a) => String(a)).join(" "));
@@ -470,7 +495,9 @@ h2Test("regression: a __proto__ header is sent, not silently eaten", {}, async (
 h2Test("validation runs per hop: a dropped header does not poison the session", {}, async () => {
   const dropped: Array<{ name: string; value: string }> = [];
   const transport = mkTransport({
-    onDroppedHeader: (name, value) => dropped.push({ name, value }),
+    onDroppedHeader: (name, value) => {
+      dropped.push({ name, value });
+    },
   });
   try {
     const seenBefore = receivedRequests.length;

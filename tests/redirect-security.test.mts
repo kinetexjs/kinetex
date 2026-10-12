@@ -50,17 +50,16 @@ function assertStripped(
   header: string,
   sentValue: string,
 ): void {
-  assert.equal(mk.received.length, 2, "expected exactly 2 hops, got %d", mk.received.length);
+  assert.equal(mk.received.length, 2, `expected exactly 2 hops, got ${mk.received.length}`);
   const first = mk.received[0];
   const second = mk.received[1];
   assert.notEqual(first.url, second.url, "hops must differ for a strip test to mean anything");
   assert.equal(
     first.headers[header],
     sentValue,
-    "control: %s MUST be present on hop 0, else this test is vacuous",
-    header,
+    `control: ${header} MUST be present on hop 0, else this test is vacuous`,
   );
-  assert.equal(second.headers[header], undefined, "%s must be stripped before hop 1", header);
+  assert.equal(second.headers[header], undefined, `${header} must be stripped before hop 1`);
 }
 
 function suite(name: string): void {

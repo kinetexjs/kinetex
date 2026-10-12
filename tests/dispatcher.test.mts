@@ -156,7 +156,9 @@ await test("regression: a dispatcher forces FetchTransport, not a silent no-op",
 await test("regression: warns when a dispatcher downgrades HTTP/2", async () => {
   const original = console.warn;
   const warnings: string[] = [];
-  console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.join(" "));
+  };
   try {
     await createTransport(undefined, true, undefined, { dispatcher: dispatcher() });
   } finally {
@@ -170,7 +172,9 @@ await test("regression: warns when a dispatcher downgrades HTTP/2", async () => 
 await test("regression: an explicit undefined dispatcher does not warn or forward", async () => {
   const original = console.warn;
   const warnings: string[] = [];
-  console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.join(" "));
+  };
   let transport: unknown;
   try {
     transport = createTransport(undefined, true, undefined, {

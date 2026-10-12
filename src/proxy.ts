@@ -21,6 +21,19 @@
 import { KinetexError } from "./types.ts";
 import type { ProxyConfig } from "./types.ts";
 
+/**
+ * True when `host` is an IPv4/IPv6 literal rather than a DNS name.
+ *
+ * A textual shape check rather than `node:net.isIP`, because this is a
+ * synchronous guard and the module only reaches for `node:net` through a
+ * dynamic import. Being imprecise here is harmless: the worst case is that a
+ * name the resolver dislikes is sent as SNI, and the TLS stack rejects it.
+ */
+function isIpLiteral(host: string): boolean {
+  const h = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  return h.includes(":") || /^\d+(\.\d+)*$/.test(h);
+}
+
 /** Options for {@link connectThroughProxy}. */
 export interface ProxyConnectOptions {
   /** CA certificate(s) trusted in addition to the system store. */
@@ -401,10 +414,15 @@ export async function connectThroughProxy(
       options.signal?.removeEventListener("abort", onTunnelAbort);
     }
 
+    // RFC 6066 §3 forbids IP literals in SNI, and Node 26 rejects the
+    // handshake outright when one is sent; Node 22 and 24 ignored it. Omit
+    // `servername` for IP targets so certificate verification falls back to
+    // the `host`/`authorized` check, which still covers the certificate.
+    const sni = options.servername ?? target.hostname;
     const secure = tls.connect(
       {
         socket: baseSocket,
-        servername: options.servername ?? target.hostname,
+        ...(sni !== undefined && !isIpLiteral(sni) ? { servername: sni } : {}),
         ...(options.ca !== undefined ? { ca: options.ca } : {}),
       },
       // `rejectUnauthorized` is left at its default (true), so a peer that
@@ -493,7 +511,7 @@ async function openTlsSocket(
       {
         host: opts.host,
         port: opts.port,
-        servername: opts.servername,
+        ...(isIpLiteral(opts.servername) ? {} : { servername: opts.servername }),
         ...(opts.ca !== undefined ? { ca: opts.ca } : {}),
       },
       () => {

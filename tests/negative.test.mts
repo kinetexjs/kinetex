@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { isErrorWithCode } from "./assert-helpers.ts";
 import { Kinetex, BatchQueue } from "../src/client.ts";
 import { kinetex } from "../src/mod.ts";
 import {
@@ -533,7 +534,7 @@ async function main() {
   suite("11. Race conditions (simulated)");
 
   await test("DedupMap: multiple simultaneous requests to same URL deduplicate", async () => {
-    const dedup = new DedupMap<number>({ windowMs: 100 });
+    const dedup = new DedupMap({ windowMs: 100 });
     let callCount = 0;
     const factory = async () => {
       callCount++;
@@ -551,7 +552,7 @@ async function main() {
   });
 
   await test("DedupMap: different URLs are not deduplicated", async () => {
-    const dedup = new DedupMap<number>({ windowMs: 100 });
+    const dedup = new DedupMap({ windowMs: 100 });
     let callCount = 0;
     const factory = async () => {
       callCount++;
@@ -565,7 +566,7 @@ async function main() {
   });
 
   await test("DedupMap: POST requests are not deduplicated by default", async () => {
-    const dedup = new DedupMap<number>();
+    const dedup = new DedupMap();
     let callCount = 0;
     const factory = async () => {
       callCount++;
@@ -616,7 +617,7 @@ async function main() {
       (e as any).code = "ENETWORK";
       throw e;
     };
-    await assert.rejects(() => cb.execute(failFactory));
+    await assert.rejects(() => cb.execute(failFactory), isErrorWithCode("ENETWORK", "fail"));
     assert.equal(cb.state, "OPEN");
 
     // The operation must not be invoked at all while the circuit is open.
@@ -673,9 +674,9 @@ async function main() {
     };
     // Two failures on key-a open it; one on key-b must not, because breakers
     // are tracked per key.
-    await assert.rejects(() => reg.execute("key-a", fail));
-    await assert.rejects(() => reg.execute("key-a", fail));
-    await assert.rejects(() => reg.execute("key-b", fail));
+    await assert.rejects(() => reg.execute("key-a", fail), isErrorWithCode("ENETWORK", "fail"));
+    await assert.rejects(() => reg.execute("key-a", fail), isErrorWithCode("ENETWORK", "fail"));
+    await assert.rejects(() => reg.execute("key-b", fail), isErrorWithCode("ENETWORK", "fail"));
     const snaps = reg.snapshots();
     assert.equal(snaps["key-a"]!.state, "OPEN", "key-a hit its threshold");
     assert.equal(snaps["key-b"]!.state, "CLOSED", "key-b must be unaffected by key-a");
@@ -934,6 +935,38 @@ async function main() {
     assert.deepEqual(run.delays, [0]);
   });
 
+  await test("a relative URL with no baseURL is refused clearly, via the fallback path", async () => {
+    // With no baseURL, `full` is the relative path itself and `new URL(full)`
+    // cannot parse it — which is the one way to reach `buildURL`'s manual
+    // param-concat fallback. It had no coverage at all, so the branch that
+    // re-implements the URL-length limit and the SSRF screen by hand was a claim
+    // rather than tested behaviour. The observable contract: a clear
+    // EVALIDATION, never a crash and never a hang.
+    const client = kinetex({ timeout: 5_000 });
+    try {
+      await assert.rejects(
+        () => client.get("/relative"),
+        (err: unknown) => {
+          assert.ok(err instanceof KinetexError, `got ${(err as Error)?.name}`);
+          assert.equal((err as KinetexError).code, "EVALIDATION");
+          assert.match((err as Error).message, /failed safety check/);
+          return true;
+        },
+        "a relative URL with no base must be refused, not attempted",
+      );
+      // The same path with query params exercises the param-concat branch.
+      await assert.rejects(
+        () => client.get("/relative", { params: { a: "1", b: "two words" } }),
+        (err: unknown) => {
+          assert.equal((err as KinetexError).code, "EVALIDATION");
+          return true;
+        },
+      );
+    } finally {
+      await client.destroy();
+    }
+  });
+
   await test("regression: Retry-After is capped at 24 hours", async () => {
     const client = stub(429, { "retry-after": "999999" });
     const delays: number[] = [];
@@ -949,6 +982,10 @@ async function main() {
           baseDelayMs: 20,
           maxDelayMs: 86_400_000,
           jitter: 0,
+          // `totalTimeoutMs` defaults to `timeout`, which would cut this before
+          // the 24 h cap was ever computed. This case is about the cap, so the
+          // budget is switched off to reach it.
+          totalTimeoutMs: 0,
           onRetry: (_ctx, delay) => {
             delays.push(delay);
             ac.abort();
@@ -1053,7 +1090,7 @@ async function main() {
           jitter: 0.5,
         });
         client.destroy();
-        assert.notEqual(d, null, `jitter seed ${r} produced no retry`);
+        assert.ok(d !== null, `jitter seed ${r} produced no retry`);
         samples.push(d!);
       }
     } finally {

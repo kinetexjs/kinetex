@@ -116,6 +116,31 @@ async function main() {
 
   suite("computeDigestResponse");
 
+  await test("matches the RFC 2617 §3.5 published test vector", async () => {
+    // The one assertion that cannot be satisfied by a formula agreeing with
+    // itself. Every other test here compares lengths and shapes; the local
+    // digest fixture previously called this same function to decide what a
+    // correct answer was, so a changed formula moved both sides together and
+    // the suite stayed green.
+    //
+    // Inputs and the expected response are taken verbatim from RFC 2617 §3.5.
+    const challenge = parseDigestChallenge(
+      `Digest realm="testrealm@host.com", qop="auth,auth-int", ` +
+        `nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", ` +
+        `opaque="5ccc069c403ebaf9f0171e9517f40e41"`,
+    );
+    const resp = await computeDigestResponse(
+      challenge,
+      "Mufasa",
+      "Circle Of Life",
+      "GET",
+      "/dir/index.html",
+      "0a4f113b",
+      "00000001",
+    );
+    assert.equal(resp, "6629fae49393a05397450978507c4ef1");
+  });
+
   await test("produces 32-char hex MD5 response with qop=auth", async () => {
     const challenge = parseDigestChallenge(WWW_AUTH);
     const resp = await computeDigestResponse(
@@ -895,6 +920,90 @@ async function main() {
       () => formatDigestAuth(plain, "admin", "resp", "/d", "CN", "00000001", "hash"),
       /does not offer userhash/,
     );
+  });
+
+  // A hand-rolled SHA-512/256 covering ~190 statements, reachable only when a
+  // server offers `algorithm=SHA-512-256`. It had no suite coverage at all, so a
+  // change to the round constants or the final truncation would have shipped
+  // unexercised — and it is exactly the code a careless edit breaks. Pinned here
+  // against `node:crypto`, an independent implementation, rather than against
+  // itself.
+  await test("SHA-512/256 matches node:crypto across inputs", async () => {
+    const { createHash } = await import("node:crypto");
+    const { parseDigestChallenge, computeUsernameStar } = await import("../src/digest.ts");
+    const oracle = (s: string): string => createHash("sha512-256").update(s, "utf8").digest("hex");
+    const challenge = parseDigestChallenge(
+      'Digest realm="r", qop="auth", nonce="n", algorithm=SHA-512-256, userhash=true',
+    );
+    // userhash hashes `<username>:<realm>`, so the username is the variable part
+    // and the realm is fixed by the challenge.
+    for (const username of ["u", "", "a", "\u00e9\u4e2d\u6587", "0".repeat(200)]) {
+      const got = await computeUsernameStar(challenge, username);
+      assert.notEqual(got, null, "userhash=true must produce a value");
+      assert.equal(
+        Buffer.from(got as string, "base64").toString("hex"),
+        oracle(`${username}:r`),
+        `SHA-512/256 mismatch for ${JSON.stringify(username.slice(0, 20))}`,
+      );
+    }
+  });
+
+  await test("every supported algorithm authenticates against a verifying server", async () => {
+    // The end-to-end version of the same oracle: the server recomputes the digest
+    // with node:crypto and rejects anything that does not match, so a correct
+    // client passes and a subtly wrong one cannot.
+    const { createServer } = await import("node:http");
+    const { createHash } = await import("node:crypto");
+    const { kinetex } = await import("../src/mod.ts");
+    const U = "u",
+      P = "p",
+      REALM = "r",
+      NONCE = "n";
+    let alg = "MD5";
+    const H = (x: string): string =>
+      alg === "MD5"
+        ? createHash("md5").update(x).digest("hex")
+        : alg === "SHA-512-256"
+          ? createHash("sha512-256").update(x).digest("hex")
+          : createHash("sha256").update(x).digest("hex");
+    const srv = createServer((q, r) => {
+      const a = q.headers.authorization ?? "";
+      if (!a) {
+        r.writeHead(401, {
+          "www-authenticate": `Digest realm="${REALM}", qop="auth", nonce="${NONCE}", algorithm=${alg}`,
+          "content-type": "text/plain",
+        });
+        r.end("no");
+        return;
+      }
+      const g = (k: string): string => (new RegExp(k + '="?([^",]+)"?').exec(a) ?? [])[1] ?? "";
+      const ha1 = H(`${U}:${REALM}:${P}`);
+      const ha2 = H(`GET:${g("uri")}`);
+      if (g("response") !== H(`${ha1}:${g("nonce")}:${g("nc")}:${g("cnonce")}:auth:${ha2}`)) {
+        r.writeHead(401, { "content-type": "text/plain" });
+        r.end("digest mismatch");
+        return;
+      }
+      r.writeHead(200, { "content-type": "application/json" });
+      r.end('{"ok":true}');
+    });
+    await new Promise<void>((res) => srv.listen(0, "127.0.0.1", res));
+    const port = (srv.address() as { port: number }).port;
+    try {
+      for (const candidate of ["MD5", "SHA-256", "SHA-512-256"]) {
+        alg = candidate;
+        const client = kinetex({
+          baseURL: `http://127.0.0.1:${port}`,
+          allowPrivateNetwork: true,
+          auth: { type: "digest", username: U, password: P },
+        });
+        const res = await client.get("/secure");
+        assert.equal(res.status, 200, `algorithm=${candidate} must authenticate`);
+        await client.destroy();
+      }
+    } finally {
+      srv.close();
+    }
   });
 
   console.log(`\n════════════════════════════════════════════════════════════`);

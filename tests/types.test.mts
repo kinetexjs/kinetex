@@ -51,6 +51,7 @@ const fakeRes = {
   headers: {},
   data: null,
   rawBody: null,
+  body: null,
   url: "https://example.com/api",
   cached: false,
   redirected: false,

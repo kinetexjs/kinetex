@@ -26,6 +26,7 @@
 
 import type { BodyInit, HTTPMethod } from "./types.ts";
 import { KinetexError as _KinetexError } from "./types.ts";
+import { perfNow, redactHeaders, abortError } from "./utils.ts";
 
 // ============================================================================
 // §1  TYPES
@@ -1160,11 +1161,8 @@ export function createLoggingHooks(
     ),
   );
 
-  function safeHeaders(h: Record<string, string>): Record<string, string> {
-    const out: Record<string, string> = {};
-    for (const [k, v] of Object.entries(h)) out[k] = redact.has(k.toLowerCase()) ? "***" : v;
-    return out;
-  }
+  const safeHeaders = (h: Record<string, string>): Record<string, string> =>
+    redactHeaders(h, redact, "***");
 
   return {
     beforeRequest: (req) => {
@@ -1256,7 +1254,7 @@ export function createAbortHook(this: void): {
     beforeRequest: (req, ctx) => {
       if (req.signal?.aborted) {
         ctx.meta.aborted = true;
-        throw createAbortError("Request aborted before sending");
+        throw abortError("Request aborted before sending");
       }
     },
     onCancel: (evt) => {
@@ -1268,20 +1266,6 @@ export function createAbortHook(this: void): {
 // ============================================================================
 // §9  UTILITIES
 // ============================================================================
-
-// Cross-runtime: safe AbortError creation (DOMException may not exist in all runtimes)
-function createAbortError(message: string): Error {
-  if (typeof DOMException !== "undefined") {
-    return new DOMException(message, "AbortError");
-  }
-  const err = new Error(message);
-  err.name = "AbortError";
-  return err;
-}
-
-function perfNow(): number {
-  return typeof performance !== "undefined" ? performance.now() : Date.now();
-}
 
 /**
  * Create a new HookContext for the given request.

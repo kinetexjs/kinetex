@@ -28,6 +28,22 @@ import { Kinetex } from "../src/client.ts";
 import type { OTelSpan } from "../src/client.ts";
 import { requireCapability } from "./capability.ts";
 
+/** Compress `text` with whichever encoder backs `encoding` on this runtime. */
+function compress(encoding: string, text: string): Uint8Array {
+  const bytes = Buffer.from(text, "utf8");
+  const table: Record<string, () => Buffer> = {
+    gzip: () => zlib.gzipSync(bytes),
+    deflate: () => zlib.deflateSync(bytes),
+    "deflate-raw": () => zlib.deflateRawSync(bytes),
+    br: () => zlib.brotliCompressSync(bytes),
+    zstd: () => zlib.zstdCompressSync(bytes),
+  };
+  const make = table[encoding];
+  if (!make) throw new Error(`no compressor for ${encoding}`);
+  return new Uint8Array(make());
+}
+import { HTTPStatusError, KinetexError } from "../src/types.ts";
+
 let passed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
@@ -148,7 +164,9 @@ await test("regression: an unknown encoding passes through untouched", async () 
 await test("regression: decompressBodyStream still rejects unknown encodings", async () => {
   const original = console.warn;
   const warnings: string[] = [];
-  console.warn = (...a: unknown[]) => warnings.push(a.join(" "));
+  console.warn = (...a: unknown[]) => {
+    warnings.push(a.join(" "));
+  };
   try {
     const raw = new TextEncoder().encode("passthrough payload");
     const headers: Record<string, string> = { "content-encoding": "exotic-v9" };
@@ -256,6 +274,24 @@ await test("strict: isNodeRuntime is false when versions.node is not a string", 
   }
 });
 
+/**
+ * Waits for `check` to hold, or gives up after `ms`.
+ *
+ * Stream cancellation is delivered through several microtask and macrotask
+ * turns, and how many is a runtime implementation detail: one `setTimeout(0)`
+ * was enough on Node 22 and 24 and not on 26, where the assertion failed for a
+ * property that was still about to become true. The property under test is "the
+ * cancel propagates", not "it has propagated by the second turn", so this polls
+ * for it with a deadline instead of counting turns.
+ */
+async function waitFor(check: () => boolean, ms = 2_000): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (!check() && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  return check();
+}
+
 await test("strict: cancelling the returned stream cancels the source", async () => {
   // The node:zlib bridge owns a reader on the source. If cancelling the
   // output does not cancel the source, an aborted request leaks the upstream
@@ -272,11 +308,12 @@ await test("strict: cancelling the returned stream cancels the source", async ()
 
   const out = decompressStream(src, "zstd");
   await out.cancel();
-  // The underlying `cancel()` algorithm runs as a microtask, so assert after
-  // yielding rather than racing it.
-  await new Promise((r) => setTimeout(r, 0));
 
-  assert.equal(cancelled, true, "cancel must propagate to the upstream stream");
+  assert.equal(
+    await waitFor(() => cancelled),
+    true,
+    "cancel must propagate to the upstream stream",
+  );
 });
 
 await test("strict: a source error propagates to the consumer", async () => {
@@ -306,7 +343,18 @@ await test("edge: a non-Error upstream failure is wrapped before it reaches zlib
   });
 
   const out = decompressStream(src, "zstd");
-  await assert.rejects(() => new Response(out).text());
+  await assert.rejects(
+    () => new Response(out).text(),
+    (e: unknown) => {
+      // The wrap is internal — it stops Duplex.destroy() seeing a non-Error — so
+      // the caller still receives the original value.
+      assert.ok(
+        Object.is(e, "a bare string, not an Error"),
+        `expected the original rejection value, got ${typeof e} ${String(e)}`,
+      );
+      return true;
+    },
+  );
 });
 
 await test("edge: a source whose cancel rejects does not surface an unhandled rejection", async () => {
@@ -365,10 +413,48 @@ await test("edge: cancelling before the bridge is ready still releases the sourc
   assert.equal(cancelled, true, "the early cancel must not be swallowed");
 });
 
-await test("edge: an empty zstd payload still round-trips through the bridge", async () => {
-  const out = await new Response(decompressStream(toStream(new Uint8Array(0)), "zstd")).text();
-  assert.equal(out, "");
-});
+// Every decoder rejects a zero-byte stream with `Z_BUF_ERROR: unexpected end
+// of file`, because there is no frame to parse. An empty body that carries a
+// `Content-Encoding` is an ordinary response — an empty 204, an empty error
+// body — so the client has to produce nothing rather than throw. This was
+// encoding-independent and had always been broken; zstd merely masked it on
+// Node 22, which is why it read as a Node-24-only regression.
+const EMPTY_FORMS: Array<[string, () => ReadableStream<Uint8Array>]> = [
+  [
+    "a closed stream with no bytes",
+    () => new ReadableStream<Uint8Array>({ start: (c) => c.close() }),
+  ],
+  ["a single zero-length chunk", () => toStream(new Uint8Array(0))],
+];
+
+for (const encoding of ["gzip", "deflate", "deflate-raw", "br", "zstd"]) {
+  for (const [shape, makeStream] of EMPTY_FORMS) {
+    await test(`edge: an empty ${encoding} body given as ${shape} yields nothing`, async () => {
+      const out = await new Response(decompressStream(makeStream(), encoding)).text();
+      assert.equal(out, "");
+    });
+  }
+}
+
+// The peek that detects emptiness must not swallow a payload that arrives
+// behind one or more zero-length chunks, or a body split across a chunk
+// boundary, or the fix would trade an exception for silently truncated data.
+for (const encoding of ["gzip", "deflate", "br", "zstd"]) {
+  await test(`regression: a ${encoding} payload behind zero-length chunks still decodes`, async () => {
+    const text = "payload behind an empty chunk";
+    const compressed = compress(encoding, text);
+    const src = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new Uint8Array(0));
+        c.enqueue(compressed.subarray(0, Math.floor(compressed.length / 2)));
+        c.enqueue(new Uint8Array(0));
+        c.enqueue(compressed.subarray(Math.floor(compressed.length / 2)));
+        c.close();
+      },
+    });
+    assert.equal(await new Response(decompressStream(src, encoding)).text(), text);
+  });
+}
 
 await test("regression: Node without createZstdDecompress reports a clear error", () => {
   // kinetex supports Node 18+, which predates `zlib.createZstdDecompress`
@@ -569,7 +655,15 @@ await test("regression: retries reuse the same key", async () => {
   });
   try {
     const builder = client.POST("/charges").withJSON({}).idempotencyKey("stable-key");
-    await assert.rejects(() => builder.json());
+    await assert.rejects(
+      () => builder.json(),
+      (e: unknown) => {
+        assert.ok(e instanceof HTTPStatusError, `expected HTTPStatusError, got ${String(e)}`);
+        assert.equal(e.code, "EHTTPSTATUS");
+        assert.equal(e.status, 503);
+        return true;
+      },
+    );
     assert.equal(calls, 3, "expected the initial attempt plus two retries");
     assert.equal(new Set(keys).size, 1, `keys changed across attempts: ${keys.join(", ")}`);
     assert.equal(keys[0], "stable-key");
@@ -612,11 +706,16 @@ await test("edge: generateIdempotencyKey works again once the CSPRNG is restored
 suite("OTel metrics");
 
 /** Minimal span stub. */
+// Satisfies `OTelSpan` exactly. It previously declared `setError` — which is
+// not on the interface — and omitted `recordException`, so any test whose
+// request failed hit `_otelSpan.recordException is not a function` and
+// rejected with a TypeError instead of the error under test. Nothing type-checked
+// `tests/`, so the mismatch was invisible.
 const stubSpan = (): OTelSpan => ({
   spanContext: () => ({ traceId: "a".repeat(32), spanId: "b".repeat(16), traceFlags: 1 }),
   setAttribute: () => stubSpan(),
   setStatus: () => stubSpan(),
-  setError: () => stubSpan(),
+  recordException: () => stubSpan(),
   end: () => undefined,
 });
 
@@ -723,7 +822,15 @@ await test("a failing request records an error counter with error.type", async (
   });
   client.setTracer(recordingTracer(sink));
   try {
-    await assert.rejects(() => client.get("/x", { retry: false }));
+    await assert.rejects(
+      () => client.get("/x", { retry: false }),
+      (e: unknown) => {
+        assert.ok(e instanceof KinetexError, `expected KinetexError, got ${String(e)}`);
+        assert.equal(e.code, "ENETWORK");
+        assert.equal(e.message, "network down");
+        return true;
+      },
+    );
   } finally {
     client.destroy();
   }
@@ -811,7 +918,7 @@ await test("edge: server.address is derived from the request URL", async () => {
   const duration = sink.find((c) => c.name === "http.client.request.duration");
   assert.ok(duration, "the histogram must be recorded");
   assert.equal(
-    duration!.attributes["server.address"],
+    duration?.attributes?.["server.address"],
     "api.example.com",
     "the hostname is a required OTel attribute",
   );

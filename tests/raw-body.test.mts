@@ -22,13 +22,14 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { NodeHTTP2Transport, readRawBody } from "../src/core.ts";
+import { Kinetex } from "../src/client.ts";
 import type { KinetexRequest } from "../src/types.ts";
 
 let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
-async function test(name: string, fn: () => Promise<void>): Promise<void> {
+async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
     await fn();
     console.log(`  ✅  ${name}`);
@@ -55,10 +56,13 @@ type Echo = { body: string };
 async function withEchoServer(
   fn: (send: (body: unknown) => Promise<Echo>) => Promise<void>,
   legacy = false,
+  httpVersion: "HTTP/1.1" | "HTTP/2" = "HTTP/1.1",
 ): Promise<void> {
   const server = createServer((req, res) => {
     const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("data", (c: Buffer) => {
+      chunks.push(c);
+    });
     req.on("end", () => {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end(Buffer.concat(chunks));
@@ -81,8 +85,7 @@ async function withEchoServer(
       body: body as KinetexRequest["body"],
       signal: null,
       meta: {},
-      // Forces the HTTP/1.1 code path rather than HTTP/2.
-      httpVersion: "HTTP/1.1",
+      httpVersion,
     } as KinetexRequest;
 
     const raw = await transport.send(req);
@@ -151,6 +154,145 @@ const legacy = false;
       const { body } = await send(stream);
       assert.equal(body, "stream-body");
     }, legacy);
+  });
+
+  await test("a ReadableStream body survives many concurrent streaming uploads", async () => {
+    // HTTP/2 streaming bodies had coverage only as a single isolated request.
+    // Under churn — several clients, each streaming repeatedly — this path
+    // intermittently failed with "Response body object should not be disturbed
+    // or locked", and one green isolated test would not have noticed. The
+    // trigger was never isolated, so the assertion is the invariant that
+    // matters: every byte arrives, on every request, and nothing is shared
+    // between callers.
+    const payload = "streamed-payload-".repeat(64);
+    const server = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end(Buffer.concat(chunks));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const { port } = server.address() as AddressInfo;
+    const clients = Array.from(
+      { length: 4 },
+      () =>
+        new Kinetex({
+          baseURL: `http://127.0.0.1:${port}`,
+          allowPrivateNetwork: true,
+          timeout: 15_000,
+        }),
+    );
+    try {
+      const bodies = await Promise.all(
+        clients.flatMap((c) =>
+          Array.from({ length: 6 }, () =>
+            c
+              .post(
+                "/echo",
+                new ReadableStream<Uint8Array>({
+                  start(c2) {
+                    c2.enqueue(new TextEncoder().encode(payload));
+                    c2.close();
+                  },
+                }),
+              )
+              .then((r) => new TextDecoder().decode(r.rawBody ?? new Uint8Array())),
+          ),
+        ),
+      );
+      assert.equal(bodies.length, 24);
+      for (const b of bodies) {
+        assert.equal(b, payload, "every concurrent stream must arrive whole");
+      }
+    } finally {
+      await Promise.all(clients.map((c) => c.destroy()));
+      server.close();
+    }
+  });
+
+  await test("every body type reaches the server intact on both raw transports", async () => {
+    // The raw Node transports bypass fetch and write the body themselves, with
+    // a separate branch per type on each transport. The h2 and http1 writers
+    // are duplicated code, and neither had all four branches exercised: a
+    // ReadableStream upload over HTTP/2 in particular was a path with no test
+    // at all, which is exactly the shape that silently sends an empty body.
+    for (const httpVersion of ["HTTP/1.1", "HTTP/2"] as const) {
+      await withEchoServer(
+        async (send) => {
+          const cases: Array<[string, unknown, string]> = [
+            ["string", "plain-text-payload", "plain-text-payload"],
+            ["Uint8Array", new TextEncoder().encode("byte-payload"), "byte-payload"],
+            [
+              "ReadableStream",
+              new ReadableStream<Uint8Array>({
+                start(c) {
+                  c.enqueue(new TextEncoder().encode("stream-"));
+                  c.enqueue(new TextEncoder().encode("payload"));
+                  c.close();
+                },
+              }),
+              "stream-payload",
+            ],
+            ["URLSearchParams", new URLSearchParams({ a: "1", b: "2" }), "a=1&b=2"],
+            // No plain object here: JSON encoding happens in the client, above
+            // this layer, and `serializeRawBody` legitimately cannot encode one.
+            // The client's own suites cover object bodies end to end.
+          ];
+          for (const [label, body, expected] of cases) {
+            const { body: got } = await send(body);
+            assert.equal(got, expected, `${httpVersion}: ${label} body must arrive intact`);
+          }
+        },
+        false,
+        httpVersion,
+      );
+    }
+  });
+
+  await test("every body type arrives over real HTTP/2, negotiated by ALPN", async () => {
+    // The h2 body writer in core.ts is separate code from the http1 one, and it
+    // only runs over a real TLS+ALPN connection — h2 cannot be negotiated over
+    // cleartext here. The cleartext pass above therefore never reached it, which
+    // is why a ReadableStream upload over HTTP/2 had no test at all.
+    const { httpbinTlsBaseUrl, LOCAL_TLS_CA } = await import("./httpbin-local.ts");
+    const base = await httpbinTlsBaseUrl();
+    const transport = new NodeHTTP2Transport({ ca: LOCAL_TLS_CA, allowPrivateNetwork: true });
+    const cases: Array<[string, unknown, string]> = [
+      ["string", "h2-text", "h2-text"],
+      ["Uint8Array", new TextEncoder().encode("h2-bytes"), "h2-bytes"],
+      [
+        "ReadableStream",
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(new TextEncoder().encode("h2-"));
+            c.enqueue(new TextEncoder().encode("stream"));
+            c.close();
+          },
+        }),
+        "h2-stream",
+      ],
+      ["URLSearchParams", new URLSearchParams({ a: "1", b: "2" }), "a=1&b=2"],
+    ];
+    for (const [label, body, expected] of cases) {
+      const raw = await transport.send({
+        url: `${base}/post`,
+        method: "POST",
+        headers: {},
+        body: body as KinetexRequest["body"],
+        signal: null,
+        meta: {},
+        httpVersion: "HTTP/2",
+      } as KinetexRequest);
+      assert.equal(raw.httpVersion, "HTTP/2", "the fixture must really negotiate h2");
+      // The fixture echoes the received body in `data`, so the bytes are read
+      // back through the JSON response rather than a raw /echo endpoint.
+      const bytes = raw.body ? await readRawBody(raw.body, 0, base, null) : new Uint8Array(0);
+      const echoed = (JSON.parse(new TextDecoder().decode(bytes)) as { data?: string }).data ?? "";
+      assert.equal(echoed, expected, `HTTP/2: ${label} body must arrive intact`);
+    }
+    transport.destroy();
   });
 
   await test("an unsupported body type yields an empty body, not a broken request", async () => {

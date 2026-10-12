@@ -23,13 +23,14 @@ const users = await api.get<User[]>("/users");
 const post = await api.POST("/posts").withJSON({ title: "Hello" }).bearer("token").json<Post>();
 ```
 
-Works in **Node.js 18+**, **Deno**, **Bun**, **browsers**, **Cloudflare Workers**, **Vercel Edge**, and all **WinterCG-compliant** runtimes.
+Works in **Node.js 22+** (LTS lines: 22, 24, 26), **Deno**, **Bun**, **browsers**, **Cloudflare Workers**, **Vercel Edge**, and all **WinterCG-compliant** runtimes.
 
 ---
 
 ## Table of Contents
 
 - [Installation](#installation)
+- [Migrating from 1.4.x](#migrating-from-14x)
 - [Quick Start](#quick-start)
 - [Client Configuration](#client-configuration)
 - [Basic HTTP Methods](#basic-http-methods)
@@ -61,6 +62,7 @@ Works in **Node.js 18+**, **Deno**, **Bun**, **browsers**, **Cloudflare Workers*
 - [HAR Recording](#har-recording)
 - [OpenTelemetry Tracing](#opentelemetry-tracing)
 - [Pipeline Trace](#pipeline-trace)
+- [Private networks, DNS and TLS](#private-networks-dns-and-tls)
 - [Transport Layer](#transport-layer)
 - [Runtime Detection](#runtime-detection)
 - [Child Clients](#child-clients)
@@ -99,6 +101,37 @@ bun add kinetex
 ```ts
 import { kinetex } from "jsr:@kinetexjs/kinetex";
 ```
+
+---
+
+## Migrating from 1.4.x
+
+1.5.0 contains three breaking changes. Each has a one-line opt-out, so none of them requires you to change anything unless the new default breaks you.
+
+**`maxResponseSize` now defaults to 100 MB** instead of unlimited. The body is read in full before you see any of it, so an unbounded default let a single response exhaust the heap. If you legitimately receive responses over 100 MB:
+
+```ts
+kinetex({ maxResponseSize: 0 }); // 0 has always meant "no limit"
+```
+
+**`totalTimeoutMs` now defaults to the effective `timeout`.** `timeout` bounds one attempt, and the backoff between attempts was not bounded by anything — `timeout: 1_000` with `maxRetries: 5` could hold the caller for roughly 37 seconds. The whole-request ceiling now defaults to `timeout`, so if you were relying on retries outliving `timeout`, raise it or remove it:
+
+```ts
+kinetex({ timeout: 1_000, totalTimeoutMs: 0 }); // unbounded retries, as in 1.4.x
+```
+
+**`URLBuilderOptions` is removed.** It was exported from `kinetex/url` but no constructor, factory or method accepted it, so it could never have been passed anywhere. If you imported the name as a type, drop it — `from()` takes a base URL directly, and `sortParams` is a real method.
+
+Behaviour changes that are not breaking, but will change what you observe:
+
+- A request carrying an `Idempotency-Key` is now retried whatever its method. An unkeyed POST is still attempted exactly once.
+- `Cache-Control: private` responses are no longer cached. This cache is a `Map` in your process, shared across every request it makes, so storing a per-user response served it to whoever asked next. `honorCacheControl: false` opts out.
+- `SameSite=Lax` and `SameSite=Strict` cookies are now sent. The client stated no SameSite context, which by design sends only `Unset` and `None`, so most real sessions were going out without their cookie.
+- A 307/308 redirect carrying a stream or `Blob` body is now refused with a clear `EVALIDATION` rather than failing later as an opaque `ENETWORK`. Those methods preserve the body, and a one-shot body is spent after the first attempt. 301/302/303 are unaffected — they downgrade to GET.
+- A `WebSocket.send()` on a socket that is not OPEN, with `bufferMessages: false`, now reports through `onError` instead of dropping the message silently.
+- A caller-supplied `fetch` is exempt from the pre-flight DNS screen and owns its own resolution. The lexical screen still applies to the initial URL and every redirect hop.
+
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full list, including the defects this release fixes.
 
 ---
 
@@ -155,8 +188,10 @@ const client = kinetex({
   //                    (see "Redirects" under Transport Layer) — the transport is never
   //                    asked to follow, whatever this is set to
   httpsOnly: false, // Reject non-HTTPS URLs
-  maxResponseSize: 10_000_000, // Response body size limit (0 = no limit)
+  maxResponseSize: 10_000_000, // Response body size limit (default: 100 MB; 0 = no limit)
   maxRequestSize: 10_000_000, // Request body size limit (0 = no limit)
+  ca: [readFileSync("./corp-root.pem", "utf8")], // Extra CAs to trust (Node transports)
+  allowPrivateNetwork: false, // Permit private/loopback destinations
   strictHeaders: false, // Throw on invalid headers vs warn+drop
   onPipelineTrace: (step) => console.log(step), // Pipeline observability callback
   onSWRError: (err, req) => log(err), // Background SWR revalidation error callback
@@ -382,7 +417,7 @@ interface SendOptions<T = unknown> {
   maxRedirects?: number; // Max redirect hops (default: 20; 0 disables following)
   httpVersion?: HTTPVersion; // Preferred HTTP version
   maxRequestSize?: number; // Request size limit (bytes)
-  maxResponseSize?: number; // Response size limit (bytes)
+  maxResponseSize?: number; // Response size limit (bytes, default 104857600; 0 = unlimited)
   parseResponse?: (raw: Uint8Array, headers: Record<string, string>, url: string) => T | Promise<T>;
   parseFailure?: (raw: Uint8Array, error: Error) => void;
   onSuccess?: (res: KinetexResponse<T>) => void;
@@ -470,18 +505,54 @@ client.GET("/public").noAuth().json();
 kinetex({
   retry: {
     maxRetries: 3, // Max attempts (default: 3)
+    totalTimeoutMs: 20_000, // Ceiling on the WHOLE request: attempts + backoff (default: = timeout)
     baseDelayMs: 300, // Exponential back-off base (default: 300)
     maxDelayMs: 30_000, // Max delay cap (default: 30_000)
     jitter: 0.3, // Random jitter factor 0-1 (default: 0.3)
     statuses: [408, 429, 500, 502, 503, 504], // Status codes that trigger retry
     onNetworkError: true, // Retry on network errors (default: true)
     onTimeout: false, // Retry on timeouts (default: false)
+    // Only these methods are retried. A request carrying an `Idempotency-Key`
+    // is retried whatever its method — the key is the caller's declaration
+    // that repeating it is safe. See "Idempotency Keys" below.
     methods: ["GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE"],
     shouldRetry: (ctx) => ctx.attempt < 3 && ctx.response?.status === 503, // Custom predicate
     onRetry: (ctx, delayMs) => console.log(`Retry ${ctx.attempt} in ${delayMs}ms`),
   },
 });
 ```
+
+`timeout` applies to a single attempt; `totalTimeoutMs` bounds the whole logical
+request, backoff included, and defaults to `timeout`. Set it to `0` to remove
+the ceiling. When the next backoff would exceed the budget the retry is skipped
+rather than slept through, and the original response or error is what the caller
+receives — the budget never substitutes an `ETIMEOUT` for a real cause.
+
+### Idempotency Keys
+
+A `POST` is not retried by default, because replaying an unkeyed write can
+double-charge someone. A request that carries an `Idempotency-Key` **is** retried
+whatever its method: the header exists precisely to declare the request
+replayable, and the server collapses the duplicates.
+
+```ts
+import { generateIdempotencyKey, isValidIdempotencyKey } from "kinetex";
+
+// Keys are RFC 9562 v4 UUIDs from the runtime CSPRNG.
+const key = generateIdempotencyKey();
+isValidIdempotencyKey(key); // true
+
+// Any method, retried on transient failures, same key every attempt —
+// a fresh key per attempt would defeat the mechanism.
+await client.post("/charges", body, { headers: { "idempotency-key": key } });
+
+// Or fluently:
+await client.POST("/charges").withJSON(body).idempotencyKey().json();
+```
+
+An unkeyed `POST` is still attempted exactly once. Validation is 1–255 visible
+ASCII, so CR/LF/NUL cannot be smuggled into the headers, and a runtime without
+`crypto.getRandomValues` throws rather than falling back to a guessable value.
 
 ### RetryContext
 
@@ -935,7 +1006,7 @@ interface HookOptions {
 
 ## Request Deduplication
 
-Coalesces identical concurrent GET/HEAD requests into a single network call. The dedup key includes a SHA-256 fingerprint of every credential-bearing header, so two users calling the same URL with different `Authorization` / `Cookie` / API-key headers are never coalesced into one response:
+Coalesces identical concurrent GET/HEAD requests into a single network call. The dedup key includes a SHA-256 fingerprint of **every request header**, so two callers are only ever coalesced when they would have received the same response — different `Authorization`, `Cookie`, API key _or_ a tenant/session header each get their own in-flight slot. Per-request tracing headers (`traceparent`, `tracestate`, `baggage`, `x-request-id`, `x-correlation-id`, `x-trace-id`) are excluded, since every request carries its own and including them would disable coalescing entirely:
 
 ```ts
 import { CREDENTIAL_HEADERS } from "kinetex/cache";
@@ -1082,7 +1153,7 @@ const client = kinetex({
     // maxBodySizeBytes: 5 * 1024 * 1024, // skip caching larger bodies
     // defaultTtlMs: 60_000, // when the response has no Cache-Control (max 1 year)
     // maxAbsoluteAgeMs: 7 * 24 * 60 * 60 * 1000, // hard cap regardless of Cache-Control
-    // honorCacheControl: true, // respect no-store / no-cache
+    // honorCacheControl: true, // respect no-store / no-cache / private
     // cacheMethods: ["GET", "HEAD"],
     // cacheStatuses: [200, 203, 204, 206, 300, 301, 404, 405, 410, 414, 501],
     storage: new MemoryStorageAdapter(), // omit for plain in-memory
@@ -1687,7 +1758,7 @@ const ws = new WSClient({
   lowWaterMark: 16384,
   maxSendRate: 0, // 0 = unlimited
   keepRooms: true,
-  bufferMessages: true,
+  bufferMessages: true, // queue sends made while reconnecting; see below
   maxBufferSize: 1000,
   rooms: ["prices"],
   signal: controller.signal,
@@ -1750,6 +1821,11 @@ ws.leave("prices");
 ws.rooms; // readonly WSSubscribedRoom[]
 
 // Backpressure
+// With `bufferMessages: true` (default) a send made while the socket is not
+// OPEN is queued, up to `maxBufferSize`, oldest evicted first. With it false
+// there is nowhere to put that message: it is dropped, and the drop is reported
+// through `onError` — `send()` returns void, so silence would make a lost
+// message indistinguishable from a delivered one.
 ws.backpressure; // { bufferedBytes, highWaterMark, lowWaterMark, isBackpressured, ... }
 await ws.drain(30_000); // Wait until outbound buffer is flushed
 await ws.drainAndClose(30_000); // Drain, then close gracefully
@@ -2381,7 +2457,7 @@ HAR logs are routinely exported and shared, so entries are redacted before they 
 - **URLs** — sensitive query parameters (`api_key`, `access_token`, `signature`, `password`, `code`, `sas`, …) and the fragment are masked, in both `request.url` and `request.queryString[]`. Non-sensitive parameters and the rest of the URL are preserved so the log stays useful.
 - **`Location`** — the redirect target is passed through the same URL redaction.
 - **Bodies** — response text is recorded only for `json`/`xml`/`text/plain`/`javascript` content types and truncated to 8 KiB; HTML and binary bodies are never recorded.
-- **Request bodies** — recorded as `request.postData` (`{ mimeType, text }`) under the same policy and the same limit, so a HAR viewer shows what was actually sent. A `ReadableStream` or `FormData` body is omitted rather than buffered, since reading it would consume it; `request.bodySize` is `-1` for those, as it always was.
+- **Request bodies** — recorded as `request.postData` (`{ mimeType, text }`) under the same policy and the same limit, so a HAR viewer shows what was actually sent. A `ReadableStream` or `FormData` body is omitted rather than buffered, since reading it would consume it; `request.bodySize` is `-1` for those, as it always was. For a `json` body the same sensitive names used for headers and query parameters (`password`, `token`, `api_key`, `secret`, …) are replaced with `***REDACTED***` at any nesting depth, since a JSON body is where credentials most often travel and HAR files get shared. Non-JSON bodies keep their text, but the literal values of this request's own credentials — the credential header, the part after its scheme, and sensitive query parameters — are still replaced wherever they appear, which catches a server echoing a token back in an error message.
 
 ```ts
 // ?api_key=SUPERSECRET&page=2  →  https://api.example.com/v1/items?api_key=***REDACTED***&page=2
@@ -2465,6 +2541,61 @@ Pipeline stages in order:
 
 ---
 
+## Private networks, DNS and TLS
+
+```ts
+const client = kinetex({
+  baseURL: "https://internal.svc",
+
+  // Trust a private CA alongside the system store. Without this, a service mesh
+  // or enterprise proxy whose certificate a corporate CA issued fails TLS.
+  // Node's transports only — `fetch` exposes no CA option, so a custom `fetch`
+  // or `dispatcher` setup has to carry its own.
+  ca: [readFileSync("./corp-root.pem", "utf8")],
+
+  // Reach localhost, a service mesh or a local dev server. Off by default.
+  allowPrivateNetwork: true,
+});
+```
+
+### How the screen works
+
+A URL is a name, not an address, so screening the text you typed does not
+describe what the socket will do. Three layers close that gap:
+
+1. **Lexical.** `isSafeURL` rejects a literal loopback, private, link-local or
+   otherwise blocked address, on the initial URL and on every redirect hop.
+2. **Resolution, pinned (Node).** `NodeHTTP2Transport` and the HTTP/1.1 path
+   resolve once and hand the _checked_ address to the socket
+   (`createPinnedLookup`). A name answering with both a public and a private
+   address keeps only the public one; one answering with only private space
+   fails with `EBLOCKEDHOST` rather than connecting.
+3. **Resolution, pre-flight (`FetchTransport`).** `fetch` exposes no resolver
+   hook — undici owns the connection — so `FetchTransport` resolves before the
+   call and refuses a host whose answers are all blocked. This layer applies
+   only when kinetex is using the runtime's own `fetch`. Supply your own via
+   the `fetch` option and you own resolution end to end: kinetex screens every
+   URL lexically, but it cannot observe which address your dispatcher dials, so
+   checking the system resolver's answer would describe a lookup that never
+   happens. Treat `fetch` the way you would treat a custom `dispatcher` — a
+   decision you have taken responsibility for.
+
+The second layer closes rebinding completely, because the address that passed
+the check is the address that is dialled. The third cannot: it is a check
+followed by a separate resolution inside `fetch`, so a resolver that answers
+public on the first lookup and private on the second is not caught here. On
+Node you get the pinned path; on Deno, Bun and edge runtimes this is the
+residual exposure, and it is worth a runtime-level DNS policy where one is
+available.
+
+### What the opt-out really does
+
+`allowPrivateNetwork: true` is not a narrower exception — it turns the screen
+off for the initial URL _and_ for every redirect hop, and it is the reason a
+redirect to `http://127.0.0.1:9/` is followed rather than refused. Set it only
+where the URLs you request are not influenced by anyone else: local
+development, a service mesh you control, and the test suite.
+
 ## Transport Layer
 
 ### Redirects
@@ -2490,7 +2621,10 @@ Every hop is subject to:
 - **Loop detection.** A target already visited in this chain is refused with
   `RedirectError` (`EREDIRECT`, "Redirect loop detected").
 - **Method downgrade.** Per RFC 7231, 301/302/303 downgrade to `GET` and drop
-  the body; 307/308 preserve both.
+  the body; 307/308 preserve both. A 307/308 therefore needs the body a second
+  time, and a `ReadableStream`/`Blob` body is spent after the first attempt — so
+  that hop is refused with `EVALIDATION` rather than silently sent empty. Buffer
+  the body first, or disable redirects for that request.
 - **Credentials.** `Authorization`, `apikey` headers, `Cookie` and any
   declared auth are dropped when a hop changes origin, and kept when it does
   not. Intermediate `Set-Cookie` headers are captured by the jar, so cookies
@@ -2804,14 +2938,7 @@ import {
   buildDataURL,
   diffURLs,
 } from "kinetex/url";
-import type {
-  ParsedURL,
-  URLBuilderOptions,
-  URLPattern,
-  URLPatternMatch,
-  URLDiff,
-  DataURLParts,
-} from "kinetex/url";
+import type { ParsedURL, URLPattern, URLPatternMatch, URLDiff, DataURLParts } from "kinetex/url";
 
 // URL Builder (fluent, immutable — every method returns a new builder)
 const builder = URLBuilder.from("https://api.example.com")
@@ -3226,8 +3353,12 @@ isSafeURL("http://169.254.169.254/latest/meta-data/"); // false
 isSafeURL("http://[::ffff:127.0.0.1]/"); // false
 
 // Applied to the initial URL AND to every redirect hop, so a public host cannot
-// bounce a request into the private network. (DNS rebinding is out of scope —
-// the check is literal-address based, not a resolution.)
+// bounce a request into the private network.
+//
+// These helpers are literal-address checks. Resolution is handled separately by
+// the transports: the Node ones resolve once and pin the checked address to the
+// socket, and `FetchTransport` resolves before the call and refuses a host whose
+// answers are all blocked. See "Private networks and DNS" below.
 sanitizeURL("javascript:alert(1)"); // null — invalid or an SSRF risk
 sanitizeURL("https://user:pass@api.example.com/x"); // "https://api.example.com/x" (credentials stripped)
 
@@ -3489,14 +3620,7 @@ import type { Socks5ProxyConfig, Socks5Tunnel, Socks5Target, TcpConnector } from
 import type { FetchTransportOptions } from "kinetex/core";
 import type { OTelTracer, OTelSpan } from "kinetex";
 import type { SafeJSONParseOptions, SafeJSONParseResult, ErrorContext } from "kinetex";
-import type {
-  ParsedURL,
-  URLBuilderOptions,
-  URLPattern,
-  URLPatternMatch,
-  URLDiff,
-  DataURLParts,
-} from "kinetex/url";
+import type { ParsedURL, URLPattern, URLPatternMatch, URLDiff, DataURLParts } from "kinetex/url";
 ```
 
 ---
@@ -3567,26 +3691,26 @@ import { kinetex } from "kinetex/browser";
 
 ## Runtime Compatibility
 
-| Feature                                   | Node 18+                 | Node 22+ | Deno          | Bun           | Browser       | CF Workers    | Vercel Edge   |
-| ----------------------------------------- | ------------------------ | -------- | ------------- | ------------- | ------------- | ------------- | ------------- |
-| HTTP/1.1 fetch                            | ✓                        | ✓        | ✓             | ✓             | ✓             | ✓             | ✓             |
-| HTTP/2 (fetch, via Alt-Svc/runtime hints) | ✓*                       | ✓        | ✓             | ✓             | ✓             | ✓             | ✓             |
-| HTTP/2 (NodeHTTP2Transport)               | ✗                        | ✓        | ✗             | ✗             | ✗             | ✗             | ✗             |
-| HTTP/3 (detection via Alt-Svc)            | ✓*                       | ✓*       | ✓*            | ✓*            | experimental  | ✓*            | ✓*            |
-| WebSocket (WSClient)                      | ✗¹ (no native WebSocket) | ✓        | ✓             | ✓             | ✓             | partial²      | ✗³            |
-| SOCKS5 proxy                              | ✓                        | ✓        | ✓             | ✓             | ✗             | ✗             | ✗             |
-| Blob                                      | ✓                        | ✓        | ✓             | ✓             | ✓             | guarded       | guarded       |
-| DOMException                              | ✓                        | ✓        | ✓             | ✓             | ✓             | guarded       | guarded       |
-| Buffer                                    | ✓                        | ✓        | ✓             | ✓             | ✗             | ✗             | ✗             |
-| crypto.subtle                             | ✓                        | ✓        | ✓             | ✓             | ✓             | ✓             | ✓             |
-| ReadableStream                            | ✓                        | ✓        | ✓             | ✓             | ✓             | ✓             | ✓             |
-| URL pattern matching                      | ✓                        | ✓        | ✓             | ✓             | ✓             | ✓             | ✓             |
-| Brotli decompression                      | ✓                        | ✓        | ✗ passthrough | ✗ passthrough | ✗ passthrough | ✗ passthrough | ✗ passthrough |
-| Gzip/deflate decompression                | ✓                        | ✓        | ✓             | ✓             | ✓             | ✓             | ✓             |
+| Feature                                   | Node 22+ | Deno | Bun           | Browser       | CF Workers    | Vercel Edge   |
+| ----------------------------------------- | -------- | ---- | ------------- | ------------- | ------------- | ------------- |
+| HTTP/1.1 fetch                            | ✓        | ✓    | ✓             | ✓             | ✓             | ✓             |
+| HTTP/2 (fetch, via Alt-Svc/runtime hints) | ✓*       | ✓    | ✓             | ✓             | ✓             | ✓             |
+| HTTP/2 (NodeHTTP2Transport)               | ✓        | ✗    | ✗             | ✗             | ✗             | ✗             |
+| HTTP/3 (detection via Alt-Svc)            | ✓*       | ✓*   | ✓*            | experimental  | ✓*            | ✓*            |
+| WebSocket (WSClient)                      | ✓        | ✓    | ✓             | ✓             | partial²      | ✗³            |
+| SOCKS5 proxy                              | ✓        | ✓    | ✓             | ✓             | ✗             | ✗             | ✗             |
+| Blob                                      | ✓        | ✓    | ✓             | ✓             | ✓             | guarded       | guarded       |
+| DOMException                              | ✓        | ✓    | ✓             | ✓             | ✓             | guarded       | guarded       |
+| Buffer                                    | ✓        | ✓    | ✓             | ✓             | ✗             | ✗             | ✗             |
+| crypto.subtle                             | ✓        | ✓    | ✓             | ✓             | ✓             | ✓             | ✓             |
+| ReadableStream                            | ✓        | ✓    | ✓             | ✓             | ✓             | ✓             | ✓             |
+| URL pattern matching                      | ✓        | ✓    | ✓             | ✓             | ✓             | ✓             | ✓             |
+| Brotli decompression                      | ✓        | ✓    | ✗ passthrough | ✗ passthrough | ✗ passthrough | ✗ passthrough | ✗ passthrough |
+| Gzip/deflate decompression                | ✓        | ✓    | ✓             | ✓             | ✓             | ✓             | ✓             |
 
-\* HTTP/2+ detection is best-effort and internal. kinetex's own `detectHTTPVersion()` helper (not exported) reports HTTP/2 only when the runtime exposes protocol evidence — a response `httpVersion`/`protocol` property, or an `Alt-Svc` header — and otherwise reports `HTTP/1.1`. The version on every `KinetexResponse` comes from that heuristic, so it is not a guarantee. This is accurate for Node 18's undici fetch, which does not negotiate h2 by default; use `NodeHTTP2Transport` (Node 22+) when you need guaranteed HTTP/2.
+\* HTTP/2+ detection is best-effort and internal. kinetex's own `detectHTTPVersion()` helper (not exported) reports HTTP/2 only when the runtime exposes protocol evidence — a response `httpVersion`/`protocol` property, or an `Alt-Svc` header — and otherwise reports `HTTP/1.1`. The version on every `KinetexResponse` comes from that heuristic, so it is not a guarantee. This is accurate for any runtime whose `fetch` does not negotiate h2 by default; use `NodeHTTP2Transport` (Node 22+) when you need guaranteed HTTP/2.
 
-¹ WSClient requires a native `WebSocket` constructor. Node added one in v22 — on Node 18 use a polyfill (`globalThis.WebSocket = require('undici').WebSocket`).
+¹ WSClient requires a native `WebSocket` constructor, which every supported Node.js version (22+) provides.
 
 ² Cloudflare Workers exposes a `WebSocket` constructor, but outbound client connections depend on runtime support.
 

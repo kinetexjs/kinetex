@@ -56,12 +56,13 @@ jobs:
           git archive --format=tar.gz -o kinetex-dist.tar.gz --prefix=kinetex-${{ github.ref_name }}/ HEAD
           git archive --format=zip -o kinetex-dist.zip --prefix=kinetex-${{ github.ref_name }}/ HEAD
 
+      # Generated locally rather than by `sbom-generator-action`, which needs
+      # GitHub Advanced Security and was therefore unavailable here — behind a
+      # `continue-on-error`, so the step quietly produced nothing on every
+      # release. `scripts/sbom.ts` derives the document from the lockfile and
+      # runs on any npm.
       - name: Generate SBOM (CycloneDX)
-        uses: advanced-security/sbom-generator-action@v0.0.1
-        id: sbom
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
+        run: npx tsx scripts/sbom.ts
 
       - name: Upload dist artifacts
         uses: actions/upload-artifact@v4
@@ -114,4 +115,3 @@ jobs:
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          

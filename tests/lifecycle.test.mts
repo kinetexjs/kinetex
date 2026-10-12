@@ -5,6 +5,7 @@
  */
 
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 import { kinetex } from "../src/mod.ts";
 import { HTTPStatusError } from "../src/types.ts";
 import {
@@ -29,12 +30,14 @@ import {
   RedirectTracker,
   TooManyRedirectsError,
 } from "../src/lifecycle.ts";
+import type { HookRequest, HookResponse } from "../src/lifecycle.ts";
+import { makeHookRequest } from "./fixtures.ts";
 
 let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
-async function test(name: string, fn: () => Promise<void>): Promise<void> {
+async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
     await fn();
     console.log(`  ✅  ${name}`);
@@ -51,12 +54,12 @@ function suite(name: string): void {
   console.log(`\n── ${name}`);
 }
 
-const bin = kinetex({ baseURL: "https://httpbin.org", timeout: 30_000 });
+const bin = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: 30_000, allowPrivateNetwork: true });
 
 // Fixtures for the in-memory blocks. Several suites below drive the registry
 // directly so the assertion is exact and the result does not depend on a live
 // API; the same three-line literals were repeated inline a dozen times.
-function hookReq(over: Record<string, unknown> = {}): any {
+function hookReq(over: Partial<HookRequest> = {}): HookRequest {
   return {
     url: "https://x.test/a",
     method: "GET",
@@ -67,7 +70,7 @@ function hookReq(over: Record<string, unknown> = {}): any {
     ...over,
   };
 }
-function hookRes(over: Record<string, unknown> = {}): any {
+function hookRes(over: Partial<HookResponse> = {}): HookResponse {
   return {
     status: 200,
     statusText: "OK",
@@ -184,7 +187,7 @@ await test("503 triggers onError with request data", async () => {
     },
   );
 
-  assert.equal(url, "https://httpbin.org/status/503");
+  assert.equal(url, `${HTTPBIN_LOCAL_ORIGIN}/status/503`);
 });
 
 // ============================================================================
@@ -195,12 +198,20 @@ suite("createLoggingHooks with real HTTP");
 
 await test("loggingHooks beforeRequest logs the outgoing request", async () => {
   const logged: Array<[string, any]> = [];
-  const logging = createLoggingHooks({ logger: (msg, data) => logged.push([msg, data]) });
+  const logging = createLoggingHooks({
+    logger: (msg, data) => {
+      logged.push([msg, data]);
+    },
+  });
 
   const reg = new HookRegistry();
   reg.addBeforeRequest(logging.beforeRequest);
 
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: 30_000 });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: 30_000,
+    allowPrivateNetwork: true,
+  });
   const eject = client.attachHookRegistry(reg);
   try {
     const res = await client.get("/get");
@@ -210,7 +221,7 @@ await test("loggingHooks beforeRequest logs the outgoing request", async () => {
     assert.equal(logged.length, 1, "beforeRequest must log exactly one record");
     assert.equal(logged[0]![0], "→ request");
     assert.equal(logged[0]![1].method, "GET");
-    assert.equal(logged[0]![1].url, "https://httpbin.org/get");
+    assert.equal(logged[0]![1].url, `${HTTPBIN_LOCAL_ORIGIN}/get`);
     assert.equal(typeof logged[0]![1].headers, "object");
   } finally {
     eject();
@@ -219,12 +230,20 @@ await test("loggingHooks beforeRequest logs the outgoing request", async () => {
 
 await test("loggingHooks afterResponse logs the incoming response", async () => {
   const logged: Array<[string, any]> = [];
-  const logging = createLoggingHooks({ logger: (msg, data) => logged.push([msg, data]) });
+  const logging = createLoggingHooks({
+    logger: (msg, data) => {
+      logged.push([msg, data]);
+    },
+  });
 
   const reg = new HookRegistry();
   reg.addAfterResponse(logging.afterResponse);
 
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: 30_000 });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: 30_000,
+    allowPrivateNetwork: true,
+  });
   const eject = client.attachHookRegistry(reg);
   try {
     const res = await client.get("/get");
@@ -232,7 +251,7 @@ await test("loggingHooks afterResponse logs the incoming response", async () => 
     assert.equal(logged.length, 1, "afterResponse must log exactly one record");
     assert.equal(logged[0]![0], "← response");
     assert.equal(logged[0]![1].status, 200);
-    assert.equal(logged[0]![1].url, "https://httpbin.org/get");
+    assert.equal(logged[0]![1].url, `${HTTPBIN_LOCAL_ORIGIN}/get`);
   } finally {
     eject();
   }
@@ -284,14 +303,20 @@ await test("loggingHooks with custom logger", async () => {
 await test("loggingHooks redactHeaders replaces the configured values", async () => {
   const logged: Array<[string, any]> = [];
   const logging = createLoggingHooks({
-    logger: (msg, data) => logged.push([msg, data]),
+    logger: (msg, data) => {
+      logged.push([msg, data]);
+    },
     redactHeaders: ["content-type", "x-api-key"],
   });
 
   const reg = new HookRegistry();
   reg.addBeforeRequest(logging.beforeRequest);
 
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: 30_000 });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: 30_000,
+    allowPrivateNetwork: true,
+  });
   const eject = client.attachHookRegistry(reg);
   try {
     const res = await client.get("/get", {
@@ -387,8 +412,9 @@ for (const [label, call] of [
     // because upstream asked" (not a bug).
     let retries = 0;
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
       timeout: 30_000,
+      allowPrivateNetwork: true,
       retry: {
         onRetry: () => {
           retries++;
@@ -412,7 +438,7 @@ for (const [label, call] of [
         new Array(retries + 1).fill(label.split(" ")[0]!),
         "the hook must see the request method, once per attempt",
       );
-      assert.equal(urls[0], `https://httpbin.org${label.split(" ")[1]!}`);
+      assert.equal(urls[0], `${HTTPBIN_LOCAL_ORIGIN}${label.split(" ")[1]!}`);
     } finally {
       eject();
     }
@@ -440,7 +466,11 @@ await test("GET /json with afterResponse", async () => {
 });
 
 await test("GET /html fires afterResponse with the body intact", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: 30_000 });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: 30_000,
+    allowPrivateNetwork: true,
+  });
   const reg = new HookRegistry();
   let bodySeen: string | Uint8Array | null = null;
   reg.addAfterResponse(async (res) => {
@@ -460,7 +490,11 @@ await test("GET /html fires afterResponse with the body intact", async () => {
 });
 
 await test("GET /bytes/100 reports the byte length to afterResponse", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: 30_000 });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: 30_000,
+    allowPrivateNetwork: true,
+  });
   const reg = new HookRegistry();
   let size = -1;
   reg.addAfterResponse(async (res) => {
@@ -497,12 +531,20 @@ await test("custom headers sent to server", async () => {
 
   bin.attachHookRegistry(reg);
 
-  const res = await bin.get<any>("/headers", { headers: { "X-Custom": "TestValue" } });
-  assert.equal(res.data.headers["X-Custom"], "TestValue");
+  const res = await bin.get<any>("/headers", {
+    headers: { "X-Custom": "TestValue" },
+  });
+  // Lower-cased: header names are case-insensitive on the wire and kinetex sends
+  // them that way. httpbin echoes the casing its own client chose.
+  assert.equal(res.data.headers["x-custom"], "TestValue");
 });
 
 await test("hook can add headers", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: 30_000 });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: 30_000,
+    allowPrivateNetwork: true,
+  });
   const reg = new HookRegistry();
   reg.addBeforeRequest(async (req) => {
     req.headers["X-HookAdded"] = "true";
@@ -585,8 +627,16 @@ await test("concurrent GET requests", async () => {
 
   bin.attachHookRegistry(reg);
 
-  const client1 = kinetex({ baseURL: "https://httpbin.org", timeout: 30_000 });
-  const client2 = kinetex({ baseURL: "https://httpbin.org", timeout: 30_000 });
+  const client1 = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: 30_000,
+    allowPrivateNetwork: true,
+  });
+  const client2 = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: 30_000,
+    allowPrivateNetwork: true,
+  });
   client1.attachHookRegistry(reg);
   client2.attachHookRegistry(reg);
 
@@ -853,8 +903,8 @@ await test("condition: false suppresses the hook in every phase that supports it
   const req = hookReq();
   await reg.runBeforeRequest(req, ctx);
   await reg.runAfterRequest(req, ctx);
-  await reg.runBeforeResponse(hookRes(req), ctx);
-  await reg.runAfterResponse(hookRes(req), ctx);
+  await reg.runBeforeResponse(hookRes({ request: req }), ctx);
+  await reg.runAfterResponse(hookRes({ request: req }), ctx);
   await reg.runOnError({ error: new Error("e"), request: req, response: null, attempt: 1 }, ctx);
   await reg.runOnRetry(
     { attempt: 2, maxRetries: 3, delayMs: 1, reason: null, request: req, response: null },
@@ -865,7 +915,7 @@ await test("condition: false suppresses the hook in every phase that supports it
   reg.runOnDownloadProgress({ loaded: 1, total: 2, percent: 50, rate: null, elapsed: 1 }, ctx);
   reg.runOnCancel({ request: req, reason: null }, ctx);
   reg.runOnConnection({ type: "connect", host: "h", port: 1, protocol: "https", elapsed: 1 }, ctx);
-  const wrapped = await reg.wrapWithAround(ctx, async () => hookRes(req))();
+  const wrapped = await reg.wrapWithAround(ctx, async () => hookRes({ request: req }))();
 
   assert.deepEqual(fired, [], "no hook may run when its condition is false");
   assert.equal(wrapped.status, 200, "a suppressed around hook must still reach the dispatch");
@@ -947,8 +997,8 @@ await test("condition: true still runs in every phase", async () => {
 
   await reg.runBeforeRequest(req, ctx);
   await reg.runAfterRequest(req, ctx);
-  await reg.runBeforeResponse(hookRes(req), ctx);
-  await reg.runAfterResponse(hookRes(req), ctx);
+  await reg.runBeforeResponse(hookRes({ request: req }), ctx);
+  await reg.runAfterResponse(hookRes({ request: req }), ctx);
   await reg.runOnError({ error: new Error("e"), request: req, response: null, attempt: 1 }, ctx);
   await reg.runOnRetry(
     { attempt: 2, maxRetries: 3, delayMs: 1, reason: null, request: req, response: null },
@@ -1109,7 +1159,7 @@ await test("addAround hook wraps the dispatch", async () => {
   assert.equal(typeof id, "string");
   const req = hookReq();
   const ctx = createHookContext(req);
-  const res = await reg.wrapWithAround(ctx, async () => hookRes(req))();
+  const res = await reg.wrapWithAround(ctx, async () => hookRes({ request: req }))();
   assert.equal(entered, true, "the around hook must be entered");
   assert.equal(res.status, 200, "and the dispatch must still run");
 });
@@ -1227,14 +1277,10 @@ await test("composeBeforeRequest combines hooks", async () => {
   const hook2 = async (req: any) => ({ ...req, headers: { ...req.headers, "X-2": "2" } });
   const composed = composeBeforeRequest(hook1, hook2);
 
-  const result = await composed({
-    url: "/test",
-    method: "GET",
-    headers: {},
-    body: null,
-    signal: null,
-    meta: {},
-  });
+  const result = (await composed(
+    makeHookRequest({ url: "/test" }),
+    createHookContext(hookReq()),
+  )) as HookRequest;
   assert.equal(result.headers["X-1"], "1");
   assert.equal(result.headers["X-2"], "2");
 });
@@ -1244,11 +1290,13 @@ await test("composeBeforeResponse transforms response", async () => {
   const hook2 = async (res: any) => ({ ...res, statusText: "Created" });
   const composed = composeBeforeResponse(hook1, hook2);
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   const res = { status: 200, statusText: "OK", headers: {}, body: null, request: req };
   const ctx = createHookContext(req);
 
-  const result = await composed(res, ctx);
+  const maybe = await composed(res, ctx);
+  assert.ok(maybe !== undefined, "the hook must return the value it modified");
+  const result = maybe as HookResponse;
   assert.equal(result.status, 201);
 });
 
@@ -1260,7 +1308,7 @@ await test("composeAround wraps execution", async () => {
     return res;
   });
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   const res = { status: 200, statusText: "OK", headers: {}, body: null, request: req };
   const ctx = createHookContext(req);
 
@@ -1271,7 +1319,7 @@ await test("composeAround wraps execution", async () => {
 await test("validateResponse throws on invalid", async () => {
   const hook = validateResponse((res) => (res.status >= 400 ? "Error" : true));
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   const badRes = { status: 400, statusText: "Error", headers: {}, body: null, request: req };
   const ctx = createHookContext(req);
 
@@ -1288,54 +1336,56 @@ await test("validateResponse throws on invalid", async () => {
 await test("injectHeaders adds headers", async () => {
   const hook = injectHeaders({ "X-Custom": "value" });
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
-  const result = await hook(req);
+  const req = makeHookRequest({ url: "/test" });
+  const maybe = await hook(req, createHookContext(hookReq()));
+  assert.ok(maybe !== undefined, "the hook must return the value it modified");
+  const result = maybe as HookRequest;
   assert.equal(result.headers["X-Custom"], "value");
 });
 
 await test("injectHeaders with async function", async () => {
   const hook = injectHeaders(async () => ({ "X-Func": "value" }));
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
-  const result = await hook(req);
+  const req = makeHookRequest({ url: "/test" });
+  const maybe = await hook(req, createHookContext(hookReq()));
+  assert.ok(maybe !== undefined, "the hook must return the value it modified");
+  const result = maybe as HookRequest;
   assert.equal(result.headers["X-Func"], "value");
 });
 
 await test("withBaseURL sets relative URL", async () => {
   const hook = withBaseURL("https://api.example.com");
 
-  const req = { url: "/users", method: "GET", headers: {}, body: null, signal: null, meta: {} };
-  const result = await hook(req);
+  const req = makeHookRequest({ url: "/users" });
+  const maybe = await hook(req, createHookContext(hookReq()));
+  assert.ok(maybe !== undefined, "the hook must return the value it modified");
+  const result = maybe as HookRequest;
   assert.equal(result.url, "https://api.example.com/users");
 });
 
 await test("withBaseURL returns undefined for absolute", async () => {
   const hook = withBaseURL("https://api.example.com");
 
-  const req = {
-    url: "https://other.com/path",
-    method: "GET",
-    headers: {},
-    body: null,
-    signal: null,
-    meta: {},
-  };
-  const result = await hook(req);
+  const req = makeHookRequest({ url: "https://other.com/path" });
+  const result = await hook(req, createHookContext(hookReq()));
   assert.equal(result, undefined);
 });
 
 await test("throwOnHTTPError throws on error status", async () => {
   const hook = throwOnHTTPError();
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   let threw = false;
   try {
-    await hook({
-      error: new Error("test"),
-      request: req,
-      response: { status: 500, statusText: "Error", headers: {}, body: null, request: req },
-      attempt: 1,
-    });
+    await hook(
+      {
+        error: new Error("test"),
+        request: req,
+        response: { status: 500, statusText: "Error", headers: {}, body: null, request: req },
+        attempt: 1,
+      },
+      createHookContext(hookReq()),
+    );
   } catch (e) {
     threw = true;
     assert.ok(e instanceof HTTPError);
@@ -1346,17 +1396,20 @@ await test("throwOnHTTPError throws on error status", async () => {
 await test("throwOnHTTPError passes valid", async () => {
   const hook = throwOnHTTPError();
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   // A 200 must pass through untouched — make that a positive claim rather than
   // an absence of a throw.
   let returned: unknown = "unset";
   await assert.doesNotReject(async () => {
-    returned = await hook({
-      error: new Error("test"),
-      request: req,
-      response: { status: 200, statusText: "OK", headers: {}, body: null, request: req },
-      attempt: 1,
-    });
+    returned = await hook(
+      {
+        error: new Error("test"),
+        request: req,
+        response: { status: 200, statusText: "OK", headers: {}, body: null, request: req },
+        attempt: 1,
+      },
+      createHookContext(hookReq()),
+    );
   });
   assert.equal(returned, undefined, "a passing response must be returned unmodified");
 });
@@ -1367,20 +1420,13 @@ await test("tap runs side-effect", async () => {
     tapped = true;
   });
 
-  const result = await hook({
-    url: "/test",
-    method: "GET",
-    headers: {},
-    body: null,
-    signal: null,
-    meta: {},
-  });
+  const result = (await hook(makeHookRequest({ url: "/test" }))) as HookRequest;
   assert.equal(tapped, true);
   assert.equal(result.url, "/test");
 });
 
 await test("HTTPError has correct properties", () => {
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   const res = { status: 500, statusText: "Error", headers: {}, body: null, request: req };
 
   const err = new HTTPError(500, "Error", res);
@@ -1390,7 +1436,7 @@ await test("HTTPError has correct properties", () => {
 });
 
 await test("ResponseValidationError has correct properties", () => {
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   const res = { status: 400, statusText: "Bad", headers: {}, body: null, request: req };
 
   const err = new ResponseValidationError("Invalid", res);
@@ -1434,7 +1480,7 @@ await test("ProgressTracker.complete returns final", () => {
 
 await test("RedirectTracker records", () => {
   const tracker = new RedirectTracker(5);
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
 
   const event = tracker.record("https://a.com", "https://b.com", 301, req);
 
@@ -1443,7 +1489,7 @@ await test("RedirectTracker records", () => {
 
 await test("TooManyRedirectsError throws", () => {
   const tracker = new RedirectTracker(2);
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
 
   tracker.record("https://a.com", "https://b.com", 301, req);
   tracker.record("https://b.com", "https://c.com", 301, req);
@@ -1472,7 +1518,7 @@ await test("wrapWithAround wraps dispatch", async () => {
     return next();
   });
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   const ctx = createHookContext(req);
 
   const wrappedFn = reg.wrapWithAround(ctx, async () => ({
@@ -1498,7 +1544,7 @@ await test("runOnUploadProgress with condition", () => {
     { condition: () => true },
   );
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   const ctx = createHookContext(req);
 
   reg.runOnUploadProgress({ loaded: 100, total: 1000, percent: 10, rate: 100, elapsed: 100 }, ctx);
@@ -1512,7 +1558,7 @@ await test("runOnDownloadProgress fires", () => {
     called = true;
   });
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   const ctx = createHookContext(req);
 
   reg.runOnDownloadProgress(
@@ -1526,7 +1572,7 @@ await test("runOnRedirect returns false when hook returns false", async () => {
   const reg = new HookRegistry();
   reg.addOnRedirect(async () => false);
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   const ctx = createHookContext(req);
 
   const allow = await reg.runOnRedirect(
@@ -1550,7 +1596,7 @@ await test("runOnCancel fires", () => {
     called = true;
   });
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   const ctx = createHookContext(req);
 
   reg.runOnCancel({ request: req, reason: new Error("cancelled") }, ctx);
@@ -1581,7 +1627,7 @@ await test("runBeforeResponse transforms", async () => {
   const reg = new HookRegistry();
   reg.addBeforeResponse(async (res) => ({ ...res, status: 201 }));
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   const ctx = createHookContext(req);
 
   const res = { status: 200, statusText: "OK", headers: {}, body: null, request: req };
@@ -1597,7 +1643,7 @@ await test("runOnRetry fires", async () => {
     called = true;
   });
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   const ctx = createHookContext(req);
 
   await reg.runOnRetry(
@@ -1622,7 +1668,7 @@ await test("runAfterRequest fires", async () => {
     called = true;
   });
 
-  const req = { url: "/test", method: "GET", headers: {}, body: null, signal: null, meta: {} };
+  const req = makeHookRequest({ url: "/test" });
   const ctx = createHookContext(req);
 
   await reg.runAfterRequest(req, ctx);
@@ -1633,14 +1679,7 @@ await test("createAbortHook with signal", async () => {
   const abort = createAbortHook();
   const controller = new AbortController();
 
-  const req = {
-    url: "/test",
-    method: "GET",
-    headers: {},
-    body: null,
-    signal: controller.signal,
-    meta: {},
-  };
+  const req = makeHookRequest({ url: "/test", signal: controller.signal });
   const ctx = createHookContext(req);
 
   // beforeRequest is synchronous, so doesNotReject is the wrong shape here.
@@ -1654,14 +1693,7 @@ await test("createAbortHook throws when aborted", async () => {
   const controller = new AbortController();
   controller.abort();
 
-  const req = {
-    url: "/test",
-    method: "GET",
-    headers: {},
-    body: null,
-    signal: controller.signal,
-    meta: {},
-  };
+  const req = makeHookRequest({ url: "/test", signal: controller.signal });
   const ctx = createHookContext(req);
 
   let threw = false;
@@ -1694,7 +1726,7 @@ await test("error hook recovery response is returned to the caller", async () =>
   // point of the type.
   const hookErr = { error: new Error("test error"), request: req, response: null, attempt: 3 };
   const result = await reg.runOnError(hookErr, hookCtx);
-  assert.notEqual(result, null);
+  assert.ok(result !== null);
   assert.equal(result!.status, 200);
   assert.equal(result!.statusText, "Recovered");
   assert.equal(saw, hookErr, "the hook must receive the exact HookError it was given");
@@ -1705,7 +1737,10 @@ await test("error hook recovery response is returned to the caller", async () =>
 // Lines 900-909: body normalization hook with non-Uint8Array body
 await test("createBodyNormalizationHook non-Uint8Array body covers line 907", async () => {
   const hook = createBodyNormalizationHook("utf-8");
-  const result = hook({ status: 200, statusText: "OK", headers: {}, body: "already string" });
+  const result = hook(
+    { status: 200, statusText: "OK", headers: {}, body: "already string", request: hookReq() },
+    createHookContext(hookReq()),
+  );
   assert.equal(result, undefined);
 });
 
@@ -1749,7 +1784,7 @@ await test("perfNow uses Date.now when performance missing", async () => {
   (globalThis as any).performance = undefined;
   try {
     const { createHookContext: chc } = await import("../src/lifecycle.ts");
-    const ctx = chc({ url: "/t", method: "GET", headers: {}, body: null, signal: null, meta: {} });
+    const ctx = chc(makeHookRequest({ url: "/t" }));
     assert.equal(typeof ctx.startedAt, "number");
   } finally {
     (globalThis as any).performance = orig;
@@ -1761,19 +1796,12 @@ await test("createAbortHook onCancel fires", async () => {
   const abort = createAbortHook();
   let cancelled = false;
   const orig = abort.onCancel;
-  abort.onCancel = (evt: any) => {
+  abort.onCancel = (evt, ctx) => {
     cancelled = true;
-    orig(evt);
+    orig(evt, ctx);
   };
   const controller = new AbortController();
-  const req = {
-    url: "/test",
-    method: "GET",
-    headers: {},
-    body: null,
-    signal: controller.signal,
-    meta: {},
-  };
+  const req = makeHookRequest({ url: "/test", signal: controller.signal });
   const ctx = createHookContext(req);
   controller.abort();
   // `assert.throws`, not `assert.rejects`: the hook aborts synchronously, and
@@ -1791,21 +1819,25 @@ await test("createAbortHook onCancel fires", async () => {
     "a hook run under an aborted signal must throw",
   );
   // Call onCancel directly
-  abort.onCancel({ request: req, reason: "test" } as any);
+  abort.onCancel({ request: req, reason: "test" }, createHookContext(hookReq()));
   assert.equal(cancelled, true);
 });
 
 // Lines 902-906: body normalization with Uint8Array body
 await test("createBodyNormalizationHook Uint8Array body", async () => {
   const hook = createBodyNormalizationHook("utf-8");
-  const result = hook({
-    status: 200,
-    statusText: "OK",
-    headers: {},
-    body: new TextEncoder().encode("hello"),
-  });
-  assert.notEqual(result, null);
-  assert.equal(result.body, "hello");
+  const result = hook(
+    {
+      status: 200,
+      statusText: "OK",
+      headers: {},
+      body: new TextEncoder().encode("hello"),
+      request: hookReq(),
+    },
+    createHookContext(hookReq()),
+  );
+  assert.ok(result !== null, "the hook must report a result");
+  assert.equal((result as HookResponse).body, "hello");
 });
 
 // Lines 945-946: createAbortError fallback (can't test in Node.js — DOMException exists)
@@ -1881,7 +1913,9 @@ await test('regression: runOnError emits "error" when a hook recovers', async ()
   // move the emit to the other branch.
   const failing = new HookRegistry();
   const seen: any[] = [];
-  failing.emitter.on("error", (e) => seen.push(e));
+  failing.emitter.on("error", (e) => {
+    seen.push(e);
+  });
   const none = await failing.runOnError(err, ctx);
   assert.equal(none, null);
   assert.equal(seen.length, 1, "an unrecovered error must be published as well");
@@ -1898,6 +1932,9 @@ await test("regression: safe:false propagates on every phase", async () => {
   };
   const req = hookReq();
 
+  // Collected hook names; the first assertion compares against an empty array,
+  // which is what narrowed this to never on every push.
+  const ran: string[] = [];
   const cancel = new HookRegistry();
   cancel.addOnCancel(boom);
   assert.throws(
@@ -1954,7 +1991,9 @@ await test("regression: safe:true isolates the hook on every phase", async () =>
   };
   const origError = console.error;
   const logged: unknown[] = [];
-  console.error = (...args: unknown[]) => logged.push(args);
+  console.error = (...args: unknown[]) => {
+    logged.push(args);
+  };
   try {
     const cancel = new HookRegistry();
     cancel.addOnCancel(boom, { safe: true });
@@ -1980,25 +2019,41 @@ await test("regression: condition gates the cancel and connection phases", async
   // `runOnConnection` was not even given a context to evaluate it against, so
   // `addOnCancel(fn, { condition })` ran the hook unconditionally.
   const ctx = createHookContext(hookReq());
+  // Collected hook names; the first assertion compares against an empty array,
+  // which is what narrowed this to never on every push.
   const ran: string[] = [];
-
   const cancel = new HookRegistry();
-  cancel.addOnCancel(() => ran.push("cancel"), {
-    condition: (c) => c.request.url.includes("/nope"),
-  });
+  cancel.addOnCancel(
+    () => {
+      ran.push("cancel");
+    },
+    {
+      condition: (c) => c.request.url.includes("/nope"),
+    },
+  );
   cancel.runOnCancel({ request: hookReq(), reason: null }, ctx);
-  assert.deepEqual(ran, [], "a false condition must suppress a cancel hook");
+  assert.equal(ran.length, 0, "a false condition must suppress a cancel hook");
 
   const conn = new HookRegistry();
-  conn.addOnConnection(() => ran.push("connection"), {
-    condition: (c) => c.request.url.includes("/nope"),
-  });
+  conn.addOnConnection(
+    () => {
+      ran.push("connection" as const);
+    },
+    {
+      condition: (c) => c.request.url.includes("/nope"),
+    },
+  );
   conn.runOnConnection({ type: "connect", host: "h", port: 1, protocol: "https", elapsed: 1 }, ctx);
-  assert.deepEqual(ran, [], "a false condition must suppress a connection hook");
+  assert.equal(ran.length, 0, "a false condition must suppress a connection hook");
 
   // ...and a true condition still runs, so this is a gate and not a kill switch.
   const open = new HookRegistry();
-  open.addOnCancel(() => ran.push("cancel-allowed"), { condition: () => true });
+  open.addOnCancel(
+    () => {
+      ran.push("cancel-allowed" as const);
+    },
+    { condition: () => true },
+  );
   open.runOnCancel({ request: hookReq(), reason: null }, ctx);
   assert.deepEqual(ran, ["cancel-allowed"]);
 });
@@ -2012,7 +2067,9 @@ await test("regression: HookEmitter.emit is re-entrancy safe", async () => {
   const order: string[] = [];
   e1.on("cancel", () => {
     order.push("first");
-    e1.on("cancel", () => order.push("added-during-emit"));
+    e1.on("cancel", () => {
+      order.push("added-during-emit");
+    });
   });
   await e1.emit("cancel", evt);
   assert.deepEqual(order, ["first"], "a listener added mid-emit waits for the next emit");
@@ -2027,8 +2084,12 @@ await test("regression: HookEmitter.emit is re-entrancy safe", async () => {
   // just removed.
   const e2 = new HookEmitter();
   const calls: string[] = [];
-  const second = () => calls.push("second");
-  const oneShot = () => calls.push("once");
+  const second = () => {
+    calls.push("second");
+  };
+  const oneShot = () => {
+    calls.push("once");
+  };
   e2.on("cancel", () => {
     calls.push("first");
     e2.off("cancel", second);
@@ -2048,8 +2109,12 @@ await test("regression: HookEmitter.emit is re-entrancy safe", async () => {
   // (c) `once` removal still works, and is by identity rather than by index.
   const e3 = new HookEmitter();
   let n = 0;
-  e3.once("cancel", () => n++);
-  e3.on("cancel", () => n++);
+  e3.once("cancel", () => {
+    n++;
+  });
+  e3.on("cancel", () => {
+    n++;
+  });
   await e3.emit("cancel", evt);
   await e3.emit("cancel", evt);
   assert.equal(n, 3, "the once listener fires exactly once, the persistent one twice");
@@ -2060,7 +2125,9 @@ await test("regression: HookEmitter.emit is re-entrancy safe", async () => {
   const seen: string[] = [];
   e4.once("cancel", () => {
     seen.push("once");
-    e4.on("cancel", () => seen.push("late"));
+    e4.on("cancel", () => {
+      seen.push("late");
+    });
   });
   await e4.emit("cancel", evt);
   assert.deepEqual(seen, ["once"]);
@@ -2078,7 +2145,11 @@ await test("regression: createLoggingHooks redacts Set-Cookie by default", async
   // logs *response* headers — so Set-Cookie went to the log in cleartext on a
   // hook whose whole purpose is logging. The interceptors already redact all four.
   const logged: Array<[string, any]> = [];
-  const logging = createLoggingHooks({ logger: (m, d) => logged.push([m, d]) });
+  const logging = createLoggingHooks({
+    logger: (m, d) => {
+      logged.push([m, d]);
+    },
+  });
   const req = hookReq();
   logging.afterResponse(
     hookRes({
@@ -2105,7 +2176,9 @@ await test("regression: createLoggingHooks redacts Set-Cookie by default", async
   // An explicit list still replaces the default rather than adding to it.
   const custom: Array<[string, any]> = [];
   const only = createLoggingHooks({
-    logger: (m, d) => custom.push([m, d]),
+    logger: (m, d) => {
+      custom.push([m, d]);
+    },
     redactHeaders: ["x-trace"],
   });
   only.beforeRequest(

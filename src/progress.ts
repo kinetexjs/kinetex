@@ -21,6 +21,8 @@
  *  - Readable progress formatting (human-readable bytes, speed)
  */
 
+import { perfNow } from "./utils.ts";
+
 // ============================================================================
 // §1  TYPES
 // ============================================================================
@@ -1177,7 +1179,3 @@ export function throttleProgress(
 // ============================================================================
 // §10  UTILITIES
 // ============================================================================
-
-function perfNow(): number {
-  return typeof performance !== "undefined" ? performance.now() : Date.now();
-}

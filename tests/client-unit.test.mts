@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
+import { isAbortRejection } from "./assert-helpers.ts";
 import { Kinetex, kinetex, BatchQueue, createMethodCircuitBreakerKey } from "../src/mod.ts";
 import type { KinetexConfig, KinetexRequest, KinetexResponse } from "../src/types.ts";
 
@@ -6,7 +8,7 @@ let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
-async function test(name: string, fn: () => Promise<void>): Promise<void> {
+async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
     await fn();
     console.log(`  ✅  ${name}`);
@@ -32,7 +34,7 @@ const T = 30_000;
 suite("BatchQueue");
 
 await test("enqueue resolves with status 200 after flush", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const queue = new BatchQueue(client, { maxBatch: 1, flushMs: 0 });
   const res = await queue.enqueue("/get", "GET");
   assert.equal(res.status, 200);
@@ -41,7 +43,7 @@ await test("enqueue resolves with status 200 after flush", async () => {
 });
 
 await test("flush sends all queued items concurrently", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const queue = new BatchQueue(client, { maxBatch: 5, flushMs: 10_000 });
   const results = await Promise.all([
     queue.enqueue("/get", "GET"),
@@ -55,7 +57,7 @@ await test("flush sends all queued items concurrently", async () => {
 });
 
 await test("maxBatch triggers immediate flush", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const queue = new BatchQueue(client, { maxBatch: 2, flushMs: 10_000 });
   const [r1, r2] = await Promise.all([queue.enqueue("/get", "GET"), queue.enqueue("/get", "GET")]);
   assert.equal(r1.status, 200);
@@ -64,7 +66,7 @@ await test("maxBatch triggers immediate flush", async () => {
 });
 
 await test("pendingCount accurate before and after flush", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const queue = new BatchQueue(client, { maxBatch: 10, flushMs: 10_000 });
   assert.equal(queue.pendingCount, 0);
   queue.enqueue("/get", "GET");
@@ -78,7 +80,7 @@ await test("pendingCount accurate before and after flush", async () => {
 });
 
 await test("enqueue with already-aborted signal rejects and empties queue slot", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const queue = new BatchQueue(client, { maxBatch: 10, flushMs: 10_000 });
   const ctrl = new AbortController();
   ctrl.abort();
@@ -89,20 +91,20 @@ await test("enqueue with already-aborted signal rejects and empties queue slot",
 });
 
 await test("abort during queue removes item and rejects", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const queue = new BatchQueue(client, { maxBatch: 10, flushMs: 10_000 });
   const ctrl = new AbortController();
   const p = queue.enqueue("/get", "GET", { signal: ctrl.signal });
   assert.equal(queue.pendingCount, 1);
   ctrl.abort();
-  await assert.rejects(p);
+  await assert.rejects(p, isAbortRejection);
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(queue.pendingCount, 0);
   client.destroy();
 });
 
 await test("abort listener cleaned up after flush — no residual rejection", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const queue = new BatchQueue(client, { maxBatch: 1, flushMs: 0 });
   const ctrl = new AbortController();
   // Enqueue and wait for flush (maxBatch=1 triggers immediately)
@@ -120,7 +122,7 @@ await test("abort listener cleaned up after flush — no residual rejection", as
 });
 
 await test("flush with more items than maxBatch processes all", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const queue = new BatchQueue(client, { maxBatch: 2, flushMs: 10_000 });
   const all = Promise.all([
     queue.enqueue("/get", "GET"),
@@ -135,7 +137,7 @@ await test("flush with more items than maxBatch processes all", async () => {
 });
 
 await test("flushMs=0 uses queueMicrotask", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const queue = new BatchQueue(client, { maxBatch: 10, flushMs: 0 });
   const p = queue.enqueue("/get", "GET");
   assert.equal(queue.pendingCount, 1, "still queued synchronously");
@@ -171,9 +173,10 @@ suite("Logger config wiring");
 
 await test("logger config creates working logger instance via lazy init", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     logger: { level: "INFO" },
+    allowPrivateNetwork: true,
   });
   const res = await client.get("/get");
   assert.equal(res.status, 200);
@@ -182,9 +185,10 @@ await test("logger config creates working logger instance via lazy init", async 
 
 await test("logger:false keeps logger null", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     logger: false,
+    allowPrivateNetwork: true,
   });
   const res = await client.get("/get");
   assert.equal(res.status, 200);
@@ -209,7 +213,12 @@ await test("empty config does not throw", () => {
 });
 
 await test("har:true enables HAR recording", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, har: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    har: true,
+    allowPrivateNetwork: true,
+  });
   await client.get("/get");
   const har = client.getHAR();
   assert.equal(har.entries.length, 1);
@@ -218,7 +227,7 @@ await test("har:true enables HAR recording", async () => {
 });
 
 await test("getHAR throws without har:true config", () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   assert.throws(() => client.getHAR(), /HAR recording not enabled/);
   client.destroy();
 });
@@ -232,7 +241,7 @@ suite("Config-level interceptors");
 await test("config interceptors.request fires before request", async () => {
   const seen: string[] = [];
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     interceptors: {
       request: [
@@ -241,6 +250,7 @@ await test("config interceptors.request fires before request", async () => {
         },
       ],
     },
+    allowPrivateNetwork: true,
   });
   await client.get("/get");
   assert.deepEqual(seen, ["GET"]);
@@ -250,7 +260,7 @@ await test("config interceptors.request fires before request", async () => {
 await test("config interceptors.error fires on 500", async () => {
   const seen: string[] = [];
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     throwOnError: true,
     interceptors: {
@@ -260,6 +270,7 @@ await test("config interceptors.error fires on 500", async () => {
         },
       ],
     },
+    allowPrivateNetwork: true,
   });
   await assert.rejects(
     () => client.get("/status/500"),
@@ -283,9 +294,10 @@ suite("Rate limit");
 
 await test("rateLimit config creates interceptor that allows requests", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
-    rateLimit: { maxRequests: 100, windowMs: 60_000 },
+    rateLimit: { limit: 100, windowMs: 60_000 },
+    allowPrivateNetwork: true,
   });
   assert.equal((await client.get("/get")).status, 200);
   assert.equal((await client.get("/get")).status, 200);
@@ -300,13 +312,14 @@ suite("AWS signing");
 
 await test("awsSigning config with valid credentials interceptor", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     awsSigning: {
       region: "us-east-1",
       service: "execute-api",
       credentials: { accessKeyId: "AKID", secretAccessKey: "secret" },
     },
+    allowPrivateNetwork: true,
   });
   const res = await client.get("/get");
   assert.equal(res.status, 200);
@@ -320,7 +333,7 @@ await test("awsSigning config with valid credentials interceptor", async () => {
 suite("OTel tracer");
 
 await test("setTracer returns this for chaining", () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const tracer = {
     startSpan: () => ({
       spanContext: () => ({ traceId: "a".repeat(32), spanId: "b".repeat(16), traceFlags: 1 }),
@@ -336,7 +349,7 @@ await test("setTracer returns this for chaining", () => {
 
 await test("tracer.startSpan called with HTTP method", async () => {
   let startSpanName = "";
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const tracer = {
     startSpan: (name: string) => {
       startSpanName = name;
@@ -362,20 +375,20 @@ await test("tracer.startSpan called with HTTP method", async () => {
 suite("Dedup");
 
 await test("enableDedup returns this and enables metrics", () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   assert.equal(client.enableDedup(), client);
-  assert.notEqual(client.dedupMetrics, null);
+  assert.ok(client.dedupMetrics !== null);
   client.destroy();
 });
 
 await test("dedupMetrics returns null when not enabled", () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   assert.equal(client.dedupMetrics, null);
   client.destroy();
 });
 
 await test("disableDedup sets metrics to null", () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   client.enableDedup();
   client.disableDedup();
   assert.equal(client.dedupMetrics, null);
@@ -389,7 +402,7 @@ await test("disableDedup sets metrics to null", () => {
 suite("Circuit breaker");
 
 await test("enableCircuitBreaker returns this", () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   assert.equal(client.enableCircuitBreaker(), client);
   client.destroy();
 });
@@ -397,7 +410,7 @@ await test("enableCircuitBreaker returns this", () => {
 await test("tripCircuit and resetCircuit change state", () => {
   // The name claimed a state transition that nothing verified: with trip and
   // reset no-ops, this still passed.
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   client.enableCircuitBreaker();
   try {
     client.tripCircuit("https://httpbin.org");
@@ -422,7 +435,7 @@ await test("tripCircuit and resetCircuit change state", () => {
 });
 
 await test("disableCircuitBreaker clears snapshots", () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   client.enableCircuitBreaker();
   client.disableCircuitBreaker();
   assert.deepEqual(client.circuitSnapshots, {});
@@ -436,13 +449,17 @@ await test("disableCircuitBreaker clears snapshots", () => {
 suite("send() validation");
 
 await test("invalid HTTP method throws KinetexError", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   await assert.rejects(() => (client as any).send("/get", "INVALID"), /Invalid HTTP method/);
   client.destroy();
 });
 
 await test("options.timeout overrides config timeout with early timeout", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: 30_000 });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: 30_000,
+    allowPrivateNetwork: true,
+  });
   await assert.rejects(() => client.get("/delay/5", { timeout: 100 }), /timeout|Timeout/i);
   client.destroy();
 });
@@ -456,11 +473,12 @@ suite("Pipeline trace");
 await test("onPipelineTrace fires for each stage", async () => {
   const events: string[] = [];
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     onPipelineTrace: (ev) => {
       events.push(`${ev.stage}:${ev.event}`);
     },
+    allowPrivateNetwork: true,
   });
   assert.equal((await client.get("/get")).status, 200);
   assert.ok(events.length >= 4);
@@ -474,7 +492,7 @@ await test("onPipelineTrace fires for each stage", async () => {
 suite("Header validation");
 
 await test("header with null byte in value throws", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   await assert.rejects(
     () => client.get("/get", { headers: { "x-test": "hello\x00world" } }),
     /Invalid header value/,
@@ -483,7 +501,12 @@ await test("header with null byte in value throws", async () => {
 });
 
 await test("strictHeaders option enabled", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, strictHeaders: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    strictHeaders: true,
+    allowPrivateNetwork: true,
+  });
   assert.equal((await client.get("/get")).status, 200);
   client.destroy();
 });
@@ -495,14 +518,14 @@ await test("strictHeaders option enabled", async () => {
 suite("extend()");
 
 await test("extend with empty overrides copies parent config", async () => {
-  const parent = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const parent = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const child = parent.extend({});
   assert.equal((await child.get("/get")).status, 200);
   parent.destroy();
 });
 
 await test("extend inherits circuit breaker", () => {
-  const parent = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const parent = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   parent.enableCircuitBreaker();
   const child = parent.extend({});
   assert.notEqual(child.circuitSnapshots, undefined);
@@ -516,7 +539,12 @@ await test("extend inherits circuit breaker", () => {
 suite("Cookie jar");
 
 await test("cookieJar:true returns non-null cache and jar", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: 15_000, cookieJar: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: 15_000,
+    cookieJar: true,
+    allowPrivateNetwork: true,
+  });
   assert.equal((await client.get("/get")).status, 200);
   client.destroy();
 });
@@ -528,14 +556,14 @@ await test("cookieJar:true returns non-null cache and jar", async () => {
 suite("Request body types");
 
 await test("send with plain object body auto-serializes as JSON", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const res = await client.post("/post", { foo: "bar" });
   assert.equal(res.status, 200);
   client.destroy();
 });
 
 await test("send with URLSearchParams body", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const res = await client.post("/post", new URLSearchParams({ a: "1" }), { throwOnError: false });
   assert.equal(res.status, 200);
   const echoed = res.data as {
@@ -545,7 +573,7 @@ await test("send with URLSearchParams body", async () => {
     files?: Record<string, string>;
   };
   assert.equal(JSON.stringify(echoed.form), JSON.stringify({ a: "1" }));
-  assert.equal(echoed.headers?.["Content-Type"], "application/x-www-form-urlencoded");
+  assert.equal(echoed.headers?.["content-type"], "application/x-www-form-urlencoded");
   client.destroy();
 });
 
@@ -556,7 +584,7 @@ await test("send with URLSearchParams body", async () => {
 suite("FluentRequest subscribe");
 
 await test("subscribe calls onSuccess with response", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const res = await new Promise<KinetexResponse>((resolve, reject) => {
     client.GET("/get").subscribe(
       (r) => resolve(r),
@@ -573,7 +601,7 @@ await test("subscribe without onError swallows the failure instead of crashing",
     unhandled.push(e);
   };
   process.on("unhandledRejection", onUnhandled);
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, throwOnError: true });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, throwOnError: true });
   let successCalls = 0;
   try {
     // The documented contract: a callback-style subscription with no `onError`

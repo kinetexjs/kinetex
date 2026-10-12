@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 import { kinetex } from "../src/mod.ts";
 import {
   SigV4Signer,
@@ -28,7 +29,9 @@ import {
 } from "../src/aws-sigv4.ts";
 
 const T = 30_000;
-const httpbin = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+// The local httpbin server. The AWS hosts in this file are signing
+// fixtures — they are never dialled.
+const httpbin = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
 
 /**
  * True when httpbin answered with a status its own front end produces —
@@ -86,7 +89,7 @@ let passed = 0;
 let failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
-async function test(name: string, fn: () => Promise<void>) {
+async function test(name: string, fn: () => Promise<void> | void) {
   try {
     await fn();
     console.log(`  ✅  ${name}`);
@@ -183,11 +186,11 @@ await test("staticCredentials with session token", async () => {
   const provider = staticCredentials({
     accessKeyId: "AKIAIOSFODNN7EXAMPLE",
     secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-    sessionToken: "IQoJb3JpZ2luX2VjEMv////4",
+    sessionToken: "AWS_DOCS_EXAMPLE_SESSION_TOKEN",
   });
   const creds = await provider();
   assert.equal(creds.accessKeyId, "AKIAIOSFODNN7EXAMPLE");
-  assert.equal(creds.sessionToken, "IQoJb3JpZ2luX2VjEMv////4");
+  assert.equal(creds.sessionToken, "AWS_DOCS_EXAMPLE_SESSION_TOKEN");
 });
 
 await test("cachingCredentials caches results", async () => {
@@ -979,9 +982,15 @@ await test("SigV4Signer.signPostPolicy signs policy", async () => {
   });
   const policy = {
     expiration: new Date(Date.now() + 3600000).toISOString(),
-    conditions: [{ bucket: "test-bucket" }, ["starts-with", "$key", "uploads/"]],
+    // Conditions are `Record<string, string>` pairs or [op, key, value] triples.
+    conditions: [
+      { bucket: "test-bucket" },
+      ["starts-with", "$key", "uploads/"] as [string, string, string],
+    ],
   };
-  const result = await signer.signPostPolicy(policy);
+  const result = await signer.signPostPolicy(
+    policy as unknown as Parameters<typeof signer.signPostPolicy>[0],
+  );
   assert.equal(typeof result.policy, "string");
   assert.equal(typeof result.signature, "string");
   assert.equal(typeof result.credential, "string");
@@ -1003,7 +1012,9 @@ await test("SigV4Signer.signPostPolicy with session token", async () => {
     expiration: new Date(Date.now() + 3600000).toISOString(),
     conditions: [{ bucket: "test-bucket" }],
   };
-  const result = await signer.signPostPolicy(policy);
+  const result = await signer.signPostPolicy(
+    policy as unknown as Parameters<typeof signer.signPostPolicy>[0],
+  );
   assert.equal(typeof result.policy, "string");
   assert.equal(typeof result.signature, "string");
   assert.equal(result.securityToken, "TOKEN");
@@ -1021,9 +1032,9 @@ await test("SigV4Signer.initChunked initializes chunked signing", async () => {
     headers: { "content-length": "1000" },
     body: null,
   });
-  assert.notEqual(result.signedRequest, null);
+  assert.ok(result.signedRequest !== null);
   assert.equal(typeof result.signedRequest.authorization, "string");
-  assert.notEqual(result.state, null);
+  assert.ok(result.state !== null);
   assert.ok(result.state.signingKey instanceof Uint8Array);
   assert.equal(typeof result.state.previousSignature, "string");
   assert.equal(typeof result.state.signingDate, "string");
@@ -1118,8 +1129,8 @@ await test("initChunkedSigning exports and works", async () => {
     { method: "PUT", url: "https://s3.amazonaws.com/bucket/key", headers: {}, body: null },
     { credentials: testCredentials, region: "us-east-1", service: "s3" },
   );
-  assert.notEqual(result.signedRequest, null);
-  assert.notEqual(result.state, null);
+  assert.ok(result.signedRequest !== null);
+  assert.ok(result.state !== null);
 });
 
 await test("SigV4Signer initChunked with string body input", async () => {
@@ -1235,7 +1246,7 @@ await test("httpbin.org/get returns JSON via kinetex", async () => {
   );
   if (!response) return;
   assert.equal(response.status, 200);
-  assert.notEqual(response.data, null);
+  assert.ok(response.data !== null);
 });
 
 await test("httpbin.org/ip returns IP via kinetex", async () => {
@@ -1247,7 +1258,7 @@ await test("httpbin.org/ip returns IP via kinetex", async () => {
   );
   if (!response) return;
   assert.equal(response.status, 200);
-  assert.equal(typeof response.data.origin, "string");
+  assert.equal(typeof (response.data as { origin: string }).origin, "string");
 });
 
 await test("httpbin.org/post with JSON body via kinetex", async () => {
@@ -1259,7 +1270,10 @@ await test("httpbin.org/post with JSON body via kinetex", async () => {
   );
   if (!response) return;
   assert.equal(response.status, 200);
-  assert.deepEqual(response.data.json, { message: "test", data: { key: "value" } });
+  assert.deepEqual((response.data as { json: unknown }).json, {
+    message: "test",
+    data: { key: "value" },
+  });
 });
 
 await test("httpbin.org/headers returns request headers via kinetex", async () => {
@@ -1271,7 +1285,7 @@ await test("httpbin.org/headers returns request headers via kinetex", async () =
   );
   if (!response) return;
   assert.equal(response.status, 200);
-  assert.notEqual(response.data.headers, null);
+  assert.ok((response.data as { headers: Record<string, string> }).headers !== null);
 });
 
 await test("httpbin.org/json returns slideshow via kinetex", async () => {
@@ -1283,7 +1297,7 @@ await test("httpbin.org/json returns slideshow via kinetex", async () => {
   );
   if (!response) return;
   assert.equal(response.status, 200);
-  assert.notEqual(response.data.slideshow, null);
+  assert.ok((response.data as { slideshow: unknown }).slideshow !== null);
 });
 
 await test("httpbin.org/uuid generates unique ID via kinetex", async () => {
@@ -1295,7 +1309,7 @@ await test("httpbin.org/uuid generates unique ID via kinetex", async () => {
   );
   if (!response) return;
   assert.equal(response.status, 200);
-  assert.equal(typeof response.data.uuid, "string");
+  assert.equal(typeof (response.data as { uuid: string }).uuid, "string");
 });
 
 await test("httpbin.org/base64 decode via kinetex", async () => {
@@ -1319,8 +1333,8 @@ await test("httpbin.org/anything echoes all request details via kinetex", async 
   );
   if (!response) return;
   assert.equal(response.status, 200);
-  assert.notEqual(response.data.json, null);
-  assert.deepEqual(response.data.json, { test: true });
+  assert.ok((response.data as { json: unknown }).json !== null);
+  assert.deepEqual((response.data as { json: unknown }).json, { test: true });
 });
 
 await test("Multiple httpbin endpoints sequential via kinetex", async () => {
@@ -1416,7 +1430,7 @@ await test("POST to httpbin with complex body via kinetex", async () => {
   );
   if (!response) return;
   assert.equal(response.status, 200);
-  assert.deepEqual(response.data.json, complexBody);
+  assert.deepEqual((response.data as { json: unknown }).json, complexBody);
 });
 
 // ============================================================================
@@ -1496,6 +1510,39 @@ const regressionSigner = (service = "s3") =>
     service,
   });
 
+/**
+ * Pins the clock for the duration of `fn`.
+ *
+ * The signer takes its date from `new Date()`, and the constructor deliberately
+ * does not accept a `signingDate`. Two presigns compared for equality can land
+ * either side of a second boundary and then differ on X-Amz-Date alone — a
+ * clock flake that surfaces as a signing regression under load.
+ */
+async function withFixedClock<T>(fn: () => Promise<T>): Promise<T> {
+  const realNow = Date.now;
+  const realCtor = globalThis.Date;
+  const FIXED = realCtor.parse("2024-01-01T00:00:00.000Z");
+  class FrozenDate extends realCtor {
+    // Date's overloads take either a string or a (year, month, …) tuple; both
+    // are forwarded unchanged so anything else in the process still sees a real
+    // date. Only the zero-argument form is frozen.
+    constructor(...args: unknown[]) {
+      // @ts-expect-error -- forwarding an overloaded constructor's arguments.
+      super(...(args.length === 0 ? [FIXED] : args));
+    }
+    static override now(): number {
+      return FIXED;
+    }
+  }
+  globalThis.Date = FrozenDate as unknown as DateConstructor;
+  try {
+    return await fn();
+  } finally {
+    globalThis.Date = realCtor;
+    Date.now = realNow;
+  }
+}
+
 const hostLineOf = (canonicalRequest: string) =>
   canonicalRequest.split("\n").find((l) => l.startsWith("host:")) ?? "";
 const signedHeadersOf = (authorization: string) =>
@@ -1538,7 +1585,7 @@ await test("regression: SignedHeaders has no leading or doubled separator", asyn
     { Host: "override.example" },
     { "": "v", Host: "override.example" },
     { "": "v" },
-  ]) {
+  ] as Record<string, string>[]) {
     const result = await regressionSigner().sign({
       method: "GET",
       url: "https://s3.amazonaws.com/",
@@ -1596,36 +1643,40 @@ await test("regression: presign() honours an explicit Host header", async () => 
   // presign() had the same merge. The signature is the only place the host is
   // observable, so pin it by equivalence: overriding Host must produce exactly
   // the signature of presigning the overridden URL.
-  const overridden = await regressionSigner().presign(
-    { method: "GET", url: "https://override.example/b/k", headers: {}, body: null },
-    { expiresIn: 3600 },
-  );
-  for (const key of ["host", "Host", "HOST"]) {
-    const withHeader = await regressionSigner().presign(
-      {
-        method: "GET",
-        url: "https://s3.amazonaws.com/b/k",
-        headers: { [key]: "override.example" },
-        body: null,
-      },
+  // A pinned clock: the two signatures are only comparable when both are
+  // signed at the same instant.
+  await withFixedClock(async () => {
+    const overridden = await regressionSigner().presign(
+      { method: "GET", url: "https://override.example/b/k", headers: {}, body: null },
       { expiresIn: 3600 },
     );
-    assert.equal(
-      new URL(withHeader).searchParams.get("X-Amz-Signature"),
-      new URL(overridden).searchParams.get("X-Amz-Signature"),
-      `casing ${key} must sign the override, not the URL host`,
+    for (const key of ["host", "Host", "HOST"]) {
+      const withHeader = await regressionSigner().presign(
+        {
+          method: "GET",
+          url: "https://s3.amazonaws.com/b/k",
+          headers: { [key]: "override.example" },
+          body: null,
+        },
+        { expiresIn: 3600 },
+      );
+      assert.equal(
+        new URL(withHeader).searchParams.get("X-Amz-Signature"),
+        new URL(overridden).searchParams.get("X-Amz-Signature"),
+        `casing ${key} must sign the override, not the URL host`,
+      );
+    }
+    // And it must genuinely differ from signing the URL host, or the assertion
+    // above would pass even if Host were ignored entirely.
+    const urlHost = await regressionSigner().presign(
+      { method: "GET", url: "https://s3.amazonaws.com/b/k", headers: {}, body: null },
+      { expiresIn: 3600 },
     );
-  }
-  // And it must genuinely differ from signing the URL host, or the assertion
-  // above would pass even if Host were ignored entirely.
-  const urlHost = await regressionSigner().presign(
-    { method: "GET", url: "https://s3.amazonaws.com/b/k", headers: {}, body: null },
-    { expiresIn: 3600 },
-  );
-  assert.notEqual(
-    new URL(urlHost).searchParams.get("X-Amz-Signature"),
-    new URL(overridden).searchParams.get("X-Amz-Signature"),
-  );
+    assert.notEqual(
+      new URL(urlHost).searchParams.get("X-Amz-Signature"),
+      new URL(overridden).searchParams.get("X-Amz-Signature"),
+    );
+  });
 });
 
 await test("regression: presign() drops an empty header name", async () => {
@@ -1686,7 +1737,9 @@ await test("regression: the expiresIn warning names the value actually used", as
   // had no way to learn what expiry their link really got.
   const warnings: string[] = [];
   const original = console.warn;
-  console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.join(" "));
+  };
   try {
     await regressionSigner("s3").presign(
       { method: "GET", url: "https://bucket.example.com/key", headers: {}, body: null },

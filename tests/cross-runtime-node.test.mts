@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 
 import {
   detectRuntime,
@@ -100,7 +101,7 @@ async function main() {
     const t = new NodeHTTP2Transport({ requestTimeoutMs: 15000 });
     try {
       const raw = await t.send({
-        url: "https://httpbin.org/get",
+        url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
         method: "GET",
         headers: {},
         body: null,
@@ -116,7 +117,7 @@ async function main() {
   await test("FetchTransport sends real request", async () => {
     const t = new FetchTransport();
     const raw = await t.send({
-      url: "https://httpbin.org/get",
+      url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
       method: "GET",
       headers: {},
       body: null,
@@ -151,7 +152,7 @@ async function main() {
     const raw = await sendWithTimeout(
       new FetchTransport(),
       {
-        url: "https://httpbin.org/get",
+        url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
         method: "GET",
         headers: {},
         body: null,
@@ -255,7 +256,11 @@ async function main() {
   suite("Kinetex client in Node.js");
 
   await test("GET to httpbin returns 200 with correct body", async () => {
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: 30000 });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: 30000,
+      allowPrivateNetwork: true,
+    });
     const res = await client.get<{ origin: string; url: string }>("/get");
     assert.equal(res.status, 200);
     assert.equal(typeof res.data.origin, "string");
@@ -264,13 +269,21 @@ async function main() {
   });
 
   await test("Fluent .GET().json() works", async () => {
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: 30000 });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: 30000,
+      allowPrivateNetwork: true,
+    });
     const data = await client.GET("/get").json<{ origin: string }>();
     assert.equal(typeof data.origin, "string");
   });
 
   await test("Fluent .param() sends query parameters", async () => {
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: 30000 });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: 30000,
+      allowPrivateNetwork: true,
+    });
     const data = await client
       .GET("/get")
       .param("key1", "value1")
@@ -281,7 +294,11 @@ async function main() {
   });
 
   await test("Fluent .header() sends custom header", async () => {
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: 30000 });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: 30000,
+      allowPrivateNetwork: true,
+    });
     const data = await client
       .GET("/headers")
       .header("x-custom-node", "test-value")
@@ -293,7 +310,11 @@ async function main() {
   });
 
   await test("Timeout throws TimeoutError", async () => {
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: 500 });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: 500,
+      allowPrivateNetwork: true,
+    });
     const start = Date.now();
     let caught: unknown;
     try {
@@ -309,7 +330,11 @@ async function main() {
   });
 
   await test("POST with JSON body", async () => {
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: 30000 });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: 30000,
+      allowPrivateNetwork: true,
+    });
     const payload = { msg: "hello from node" };
     const res = await client.post<{ json: typeof payload }>("/post", JSON.stringify(payload), {
       headers: { "content-type": "application/json" },
@@ -319,7 +344,11 @@ async function main() {
   });
 
   await test("Request interceptor fires", async () => {
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: 30000 });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: 30000,
+      allowPrivateNetwork: true,
+    });
     let intercepted = false;
     client.useRequest(() => {
       intercepted = true;
@@ -329,7 +358,11 @@ async function main() {
   });
 
   await test("Response interceptor fires", async () => {
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: 30000 });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: 30000,
+      allowPrivateNetwork: true,
+    });
     let intercepted = false;
     client.useResponse(() => {
       intercepted = true;

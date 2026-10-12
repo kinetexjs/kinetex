@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 import process from "node:process";
 import http from "node:http";
 import type { AddressInfo, Socket } from "node:net";
@@ -18,11 +19,16 @@ import {
 } from "../src/mod.ts";
 import { jsonSSE } from "../src/sse.ts";
 
+/** `jsonSSE` consumes an AsyncIterable; a plain array is not one. */
+async function* fromArray<T>(items: T[]): AsyncGenerator<T> {
+  for (const item of items) yield item;
+}
+
 let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
-async function test(name: string, fn: () => Promise<void>): Promise<void> {
+async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
     // Almost every test here is `for await (const e of client.stream())`.
     // A stream that never yields, or a `collect()` that never settles, parks
@@ -316,10 +322,10 @@ await test("accepts onParseError option", async () => {
   // The read is taken before the write: a write that enqueues does not
   // settle until the value has been taken.
   const written = ts.writable.getWriter().write(encodeSSE("id: 7\ndata: after\n\n"));
-  const { value } = await pending;
+  const settled = await pending;
   await written;
-  assert.equal(value.data, "after");
-  assert.equal(value.id, "7");
+  assert.equal(settled.value?.data, "after");
+  assert.equal(settled.value?.id, "7");
   assert.equal(called, 0, "a clean stream must not report a parse error");
   assert.equal(await reader.read.call(null).catch(() => "closed"), "closed");
 });
@@ -469,37 +475,47 @@ suite("jsonSSE");
 
 await test("parses JSON events", async () => {
   const src = [
-    { id: "1", event: "u", data: '{"x":1}', retry: null, raw: [] },
-    { id: "2", event: "u2", data: '{"y":2}', retry: null, raw: [] },
+    { id: "1", event: "u", data: '{"x":1}', retry: null, raw: ['data: {"x":1}'] },
+    { id: "2", event: "u2", data: '{"y":2}', retry: null, raw: [] as string[] },
   ];
   const r: any[] = [];
-  for await (const e of jsonSSE(src)) r.push(e);
+  for await (const e of jsonSSE(fromArray(src))) r.push(e);
   assert.strictEqual(r.length, 2);
   assertDeepEq(r[0].data, { x: 1 });
 });
 
 await test("skips non-JSON silently", async () => {
   const r: any[] = [];
-  for await (const e of jsonSSE([
-    { id: null, event: "m", data: "bad", retry: null, raw: [] },
-    { id: null, event: "m", data: '{"ok":true}', retry: null, raw: [] },
-  ]))
+  for await (const e of jsonSSE(
+    fromArray([
+      { id: null, event: "m", data: "bad", retry: null, raw: [] as string[] },
+      { id: null, event: "m", data: '{"ok":true}', retry: null, raw: [] as string[] },
+    ]),
+  ))
     r.push(e);
   assert.strictEqual(r.length, 1);
 });
 
 await test("onError callback fires on parse failure", async () => {
   let c = 0;
-  for await (const _ of jsonSSE([{ id: null, event: "m", data: "bad", retry: null, raw: [] }], {
-    onError: () => c++,
-  })) {
+  for await (const _ of jsonSSE(
+    fromArray([{ id: null, event: "m", data: "bad", retry: null, raw: [] as string[] }]),
+    {
+      onError: () => {
+        c++;
+      },
+    },
+  )) {
   }
   assert.strictEqual(c, 1);
 });
 
 await test("empty data skipped", async () => {
   let c = 0;
-  for await (const _ of jsonSSE([{ id: null, event: "m", data: "", retry: null, raw: [] }])) c++;
+  for await (const _ of jsonSSE(
+    fromArray([{ id: null, event: "m", data: "", retry: null, raw: [] as string[] }]),
+  ))
+    c++;
   assert.strictEqual(c, 0);
 });
 
@@ -512,7 +528,7 @@ await test("on dispatches to handler", async () => {
   const r = new SSERouter().on("t", async () => {
     called = true;
   });
-  await r.dispatch({ event: "t", data: "d", id: null, retry: null, raw: [] });
+  await r.dispatch({ event: "t", data: "d", id: null, retry: null, raw: [] as string[] });
   assert.equal(called, true);
 });
 
@@ -521,7 +537,7 @@ await test("onMessage handler", async () => {
   const r = new SSERouter().onMessage(async () => {
     called = true;
   });
-  await r.dispatch({ event: "message", data: "d", id: null, retry: null, raw: [] });
+  await r.dispatch({ event: "message", data: "d", id: null, retry: null, raw: [] as string[] });
   assert.equal(called, true);
 });
 
@@ -530,7 +546,7 @@ await test("onAny fallback for unmatched event", async () => {
   const r = new SSERouter().onAny(async () => {
     called = true;
   });
-  await r.dispatch({ event: "unknown", data: "d", id: null, retry: null, raw: [] });
+  await r.dispatch({ event: "unknown", data: "d", id: null, retry: null, raw: [] as string[] });
   assert.equal(called, true);
 });
 
@@ -544,7 +560,7 @@ await test("onAny not called when specific handler exists", async () => {
   r.onAny(async () => {
     fallback = true;
   });
-  await r.dispatch({ event: "known", data: "d", id: null, retry: null, raw: [] });
+  await r.dispatch({ event: "known", data: "d", id: null, retry: null, raw: [] as string[] });
   assert.equal(specific, true);
   assert.equal(fallback, false);
 });
@@ -554,7 +570,7 @@ await test("onJSON valid parses JSON", async () => {
   const r = new SSERouter().onJSON<{ x: number }>("j", async (v) => {
     d = v;
   });
-  await r.dispatch({ event: "j", data: '{"x":1}', id: null, retry: null, raw: [] });
+  await r.dispatch({ event: "j", data: '{"x":1}', id: null, retry: null, raw: [] as string[] });
   assertDeepEq(d, { x: 1 });
 });
 
@@ -563,7 +579,7 @@ await test("onJSON parse error silently ignored", async () => {
   const r = new SSERouter().onJSON<any>("b", async () => {
     called = true;
   });
-  await r.dispatch({ event: "b", data: "bad", id: null, retry: null, raw: [] });
+  await r.dispatch({ event: "b", data: "bad", id: null, retry: null, raw: [] as string[] });
   assert.equal(called, false);
 });
 
@@ -572,10 +588,12 @@ await test("consume iterates all events", async () => {
   const r = new SSERouter().on("e", async () => {
     n++;
   });
-  await r.consume([
-    { event: "e", data: "1", id: null, retry: null, raw: [] },
-    { event: "e", data: "2", id: null, retry: null, raw: [] },
-  ]);
+  await r.consume(
+    fromArray([
+      { event: "e", data: "1", id: null, retry: null, raw: [] as string[] },
+      { event: "e", data: "2", id: null, retry: null, raw: [] as string[] },
+    ]),
+  );
   assert.strictEqual(n, 2);
 });
 
@@ -652,7 +670,7 @@ await test("createSSEResponse forwards custom headers", async () => {
 suite("Real HTTP via kinetex");
 
 await test("kinetex GET /ip returns origin", async () => {
-  const ktx = kinetex({ baseURL: "https://httpbin.org" });
+  const ktx = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
   const res = await ktx.get<{ origin: string }>("/ip");
   assert.strictEqual(res.status, 200);
   assert.ok(typeof res.data.origin === "string");
@@ -660,7 +678,7 @@ await test("kinetex GET /ip returns origin", async () => {
 });
 
 await test("kinetex GET /uuid returns uuid", async () => {
-  const ktx = kinetex({ baseURL: "https://httpbin.org" });
+  const ktx = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
   const res = await ktx.get<{ uuid: string }>("/uuid");
   assert.strictEqual(res.status, 200);
   assert.ok(res.data.uuid.includes("-"));
@@ -668,7 +686,7 @@ await test("kinetex GET /uuid returns uuid", async () => {
 });
 
 await test("kinetex POST /post roundtrips JSON", async () => {
-  const ktx = kinetex({ baseURL: "https://httpbin.org" });
+  const ktx = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
   const res = await ktx.post<{ json: { a: number } }>("/post", JSON.stringify({ a: 1 }), {
     headers: { "content-type": "application/json" },
   });
@@ -699,6 +717,35 @@ await test("SSEError properties", async () => {
   assert.strictEqual(new SSEError("m", null, null).response, null);
 });
 
+await test("maxReconnects is enforced when the upstream drops the stream", async () => {
+  // The cap is checked in two places — the clean-close path and the error/drop
+  // path — and only the clean one was covered. They are separate blocks, and a
+  // server that accepts the connection then drops the stream is the shape a
+  // real upstream failure takes.
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write("data: tick\n\n");
+    setTimeout(() => res.destroy(), 10);
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address() as AddressInfo;
+  const client = new SSEClient({
+    url: `http://127.0.0.1:${port}/events`,
+    reconnectDelayMs: 2,
+    maxReconnectDelayMs: 5,
+    maxReconnects: 2,
+  });
+  try {
+    // `health` is private, so the observable proof is the error itself: a
+    // bare `assert.rejects` would be satisfied by any rejection at all, which
+    // is exactly what the assertion-hygiene guard exists to prevent.
+    await assert.rejects(() => client.collect({ limit: 99 }), SSEMaxReconnectsError);
+  } finally {
+    await client.close();
+    server.close();
+  }
+});
+
 await test("SSEMaxReconnectsError properties", async () => {
   const e = new SSEMaxReconnectsError(5, "http://t");
   assert.ok(e instanceof Error, "SSEMaxReconnectsError must be an Error");
@@ -722,7 +769,7 @@ suite("Factory");
 await test("createSSEStream returns async iterable", async () => {
   const s = createSSEStream({ url: "http://localhost:5630", validateResponse: () => true });
   assert.equal(typeof s[Symbol.asyncIterator], "function");
-  assert.equal(s.url, "http://localhost:5630");
+  assert.equal((s as unknown as { url: string }).url, "http://localhost:5630");
 });
 
 await test("createJSONSSEStream returns async iterable", async () => {
@@ -1004,7 +1051,7 @@ await test("an onJSON handler that throws surfaces to the caller", async () => {
     throw boom;
   });
   await assert.rejects(
-    () => r.dispatch({ event: "j", data: '{"x":1}', id: null, retry: null, raw: [] }),
+    () => r.dispatch({ event: "j", data: '{"x":1}', id: null, retry: null, raw: [] as string[] }),
     (err: unknown) => {
       assert.strictEqual(err, boom, "the handler's own error must reach the caller");
       return true;
@@ -1015,7 +1062,10 @@ await test("an onJSON handler that throws surfaces to the caller", async () => {
     throw boom;
   });
   await assert.rejects(
-    () => r2.consume([{ event: "j", data: '{"x":1}', id: null, retry: null, raw: [] }]),
+    () =>
+      r2.consume(
+        fromArray([{ event: "j", data: '{"x":1}', id: null, retry: null, raw: [] as string[] }]),
+      ),
     (err: unknown) => {
       assert.strictEqual(err, boom);
       return true;
@@ -1027,7 +1077,7 @@ await test("an onJSON handler that throws surfaces to the caller", async () => {
   const r3 = new SSERouter().onJSON("b", () => {
     called = true;
   });
-  await r3.dispatch({ event: "b", data: "not json", id: null, retry: null, raw: [] });
+  await r3.dispatch({ event: "b", data: "not json", id: null, retry: null, raw: [] as string[] });
   assert.strictEqual(called, false, "a parse failure must still be ignored silently");
 });
 

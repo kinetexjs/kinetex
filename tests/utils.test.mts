@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { isAbortRejection } from "./assert-helpers.ts";
 import {
   safeJSONParse,
   tryParseJSON,
@@ -175,7 +176,7 @@ await test("accepts numeric overflow when allowNonFinite true", () => {
   const text = '{"value": 1e309}';
   const r = safeJSONParse(text, { allowNonFinite: true });
   assert.equal(r.success, true);
-  if (r.success) assert.ok(!Number.isFinite(r.value.value));
+  if (r.success) assert.ok(!Number.isFinite((r.value as { value: number }).value));
 });
 
 await test("rejects -1e309 (negative overflow) when allowNonFinite false", () => {
@@ -353,9 +354,7 @@ await test("isPlainObject with non-plain", () => {
   // passed, and the name promises the opposite. What makes an object plain is
   // its prototype.
   class Plain {
-    constructor() {
-      this.a = 1;
-    }
+    a = 1;
   }
   assert.equal(isPlainObject(new Plain()), false);
   class Custom {
@@ -695,7 +694,7 @@ await test("createStructuredError returns error with code and request", () => {
   assert.equal(withMsg.message, "Inner", "context.message wins, as Object.assign gives it");
   assert.equal(withMsg.code, "E");
   // A context with nothing in it produces a plain Error.
-  const bare = createStructuredError("Bare", {});
+  const bare = createStructuredError("Bare", {} as Parameters<typeof createStructuredError>[1]);
   assert.ok(bare instanceof Error);
   assert.equal(bare.message, "Bare");
 });
@@ -745,14 +744,14 @@ await test("sleep resolves after at least ms", async () => {
 await test("sleep with pre-aborted signal rejects", async () => {
   const ctrl = new AbortController();
   ctrl.abort();
-  await assert.rejects(() => sleep(1000, ctrl.signal));
+  await assert.rejects(() => sleep(1000, ctrl.signal), isAbortRejection);
 });
 
 await test("sleep with abort during wait rejects", async () => {
   const ctrl = new AbortController();
   const p = sleep(1000, ctrl.signal);
   setTimeout(() => ctrl.abort(), 10);
-  await assert.rejects(p);
+  await assert.rejects(p, isAbortRejection);
 });
 
 // ============================================================================
@@ -1504,7 +1503,18 @@ await test("regression: isValidHeaderValue agrees with the runtime about ByteStr
   }
   for (const v of ["\u{1F600}", "a\rb", "a\x00b", "\u0100"]) {
     assert.equal(isValidHeaderValue(v), false, `${JSON.stringify(v)} should be invalid`);
-    assert.throws(() => new Headers({ "X-A": v }), `${JSON.stringify(v)} must be refused`);
+    assert.throws(
+      () => new Headers({ "X-A": v }),
+      (err: unknown) => {
+        // The platform refuses these with a TypeError. Asserting the class is
+        // what makes this a test of the guard: a bare `assert.throws(fn, msg)`
+        // would pass on any throw at all, because a string second argument is
+        // the AssertionError *message*, not a matcher.
+        assert.ok(err instanceof TypeError, `expected TypeError, got ${String(err)}`);
+        return true;
+      },
+      `${JSON.stringify(v)} must be refused`,
+    );
   }
   // DEL is the one place the guard is *stricter* than the platform, which
   // accepts it; being conservative there is the right direction, so it is

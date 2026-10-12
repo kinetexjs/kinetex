@@ -117,7 +117,7 @@ const failures: Array<{ name: string; err: unknown }> = [];
  */
 const TEST_BUDGET_MS = 5_000;
 
-async function test(name: string, fn: () => Promise<void>): Promise<void> {
+async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([
@@ -271,8 +271,14 @@ await test("download progress events reach onDownloadProgress", async () => {
 await test("no progress listeners are attached when none are requested", async () => {
   const p = xhrFetch("https://example.com/plain", {});
   const xhr = xhrAfter(p);
-  assert.deepStrictEqual(Object.keys(xhr.upload.listeners), []);
-  assert.strictEqual(xhr.listeners["progress"], undefined);
+  assert.deepStrictEqual(
+    Object.keys((xhr.upload as unknown as { listeners: Record<string, unknown> }).listeners),
+    [],
+  );
+  assert.strictEqual(
+    (xhr as unknown as { listeners: Record<string, unknown> }).listeners["progress"],
+    undefined,
+  );
   xhr.status = 200;
   xhr.response = "";
   xhr.rawHeaders = "";

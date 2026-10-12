@@ -46,6 +46,20 @@ export interface DedupOptions {
    * @experimental
    */
   signal?: AbortSignal;
+  /**
+   * Timer functions used for the coalescing window.
+   *
+   * Defaults to the globals. Injecting them lets a test drive the window
+   * without replacing `globalThis.setTimeout` — which, when done at module
+   * scope, also captures every unrelated timer in the process. That is not
+   * hypothetical: undici's HTTP/1 parser calls `setTimeout` and then `.unref()`s
+   * the result, so a stub returning a plain number crashed a run outright as
+   * soon as any socket was open.
+   */
+  timers?: {
+    setTimeout: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+    clearTimeout: (handle: ReturnType<typeof setTimeout>) => void;
+  };
 }
 
 interface InFlightEntry<T> {
@@ -60,12 +74,96 @@ interface InFlightEntry<T> {
 // ============================================================================
 
 /**
+ * Headers that are per-request noise rather than part of a request's identity.
+ *
+ * Two callers sending different trace ids are the same request as far as the
+ * response is concerned, so including them would only cost the coalescing that
+ * dedup exists to provide. Everything else — `Authorization`, `Cookie`,
+ * `Accept`, any custom header a gateway keys on — participates, so a request is
+ * only ever coalesced with one that would have received the same response.
+ */
+/**
+ * The default dedup key: method, URL, and the identity-bearing headers.
+ *
+ * Sorting makes the key order-independent, since two requests that differ only
+ * in header order are the same request. Values are included verbatim: a caller
+ * that wants coarser or finer granularity supplies a `keyFn`.
+ */
+/**
+ * Headers excluded from a request's identity, as with {@link defaultDedupKey}.
+ * Duplicated rather than imported so `dedup.ts` stays dependency-free; the two
+ * lists must be kept in step.
+ */
+const NON_IDENTITY_HEADERS = [
+  "traceparent",
+  "tracestate",
+  "baggage",
+  "x-request-id",
+  "x-correlation-id",
+  "x-trace-id",
+];
+
+/**
+ * A stable, opaque digest of everything that makes a request distinct.
+ *
+ * Hashing rather than concatenating keeps credentials out of the key: a dedup
+ * map is a long-lived map of strings, and its keys should not be a place where
+ * an `Authorization` header sits in plain text. Returns `""` when no header
+ * distinguishes the request, so the common unauthenticated case keys on method
+ * and URL alone.
+ */
+export async function identityFingerprint(
+  headers: Record<string, string> | undefined,
+): Promise<string> {
+  if (headers === undefined) return "";
+  const lowered = new Map<string, string>();
+  for (const [name, value] of Object.entries(headers)) {
+    lowered.set(name.toLowerCase(), value);
+  }
+  const parts: string[] = [];
+  for (const name of NON_IDENTITY_HEADERS) lowered.delete(name);
+  for (const name of [...lowered.keys()].sort()) {
+    parts.push(`${name}=${lowered.get(name)}`);
+  }
+  if (parts.length === 0) return "";
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(parts.join("|")));
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Build a dedup key from a method, URL and identity digest.
+ */
+export function dedupKeyFrom(method: string, url: string, fingerprint: string): string {
+  return fingerprint ? `${method}:${url}:${fingerprint}` : `${method}:${url}`;
+}
+
+export function defaultDedupKey(
+  method: string,
+  url: string,
+  headers?: Record<string, string>,
+): string {
+  if (headers === undefined) return `${method}::${url}`;
+  const identity = Object.entries(headers)
+    .filter(([name]) => !NON_IDENTITY_HEADERS.includes(name.toLowerCase()))
+    .map(([name, value]) => `${name.toLowerCase()}=${value}`)
+    .sort();
+  // No distinguishing header means the key stays method + URL, so an empty
+  // header set does not silently become a different key shape.
+  return identity.length === 0 ? `${method}::${url}` : `${method}::${url}::${identity.join("&")}`;
+}
+
+/**
  * `DedupMap` manages in-flight promises keyed by a request fingerprint.
  * It is transport-agnostic — pass any async factory function.
  */
 export class DedupMap<T = unknown> {
   private readonly inflight = new Map<string, InFlightEntry<T>>();
   private readonly timeouts = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Window timers, overridable for tests. See {@link DedupOptions.timers}. */
+  private readonly _setTimeout: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  private readonly _clearTimeout: (handle: ReturnType<typeof setTimeout>) => void;
   private readonly windowMs: number;
   private readonly methods: Set<string>;
   private readonly keyFn: (m: string, url: string, headers?: Record<string, string>) => string;
@@ -81,8 +179,10 @@ export class DedupMap<T = unknown> {
   constructor(options: DedupOptions = {}) {
     this.windowMs = options.windowMs ?? 0;
     this.methods = new Set((options.methods ?? ["GET", "HEAD"]).map((m) => m.toUpperCase()));
-    this.keyFn = options.keyFn ?? ((m, url) => `${m}::${url}`);
+    this.keyFn = options.keyFn ?? defaultDedupKey;
     this._globalSignal = options.signal ?? null;
+    this._setTimeout = options.timers?.setTimeout ?? ((fn, ms) => setTimeout(fn, ms));
+    this._clearTimeout = options.timers?.clearTimeout ?? ((h) => clearTimeout(h));
   }
 
   /**
@@ -107,9 +207,12 @@ export class DedupMap<T = unknown> {
    * entry and creating a new one. The first caller becomes the "leader" and all
    * subsequent callers within the same tick share the same promise.
    *
-   * Note: The default `keyFn` does NOT include headers in the deduplication key.
-   * Two requests with different auth tokens to the same URL will NOT be deduplicated
-   * unless you provide a custom `keyFn` that includes headers.
+   * Note: the default key includes the request headers, so two requests to the
+   * same URL carrying different `Authorization` or `Cookie` are separate
+   * requests and are never coalesced. A key of method + URL alone was the
+   * default once, and it handed one caller's response to another: 50 callers
+   * aside, even two callers for different tenants shared a single response.
+   * See {@link defaultDedupKey}.
    */
   execute(
     method: string,
@@ -196,7 +299,7 @@ export class DedupMap<T = unknown> {
             this.inflight.delete(key);
             const existingTimeout = this.timeouts.get(key);
             if (existingTimeout !== undefined) {
-              clearTimeout(existingTimeout);
+              this._clearTimeout(existingTimeout);
               this.timeouts.delete(key);
             }
           }
@@ -234,10 +337,10 @@ export class DedupMap<T = unknown> {
           // out from under callers that were sharing it.
           const stale = this.timeouts.get(key);
           if (stale !== undefined) {
-            clearTimeout(stale);
+            this._clearTimeout(stale);
             this.timeouts.delete(key);
           }
-          const timeoutId = setTimeout(() => {
+          const timeoutId = this._setTimeout(() => {
             this.inflight.delete(key);
             this.timeouts.delete(key);
           }, effectiveWindowMs);
@@ -253,7 +356,7 @@ export class DedupMap<T = unknown> {
         if (this.inflight.get(key) === entry) this.inflight.delete(key);
         const existingTimeout = this.timeouts.get(key);
         if (existingTimeout !== undefined) {
-          clearTimeout(existingTimeout);
+          this._clearTimeout(existingTimeout);
           this.timeouts.delete(key);
         }
         throw err;
@@ -330,7 +433,7 @@ export class DedupMap<T = unknown> {
     this.inflight.clear();
     // Clear pending timeouts (B-1)
     for (const timeoutId of this.timeouts.values()) {
-      clearTimeout(timeoutId);
+      this._clearTimeout(timeoutId);
     }
     this.timeouts.clear();
   }
@@ -345,7 +448,7 @@ export class DedupMap<T = unknown> {
   invalidate(key: string): boolean {
     const timeoutId = this.timeouts.get(key);
     if (timeoutId) {
-      clearTimeout(timeoutId);
+      this._clearTimeout(timeoutId);
       this.timeouts.delete(key);
     }
     return this.inflight.delete(key);

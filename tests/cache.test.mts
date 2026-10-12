@@ -2,15 +2,21 @@ import assert from "node:assert/strict";
 import { kinetex, HTTPCache, MemoryStorageAdapter, createTwoTierCache } from "../src/mod.ts";
 import { createMemoryCache } from "../src/mod.ts";
 import { getAuthFingerprint } from "../src/cache.ts";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 
 const T = 30_000;
-const httpbin = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+// The local httpbin server, so this suite's result does not depend on a third
+// party's uptime. `allowPrivateNetwork` is the documented opt-in for reaching
+// loopback; without it the client-layer SSRF gate rejects the host, which is
+// correct behaviour outside a test.
+const LOCAL = HTTPBIN_LOCAL_ORIGIN;
+const httpbin = kinetex({ baseURL: LOCAL, timeout: T, allowPrivateNetwork: true });
 
 let passed = 0;
 let failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
-async function test(name: string, fn: () => Promise<void>) {
+async function test(name: string, fn: () => Promise<void> | void) {
   try {
     await fn();
     console.log(`  ✅  ${name}`);
@@ -27,7 +33,7 @@ function suite(name: string) {
   console.log(`\n── ${name}`);
 }
 
-const BASE = "https://httpbin.org";
+const BASE = LOCAL;
 
 // ============================================================================
 // §1  HTTPCache CORE
@@ -46,7 +52,7 @@ await test("set and get work", async () => {
   };
   assert.equal(await cache.set(req, res), true);
   const r = await cache.get(req);
-  assert.notEqual(r, null, "should return cached entry");
+  assert.ok(r !== null, "should return cached entry");
   assert.equal(r.entry.response.body, '{"test":true}');
   assert.equal(r.stale, false);
 });
@@ -120,7 +126,7 @@ await test("set with custom ttlMs", async () => {
     { ttlMs: 500 },
   );
   const r = await cache.get({ url: `${BASE}/custom-ttl`, method: "GET", headers: {} });
-  assert.notEqual(r, null, "should return entry with custom ttl");
+  assert.ok(r !== null, "should return entry with custom ttl");
   assert.equal(r.stale, false);
 });
 
@@ -146,7 +152,7 @@ await test("set with Vary header differentiates requests", async () => {
   await cache.set(reqA, res);
   const r1 = await cache.get(reqA);
   const r2 = await cache.get(reqB);
-  assert.notEqual(r1, null, "should hit for matching vary");
+  assert.ok(r1 !== null, "should hit for matching vary");
   assert.equal(r2, null, "should miss for different vary");
 });
 
@@ -158,7 +164,7 @@ await test("set with tags stores them", async () => {
     { tags: ["a", "b"] },
   );
   const r = await cache.get({ url: `${BASE}/tagged`, method: "GET", headers: {} });
-  assert.notEqual(r, null, "should return entry with tags");
+  assert.ok(r !== null, "should return entry with tags");
   assert.deepEqual(r.entry.tags, ["a", "b"]);
 });
 
@@ -249,7 +255,7 @@ await test("buildConditionalHeaders with etag and last-modified", async () => {
     { force: true },
   );
   const r = await cache.get(req);
-  assert.notEqual(r, null, "should return entry with etag/lm headers");
+  assert.ok(r !== null, "should return entry with etag/lm headers");
   const h = cache.buildConditionalHeaders(r.entry);
   assert.equal(h["if-none-match"], '"abc"');
   assert.equal(h["if-modified-since"], "Mon, 01 Jan 2024 00:00:00 GMT");
@@ -260,7 +266,7 @@ await test("buildConditionalHeaders returns empty for no etag/lm", async () => {
   const req = { url: `${BASE}/no-etag`, method: "GET", headers: {} };
   await cache.set(req, { status: 200, statusText: "OK", headers: {}, body: "x" });
   const r = await cache.get(req);
-  assert.notEqual(r, null, "should return entry for conditional headers");
+  assert.ok(r !== null, "should return entry for conditional headers");
   const h = cache.buildConditionalHeaders(r.entry);
   assert.deepEqual(h, {});
 });
@@ -284,12 +290,12 @@ await test("revalidate handles 304 with new headers", async () => {
     headers: { "cache-control": "max-age=120" },
     body: null,
   });
-  assert.notEqual(r, null, "revalidate should succeed");
+  assert.ok(r !== null, "revalidate should succeed");
   // After revalidation, the entry should have merged headers and new TTL.
   // Only `notEqual(null)` was asserted, so a revalidate() that did nothing at
   // all — returning the entry untouched — passed.
   const g = await cache.get(req);
-  assert.notEqual(g, null, "entry should persist after revalidation");
+  assert.ok(g !== null, "entry should persist after revalidation");
   // The 304's validator replaces the old one ...
   assert.equal(g.entry.etag, '"abc"', "the 304 carried no etag, so the old one is kept");
   // ... the body and status of the original 200 are preserved, not the 304's null body ...
@@ -385,6 +391,8 @@ await test("warm preloads entries", async () => {
   assert.equal(cache.getStats().totalEntries, 2);
   const w1 = await cache.get({ url: `${BASE}/w1`, method: "GET", headers: {} });
   const w2 = await cache.get({ url: `${BASE}/w2`, method: "GET", headers: {} });
+  assert.ok(w1 !== null, "warm() must have stored /w1");
+  assert.ok(w2 !== null, "warm() must have stored /w2");
   assert.equal(w1.entry.response.body, "d1", "warm must store the body, not a placeholder");
   assert.equal(w2.entry.response.body, "d2");
   assert.deepEqual(w1.entry.tags, []);
@@ -427,12 +435,12 @@ const ttlOf = async (
   req: { url: string; method: string; headers: Record<string, string> },
 ): Promise<number> => {
   const r = await cache.get(req);
-  assert.notEqual(r, null, "the entry must be stored to measure its TTL");
+  assert.ok(r !== null, "the entry must be stored to measure its TTL");
   return r.entry.expiresAt - r.entry.createdAt;
 };
 
 await test("Cache-Control max-age used as TTL", async () => {
-  // Was `assert.notEqual(r, null)` — satisfied by the 60 s default TTL, by an
+  // Was `assert.ok(r !== null)` — satisfied by the 60 s default TTL, by an
   // Infinity TTL, by any TTL at all. The subject of the test is the number.
   const cache = createMemoryCache({ defaultTtlMs: 60000 });
   const req = { url: `${BASE}/ma`, method: "GET", headers: {} };
@@ -444,6 +452,7 @@ await test("Cache-Control max-age used as TTL", async () => {
   });
   assert.equal(await ttlOf(cache, req), 10_000, "max-age is in seconds");
   const r = await cache.get(req);
+  assert.ok(r !== null, "cache entry must be present");
   assert.equal(r.stale, false);
 });
 
@@ -692,7 +701,7 @@ await test("deserialize restores entries", async () => {
   const c2 = createMemoryCache();
   await c2.deserialize(data);
   const r = await c2.get({ url: `${BASE}/d1`, method: "GET", headers: {} });
-  assert.notEqual(r, null, "should restore deserialized entry");
+  assert.ok(r !== null, "should restore deserialized entry");
   assert.equal(r.stale, false, "a restored entry is fresh if it has not expired");
   assert.equal(r.entry.response.body, "data", "the body must survive the round trip");
   assert.equal(r.entry.response.status, 200);
@@ -763,7 +772,7 @@ await test("stale-while-revalidate returns stale entry within SWR window", async
   // Wait for the entry to expire (past max-age)
   await new Promise((r) => setTimeout(r, 1100));
   const g = await cache.get({ url: `${BASE}/swr-test`, method: "GET", headers: {} });
-  assert.notEqual(g, null, "should return stale entry within SWR window");
+  assert.ok(g !== null, "should return stale entry within SWR window");
   assert.equal(g.stale, true);
   assert.equal(g.entry.response.body, "stale", "the stale body is what gets served");
   // The window has to be the declared 3600 s, and it has to start where the
@@ -790,7 +799,7 @@ await test("stale-if-error returns stale entry within SIE window", async () => {
   );
   await new Promise((r) => setTimeout(r, 1100));
   const g = await cache.get({ url: `${BASE}/sie-test`, method: "GET", headers: {} });
-  assert.notEqual(g, null, "should return stale entry within SIE window");
+  assert.ok(g !== null, "should return stale entry within SIE window");
   assert.equal(g.stale, true);
   assert.equal(g.entry.response.body, "stale-sie");
   assert.equal(g.entry.expiresAt - g.entry.createdAt, 1000);
@@ -836,7 +845,7 @@ await test("immutable sets very long TTL", async () => {
     body: "x",
   });
   const r = await cache.get(req);
-  assert.notEqual(r, null, "should cache immutable entry");
+  assert.ok(r !== null, "should cache immutable entry");
   assert.equal(r.entry.expiresAt - r.entry.createdAt, 86_400_000, "capped to maxAbsoluteAgeMs");
 
   // Without the cap, immutable must reach the full year, not the 10 s max-age.
@@ -848,8 +857,10 @@ await test("immutable sets very long TTL", async () => {
     headers: { "cache-control": "max-age=10, immutable" },
     body: "x",
   });
+  const oneYear = await long.get(req2);
+  assert.ok(oneYear !== null, "the entry must exist to measure its lifetime");
   assert.equal(
-    (await long.get(req2)).entry.expiresAt - (await long.get(req2)).entry.createdAt,
+    oneYear.entry.expiresAt - oneYear.entry.createdAt,
     365 * 24 * 60 * 60 * 1000,
     "immutable means a year, whatever max-age said",
   );
@@ -904,7 +915,7 @@ await test("TwoTierStorageAdapter promotes L2 to L1", async () => {
     { status: 200, statusText: "OK", headers: {}, body: "x" },
   );
   const r = await cache.get({ url: `${BASE}/tier`, method: "GET", headers: {} });
-  assert.notEqual(r, null, "should return entry from two-tier cache");
+  assert.ok(r !== null, "should return entry from two-tier cache");
 });
 
 await test("TwoTierStorageAdapter L1-miss L2-hit promotes", async () => {
@@ -927,12 +938,12 @@ await test("TwoTierStorageAdapter L1-miss L2-hit promotes", async () => {
   await l2.set("pk", entry);
   // Get through TwoTier - should miss L1, hit L2, promote to L1
   const result = await twoTier.get("pk");
-  assert.notEqual(result, null, "should return promoted entry");
+  assert.ok(result !== null, "should return promoted entry");
   assert.equal(result.response.body, "promoted");
   // Now L1 should have it promoted - verify by deleting from L2 and getting from TwoTier
   await l2.delete("pk");
   const resultAfterL2Deleted = await twoTier.get("pk");
-  assert.notEqual(resultAfterL2Deleted, null, "Should still be in L1 after promotion");
+  assert.ok(resultAfterL2Deleted !== null, "Should still be in L1 after promotion");
   // Direct method tests
   const e2 = { ...entry, response: { ...entry.response, body: "direct" } };
   await twoTier.set("dk", e2);
@@ -957,7 +968,9 @@ await test("defaultTtlMs capped to 1 year", async () => {
   // that actually determines the stored lifetime.
   const warnings: string[] = [];
   const original = console.warn;
-  console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.join(" "));
+  };
   let cache;
   try {
     cache = createMemoryCache({ defaultTtlMs: 366 * 24 * 60 * 60 * 1000 });
@@ -976,8 +989,10 @@ await test("defaultTtlMs capped to 1 year", async () => {
   const stored = await cache.set(req, { status: 200, statusText: "OK", headers: {}, body: "x" });
   assert.equal(stored, true);
   // 366 d is capped to 1 y by the config, then to 7 days by maxAbsoluteAgeMs.
+  const lifetime1 = await cache.get(req);
+  assert.ok(lifetime1 !== null, "entry 1 must exist to measure its lifetime");
   assert.equal(
-    (await cache.get(req)).entry.expiresAt - (await cache.get(req)).entry.createdAt,
+    lifetime1.entry.expiresAt - lifetime1.entry.createdAt,
     7 * 24 * 60 * 60 * 1000,
     "the stored lifetime is maxAbsoluteAgeMs, which defaults to 7 days",
   );
@@ -989,8 +1004,10 @@ await test("defaultTtlMs capped to 1 year", async () => {
   });
   const req2 = { url: `${BASE}/cap2`, method: "GET", headers: {} };
   await wide.set(req2, { status: 200, statusText: "OK", headers: {}, body: "x" });
+  const lifetime = await wide.get(req2);
+  assert.ok(lifetime !== null, "the entry must exist to measure its lifetime");
   assert.equal(
-    (await wide.get(req2)).entry.expiresAt - (await wide.get(req2)).entry.createdAt,
+    lifetime.entry.expiresAt - lifetime.entry.createdAt,
     365 * 24 * 60 * 60 * 1000,
     "the config-level 1-year cap applies once the absolute cap is lifted",
   );
@@ -1029,6 +1046,7 @@ await test("custom cacheKey function", async () => {
   );
   assert.deepEqual(await storage.keys(), ["custom-key"], "one key, two URLs");
   const r = await cache.get({ url: `${BASE}/custom`, method: "GET", headers: {} });
+  assert.ok(r !== null, "cache entry must be present");
   assert.equal(r.entry.response.body, "y", "the second write must have won");
 });
 
@@ -1041,7 +1059,7 @@ await test("namespace prefixes keys", async () => {
   );
   assert.deepEqual(
     await storage.keys(),
-    ["ns1:GET:https://httpbin.org/ns"],
+    [`ns1:GET:${LOCAL}/ns`],
     "the namespace prefixes METHOD:url",
   );
 
@@ -1052,8 +1070,10 @@ await test("namespace prefixes keys", async () => {
     { status: 200, statusText: "OK", headers: {}, body: "from-ns2" },
   );
   const r = await cache.get({ url: `${BASE}/ns`, method: "GET", headers: {} });
+  assert.ok(r !== null, "cache entry must be present");
   assert.equal(r.entry.response.body, "x", "the ns1 entry must be untouched by ns2");
   const r2 = await other.get({ url: `${BASE}/ns`, method: "GET", headers: {} });
+  assert.ok(r2 !== null, "the ns2 entry must be present");
   assert.equal(r2.entry.response.body, "from-ns2");
 });
 
@@ -1068,7 +1088,7 @@ await test("default cache key normalizes method, query order, hash and auth", as
   );
   assert.deepEqual(
     await storage.keys(),
-    ["GET:https://httpbin.org/n?a=1&b=2"],
+    [`GET:${LOCAL}/n?a=1&b=2`],
     "method upper-cased, query sorted, fragment dropped",
   );
 
@@ -1079,7 +1099,7 @@ await test("default cache key normalizes method, query order, hash and auth", as
     { status: 200, statusText: "OK", headers: {}, body: "x" },
   );
   const [key] = await authed.keys();
-  assert.match(key, /^GET:https:\/\/httpbin\.org\/n:auth:[0-9a-f]{32}$/);
+  assert.match(key, new RegExp(`^GET:${LOCAL}/n:auth:[0-9a-f]{32}$`));
   // Two different users must never share a cache entry.
   const c3 = new HTTPCache({ storage: authed });
   await c3.set(
@@ -1149,7 +1169,7 @@ await test("LRU touch promotes accessed key", async () => {
   );
   const r1 = await cache.get({ url: `${BASE}/lru1`, method: "GET", headers: {} });
   const r2 = await cache.get({ url: `${BASE}/lru2`, method: "GET", headers: {} });
-  assert.notEqual(r1, null, "lru1 should survive (was accessed)");
+  assert.ok(r1 !== null, "lru1 should survive (was accessed)");
   assert.equal(r2, null, "lru2 should be evicted (was LRU)");
 });
 
@@ -1218,9 +1238,20 @@ await test("createLocalStorageCache throws in Node.js", async () => {
   assert.throws(() => fn(), /localStorage is not available/);
 });
 
-await test("createSessionStorageCache throws in Node.js", async () => {
+await test("createSessionStorageCache reflects the runtime's web storage", async () => {
   const { createSessionStorageCache: fn } = await import("../src/cache.ts");
-  assert.throws(() => fn(), /sessionStorage is not available/);
+  const { HTTPCache } = await import("../src/cache.ts");
+  // Node 26 ships a built-in `sessionStorage`; Node 22 and 24 do not. The
+  // contract is "use web storage when it exists, refuse clearly when it does
+  // not", and asserting only the refusal made the test fail on the first
+  // runtime to add the global — as if the library had regressed, when it had
+  // simply gained a capability.
+  if (typeof globalThis.sessionStorage === "undefined") {
+    assert.throws(() => fn(), /sessionStorage is not available/);
+    return;
+  }
+  const cache = fn();
+  assert.ok(cache instanceof HTTPCache, "a runtime with sessionStorage gets a usable cache");
 });
 
 await test("createKVCache creates HTTPCache", async () => {
@@ -1235,32 +1266,35 @@ await test("createKVCache creates HTTPCache", async () => {
 
 suite("Real HTTP Calls via Kinetex");
 
-await test("real httpbin.org/get", async () => {
+await test("local httpbin/get", async () => {
   assert.equal((await httpbin.get("/get")).status, 200);
 });
 
-await test("real httpbin.org/ip", async () => {
-  const r = await httpbin.get("/ip");
+await test("local httpbin/ip", async () => {
+  const r = await httpbin.get<{ headers: unknown; origin: string }>("/ip");
   assert.equal(r.status, 200);
   assert.equal(typeof r.data.origin, "string", "origin should be a string");
   assert.ok(r.data.origin.length > 0, "and must not be empty");
 });
 
-await test("real httpbin.org/headers", async () => {
-  const r = await httpbin.get("/headers", { headers: { "X-Test": "val" } });
+await test("local httpbin/headers", async () => {
+  const r = await httpbin.get<{ headers: Record<string, string> }>("/headers", {
+    headers: { "X-Test": "val" },
+  });
   assert.equal(r.status, 200);
   // A truthy check on `r.data.headers` is satisfied by `{}`. Echo the header
   // back so the request actually has to have carried it.
   assert.equal(typeof r.data.headers, "object");
-  assert.equal(
-    String(r.data.headers["X-Test"]).toLowerCase(),
-    "val",
-    "the request header must reach the server",
-  );
+  // Looked up lower-cased on purpose. Header names are case-insensitive on the
+  // wire and kinetex sends them lower-cased, which is correct; the only reason
+  // httpbin echoes `X-Test` back with that casing is that *its* client chose it.
+  // Asserting the sent casing here would pin a test to a remote server's
+  // accident instead of to this library's behaviour.
+  assert.equal(r.data.headers["x-test"], "val", "the request header must reach the server");
 });
 
-await test("real httpbin.org/json", async () => {
-  const r = await httpbin.get("/json");
+await test("local httpbin/json", async () => {
+  const r = await httpbin.get<{ slideshow: { slides: unknown[]; title: string } }>("/json");
   assert.equal(r.status, 200);
   assert.equal(typeof r.data.slideshow, "object", "not merely truthy");
   assert.ok(Array.isArray(r.data.slideshow.slides), "slides must be a list");
@@ -1268,8 +1302,8 @@ await test("real httpbin.org/json", async () => {
   assert.equal(typeof r.data.slideshow.title, "string");
 });
 
-await test("real httpbin.org/uuid", async () => {
-  const r = await httpbin.get("/uuid");
+await test("local httpbin/uuid", async () => {
+  const r = await httpbin.get<{ uuid: string }>("/uuid");
   assert.equal(r.status, 200);
   assert.match(
     r.data.uuid,
@@ -1278,32 +1312,32 @@ await test("real httpbin.org/uuid", async () => {
   );
 });
 
-await test("real httpbin.org/post with JSON", async () => {
-  const r = await httpbin.post("/post", { test: "data" });
+await test("local httpbin/post with JSON", async () => {
+  const r = await httpbin.post<{ json: { test: string } }>("/post", { test: "data" });
   assert.equal(r.status, 200);
   assert.deepEqual(r.data.json, { test: "data" });
 });
 
-await test("real httpbin.org/anything", async () => {
-  const r = await httpbin.post("/anything", { msg: "cache-test" });
+await test("local httpbin/anything", async () => {
+  const r = await httpbin.post<{ json: { msg: string } }>("/anything", { msg: "cache-test" });
   assert.equal(r.status, 200);
   assert.equal(r.data.json.msg, "cache-test");
 });
 
-await test("real httpbin.org/base64 decode", async () => {
+await test("local httpbin/base64 decode", async () => {
   const r = await httpbin.get("/base64/SGVsbG8gV29ybGQ=");
   assert.equal(r.status, 200);
   assert.equal(String(r.data).trim(), "Hello World");
 });
 
-await test("real httpbin.org/delay/0 with timing", async () => {
+await test("local httpbin/delay/0 with timing", async () => {
   const start = Date.now();
   const r = await httpbin.get("/delay/0");
   assert.equal(r.status, 200);
   assert.ok(Date.now() - start < 2000, "response should arrive within 2s");
 });
 
-await test("real httpbin.org/response-headers", async () => {
+await test("local httpbin/response-headers", async () => {
   const r = await httpbin.get("/response-headers", { headers: { "X-Test": "val" } });
   assert.equal(r.status, 200);
 });
@@ -1326,7 +1360,7 @@ await test("invalid URL in cache key triggers fallback path", async () => {
   const ok = await cache.set(req, { status: 200, statusText: "OK", headers: {}, body: "x" });
   assert.equal(ok, true);
   const r = await cache.get(req);
-  assert.notEqual(r, null, "should cache entry with invalid URL");
+  assert.ok(r !== null, "should cache entry with invalid URL");
   assert.equal(r.entry.response.body, "x");
   // The fallback key must still be stable and method-qualified, or an
   // unparseable URL would collide with every other unparseable URL.
@@ -1351,7 +1385,7 @@ await test("invalid Last-Modified date falls back to default TTL", async () => {
   });
   assert.equal(ok, true);
   const r = await cache.get(req);
-  assert.notEqual(r, null, "Should cache with default TTL despite invalid LM");
+  assert.ok(r !== null, "Should cache with default TTL despite invalid LM");
   assert.equal(
     r.entry.expiresAt - r.entry.createdAt,
     5000,
@@ -1362,9 +1396,14 @@ await test("invalid Last-Modified date falls back to default TTL", async () => {
 
 await test("all Cache-Control directive branches", async () => {
   const cache = createMemoryCache({ honorCacheControl: true });
-  // Test must-revalidate, proxy-revalidate, public, private, no-transform, only-if-cached, must-understand
+  // must-revalidate, proxy-revalidate, public, no-transform, only-if-cached,
+  // must-understand. `private` used to be in this list, which made the test
+  // assert that a `private` response is storable — the opposite of what the
+  // directive means, and it hid that `d.private` was parsed and never read.
+  // `private` is covered on its own below, where the storage decision is the
+  // thing under test rather than an accident of the parser smoke test.
   const cc =
-    "must-revalidate, proxy-revalidate, public, private, no-transform, only-if-cached, must-understand, max-age=3600";
+    "must-revalidate, proxy-revalidate, public, no-transform, only-if-cached, must-understand, max-age=3600";
   const req = { url: `${BASE}/all-cc`, method: "GET", headers: {} };
   const ok = await cache.set(req, {
     status: 200,
@@ -1374,7 +1413,7 @@ await test("all Cache-Control directive branches", async () => {
   });
   assert.equal(ok, true);
   const r = await cache.get(req);
-  assert.notEqual(r, null, "should cache entry with all cache-control directives");
+  assert.ok(r !== null, "should cache entry with all cache-control directives");
   assert.equal(r.entry.expiresAt - r.entry.createdAt, 3_600_000, "max-age still parsed");
   assert.equal(
     r.entry.mustRevalidate,
@@ -1382,6 +1421,94 @@ await test("all Cache-Control directive branches", async () => {
     "must-revalidate must survive alongside the other directives",
   );
   assert.equal(r.stale, true, "must-revalidate forbids a fresh hit");
+});
+
+await test("a 304 from the server is answered from the cache, not as an empty body", async () => {
+  // The foreground 304 branch rebuilds the response from the stored entry. It
+  // had no coverage: the conditional round trip only exercises the *background*
+  // revalidation path, so a regression here would turn every 304 into a caller
+  // receiving an empty response body with no indication anything was cached.
+  const { createServer } = await import("node:http");
+  const { kinetex } = await import("../src/mod.ts");
+  let n = 0;
+  const srv = createServer((_req, res) => {
+    n++;
+    if (n > 1) {
+      res.writeHead(304, { etag: '"v1"' });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json", etag: '"v1"' });
+    res.end(JSON.stringify({ version: 1, secret: "from-cache" }));
+  });
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  const port = (srv.address() as { port: number }).port;
+  const client = kinetex({
+    baseURL: `http://127.0.0.1:${port}`,
+    allowPrivateNetwork: true,
+    cache: { defaultTtlMs: 600_000 },
+  });
+  try {
+    const first = await client.get<{ version: number; secret: string }>("/doc");
+    assert.equal(first.data.version, 1);
+    // Serve the entry but force the next request onto the wire.
+    const second = await client.get<{ version: number; secret: string }>("/doc", {
+      cache: { forceRefresh: true },
+    });
+    assert.equal(n, 2, "the second request must have reached the server");
+    assert.equal(second.status, 200, "a 304 must not surface as a 304 to the caller");
+    assert.equal(second.data.secret, "from-cache", "the stored body must be rebuilt");
+  } finally {
+    await client.destroy();
+    srv.close();
+  }
+});
+
+await test("a Cache-Control: private response is not stored", async () => {
+  // `private` marks a response as belonging to one user. A browser's cache is
+  // per-user so storing it is fine there, but this cache is a Map in the calling
+  // process shared by every request that process makes — so storing it is the
+  // difference between one user's response and another user's. The directive was
+  // parsed into `d.private` and then never read, so it was stored regardless.
+  const cache = createMemoryCache();
+  const req = { url: `${BASE}/private-resp`, method: "GET", headers: {} };
+  const stored = await cache.set(req, {
+    status: 200,
+    statusText: "OK",
+    headers: { "cache-control": "private, max-age=600" },
+    body: "secret-for-one-user",
+  });
+  assert.equal(stored, false, "a private response must not be stored");
+  assert.equal(await cache.get(req), null, "and must not be replayed");
+});
+
+await test("a Cache-Control: private response is stored when directives are not honoured", async () => {
+  // The opt-out has to keep working: a caller who sets honorCacheControl: false
+  // is asking for the cache to store whatever it is given.
+  const cache = createMemoryCache({ honorCacheControl: false });
+  const req = { url: `${BASE}/private-optout`, method: "GET", headers: {} };
+  const stored = await cache.set(req, {
+    status: 200,
+    statusText: "OK",
+    headers: { "cache-control": "private, max-age=600" },
+    body: "x",
+  });
+  assert.equal(stored, true);
+  assert.ok((await cache.get(req)) !== null);
+});
+
+await test("an ordinary max-age response is still cached", async () => {
+  // The guard must not turn caching off by accident.
+  const cache = createMemoryCache();
+  const req = { url: `${BASE}/ordinary`, method: "GET", headers: {} };
+  const stored = await cache.set(req, {
+    status: 200,
+    statusText: "OK",
+    headers: { "cache-control": "max-age=600" },
+    body: "x",
+  });
+  assert.equal(stored, true);
+  assert.ok((await cache.get(req)) !== null);
 });
 
 // ============================================================================
@@ -1444,7 +1571,10 @@ await test("regression: `no-cache` is stored but never served as fresh", async (
   // RFC 9111 §5.2.2.4. The response was reported as a plain fresh hit with
   // nothing recorded, so an origin that said "ask me again" was ignored and
   // its body was served indefinitely from cache.
-  for (const cc of ["no-cache", "private, no-cache", "max-age=600, no-cache"]) {
+  // `private` is deliberately absent: `private, no-cache` is no longer stored at
+  // all rather than stored-and-never-fresh, which is what this loop asserts.
+  // It has its own cases below.
+  for (const cc of ["no-cache", "max-age=600, no-cache"]) {
     const cache = createMemoryCache();
     const req = { url: `${BASE}/nc-${cc}`, method: "GET", headers: {} };
     const stored = await cache.set(req, {
@@ -1455,7 +1585,7 @@ await test("regression: `no-cache` is stored but never served as fresh", async (
     });
     assert.equal(stored, true, `${cc} may be stored`);
     const hit = await cache.get(req);
-    assert.notEqual(hit, null, `${cc} should still be retrievable for revalidation`);
+    assert.ok(hit !== null, `${cc} should still be retrievable for revalidation`);
     assert.equal(hit.stale, true, `${cc} must not be reported as a fresh hit`);
     assert.equal(hit.entry.mustRevalidate, true, `${cc} must record the directive`);
   }
@@ -1471,6 +1601,7 @@ await test("regression: `must-revalidate` is stored but never served as fresh", 
     body: "x",
   });
   const hit = await cache.get(req);
+  assert.ok(hit !== null, "cache entry must be present");
   assert.equal(hit.stale, true, "must-revalidate requires a check with the origin");
   assert.equal(hit.entry.mustRevalidate, true);
 });
@@ -1486,6 +1617,7 @@ await test("regression: an ordinary `max-age` response is still a fresh hit", as
     body: "x",
   });
   const hit = await cache.get(req);
+  assert.ok(hit !== null, "cache entry must be present");
   assert.equal(hit.stale, false, "a plain max-age response must still be fresh");
   assert.equal(hit.entry.mustRevalidate, false);
 });
@@ -1524,7 +1656,7 @@ await test("regression: resetStats keeps enforcing maxSizeBytes", async () => {
 
   const keys = await storage.keys();
   let realBytes = 0;
-  for (const k of keys) realBytes += (await storage.get(k)).size;
+  for (const k of keys) realBytes += (await storage.get(k))?.size ?? 0;
   assert.ok(
     realBytes <= 600,
     `storage holds ${realBytes} bytes against a 600-byte cap across ${keys.length} entries`,
@@ -1598,7 +1730,7 @@ await test("regression: `max-age=0, stale-while-revalidate` is cached", async ()
   assert.equal(stored, true, "a stale-while-revalidate window must permit storage");
 
   const hit = await cache.get(req);
-  assert.notEqual(hit, null, "and it must be retrievable");
+  assert.ok(hit !== null, "and it must be retrievable");
   assert.equal(hit.stale, true, "already stale, so it is not a fresh hit");
   assert.equal(hit.entry.response.body, "swr-body");
   assert.equal(hit.entry.expiresAt - hit.entry.createdAt, 0, "no freshness lifetime");
@@ -1623,7 +1755,7 @@ await test("regression: `max-age=0, stale-if-error` is cached", async () => {
   });
   assert.equal(stored, true);
   const hit = await cache.get(req);
-  assert.notEqual(hit, null);
+  assert.ok(hit !== null);
   assert.equal(hit.stale, true);
   assert.equal(
     hit.entry.staleOnError - hit.entry.expiresAt,
@@ -1666,7 +1798,7 @@ await test("regression: a future Last-Modified never yields a negative lifetime"
     body: "skewed",
   });
   const hit = await cache.get(req);
-  assert.notEqual(hit, null, "a 60 s SWR window must make it storable and servable");
+  assert.ok(hit !== null, "a 60 s SWR window must make it storable and servable");
   assert.ok(
     hit.entry.expiresAt >= hit.entry.createdAt,
     `expiresAt ${hit.entry.expiresAt} must not precede createdAt ${hit.entry.createdAt}`,
@@ -1694,6 +1826,7 @@ await test("regression: a forced entry with a future Last-Modified stores a 0 TT
   );
   const [key] = await storage.keys();
   const entry = await storage.get(key);
+  assert.ok(entry, "the entry must still be stored");
   assert.ok(
     entry.expiresAt >= entry.createdAt,
     "a stored entry must never expire before it was created",
@@ -1712,7 +1845,8 @@ await test("regression: a past Last-Modified still uses the 10% heuristic", asyn
     headers: { "last-modified": new Date(Date.now() - DAY).toUTCString() },
     body: "x",
   });
-  const ttl = (await cache.get(req)).entry.expiresAt - (await cache.get(req)).entry.createdAt;
+  const cached = (await cache.get(req))!.entry;
+  const ttl = cached.expiresAt - cached.createdAt;
   assert.ok(Math.abs(ttl - DAY * 0.1) < 1000, `expected ~${DAY * 0.1}, got ${ttl}`);
 });
 

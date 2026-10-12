@@ -41,8 +41,7 @@
 import { execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { rmSync, writeFileSync } from "node:fs";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 
 const run = (cmd: string) => {
   console.log(`  $ ${cmd}`);
@@ -377,8 +376,23 @@ async function main() {
     deno.version = newVersion;
     writeFileSync("deno.json", JSON.stringify(deno, null, 2) + "\n");
   }
+  // The lock carries the version twice — at the root and under packages[""] —
+  // and `npm ci` fails outright when it disagrees with package.json, so a
+  // release that bumps one and not the other does not install. It was left
+  // behind at 1.0.0-rc.1 once already.
+  const hasLock = existsSync("package-lock.json");
+  if (hasLock) {
+    const lock = JSON.parse(readFileSync("package-lock.json", "utf8")) as {
+      version?: string;
+      packages?: Record<string, { version?: string }>;
+    };
+    if (lock.version !== undefined) lock.version = newVersion;
+    if (lock.packages?.[""]?.version !== undefined) lock.packages[""]!.version = newVersion;
+    writeFileSync("package-lock.json", JSON.stringify(lock, null, 2) + "\n");
+  }
+  const alsoBumped = [hasDenoJson && "deno.json", hasLock && "package-lock.json"].filter(Boolean);
   console.log(
-    `  ✓ package.json: ${oldVersion} → ${newVersion}${hasDenoJson ? " (+ deno.json)" : ""}`,
+    `  ✓ package.json: ${oldVersion} → ${newVersion}${alsoBumped.length ? ` (+ ${alsoBumped.join(", ")})` : ""}`,
   );
 
   // ── Verify ───────────────────────────────────────────────────────────────

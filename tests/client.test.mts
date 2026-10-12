@@ -1,81 +1,37 @@
 /**
  * kinetex — client.ts unit tests
- * Tests all Kinetex client features with real HTTP calls to external APIs.
- * No mocks, no predefined data, only real network calls.
+ * Every test makes a real HTTP call against the local fixture in
+ * tests/httpbin-local.ts; there are no mocks and no third-party endpoints.
  */
 
 import assert from "node:assert/strict";
 import { kinetex } from "../src/mod.ts";
 import { HTTPStatusError, KinetexError, SizeLimitError, TimeoutError } from "../src/types.ts";
 import { encodeMultipart, NodeHTTP2Transport } from "../src/core.ts";
-import { isUpstreamFlake, isUpstreamStatusDrift } from "./upstream.ts";
+import { HTTPBIN_LOCAL_ORIGIN, HTTPBIN_LOCAL_TLS_ORIGIN, LOCAL_TLS_CA } from "./httpbin-local.ts";
 
 let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
-// Per-test wall-clock budget. Every test here talks to a live third-party
-// API, so without a cap a single hung socket would park the whole suite for
-// the 30s client timeout — or forever, if the timeout itself regressed. A
-// test that overruns is a failure, never a silent stall.
-const TEST_BUDGET_MS = 45_000;
+// Per-test wall-clock budget. A test that overruns is a failure, never a
+// silent stall that parks the whole suite.
+const T = 30_000;
 
-/**
- * Skip the rest of the current test when `status` is an upstream failure
- * rather than `expected`. Returns true when it skipped, so the caller can
- * `return`.
- */
-function skipOnUpstreamDrift(name: string, status: number, expected: number): boolean {
-  if (!isUpstreamStatusDrift(status, expected)) return false;
-  console.log(
-    `    ⚠️  ${name} — assertions skipped (transient: httpbin answered ${status}, not ${expected})`,
-  );
-  return true;
-}
-
-/**
- * Almost every test in this file talks to live httpbin, so an outage arrives as
- * a failure that says nothing about the client — `HTTP 502 Bad Gateway` on a
- * POST that should have echoed its body. Handled one test at a time it is
- * whack-a-mole: the run that failed tonight would have been a different POST.
- *
- * `isUpstreamFlake` is applied to every test in the file, not opted into per
- * test, because the point is to survive an outage rather than to whitelist known
- * flakiness. Its discrimination is deliberately narrow and an AssertionError is
- * never excused, so it cannot convert a real failure into green. It lives in
- * `tests/upstream.ts`, shared with the other live suites, and is pinned by
- * `tests/upstream-drift.test.mts`.
- */
-
-async function test(name: string, fn: () => Promise<void>): Promise<void> {
-  const started = Date.now();
-  let timer: ReturnType<typeof setTimeout> | undefined;
+async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
   try {
     await Promise.race([
-      fn(),
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`exceeded the ${TEST_BUDGET_MS}ms per-test budget`)),
-          TEST_BUDGET_MS,
-        );
-      }),
+      Promise.resolve(fn()),
+      new Promise<void>((_resolve, race) =>
+        setTimeout(() => race(new Error("test timed out")), T + 5_000).unref?.(),
+      ),
     ]);
-    console.log(`  ✅  ${name}`);
     passed++;
   } catch (err) {
-    if (isUpstreamFlake(err)) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.log(`  ⚠️  ${name} — inconclusive (third party misbehaved): ${msg}`);
-      return;
-    }
-    const msg = err instanceof Error ? err.message : String(err);
-    console.log(`  ❌  ${name}: ${msg}`);
+    const m = err instanceof Error ? err.message : String(err);
     failures.push({ name, err });
+    console.log(`  ❌ ${name}: ${m}`);
     failed++;
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-    const ms = Date.now() - started;
-    if (ms > 20_000) console.log(`    ⏱  ${name} took ${ms}ms`);
   }
 }
 
@@ -83,9 +39,90 @@ function suite(name: string): void {
   console.log(`\n── ${name}`);
 }
 
-const T = 30_000;
-const bin = kinetex({ baseURL: "https://httpbin.org", timeout: T });
-const json = kinetex({ baseURL: "https://jsonplaceholder.typicode.com", timeout: T });
+/**
+ * A `fetch` that resolves every hostname to loopback, so a client can be given
+ * a *public-looking* origin and keep the SSRF screen switched on.
+ *
+ * The redirect screens need exactly that combination: `allowPrivateNetwork` has
+ * to be OFF for the screen to apply, and with it OFF a loopback base URL is
+ * itself refused — so the cases could not reach a local fixture at all. The
+ * screen checks host *text*, never DNS, so a name that is not a blocked literal
+ * passes it while still resolving to the fixture. That is not a workaround for
+ * the assertion under test: the redirect target is still screened by the real
+ * code path, and it is still a literal address that the real rule blocks.
+ *
+ * Implemented over `node:http`/`node:https` rather than an undici `Agent` so
+ * the suite stays dependency-free.
+ */
+function loopbackResolvingFetch(): typeof globalThis.fetch {
+  // Node asks for *every* candidate (happy-eyeballs passes `all: true`), and
+  // the callback shape differs between the two forms. Answering the wrong one
+  // surfaces as `Invalid IP address: undefined`.
+  const lookup = (
+    _host: string,
+    opts: { all?: boolean } | number | undefined,
+    cb: (
+      err: null,
+      address: string | Array<{ address: string; family: number }>,
+      family?: number,
+    ) => void,
+  ): void => {
+    const wantsAll = typeof opts === "object" && opts !== null ? opts.all === true : false;
+    const family = typeof opts === "number" ? opts : 4;
+    if (wantsAll) cb(null, [{ address: "127.0.0.1", family: family || 4 }]);
+    else cb(null, "127.0.0.1", family || 4);
+  };
+  return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = new URL(
+      typeof input === "string" ? input : input instanceof URL ? input : input.url,
+    );
+    const mod = url.protocol === "https:" ? await import("node:https") : await import("node:http");
+    return await new Promise<Response>((resolve, reject) => {
+      const req = mod.request(
+        url,
+        {
+          method: init?.method ?? "GET",
+          headers: init?.headers as Record<string, string> | undefined,
+          lookup: lookup as never,
+          ...(init?.body != null ? { body: init.body } : {}),
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const headers = new Headers();
+            for (const [k, v] of Object.entries(res.headers)) {
+              if (Array.isArray(v)) for (const one of v) headers.append(k, one);
+              else if (v != null) headers.set(k, v);
+            }
+            resolve(
+              new Response(chunks.length > 0 ? Buffer.concat(chunks) : null, {
+                status: res.statusCode ?? 0,
+                statusText: res.statusMessage ?? "",
+                headers,
+              }),
+            );
+          });
+          res.on("error", reject);
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+  }) as typeof globalThis.fetch;
+}
+
+const bin = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
+// A TLS client for the cases that need a real https origin (ALPN negotiates h2).
+const tlsBin = kinetex({
+  baseURL: HTTPBIN_LOCAL_TLS_ORIGIN,
+  timeout: T,
+  ca: LOCAL_TLS_CA,
+  allowPrivateNetwork: true,
+});
+// The local server models the `/posts` shape jsonplaceholder provides, so this
+// suite no longer depends on either public host.
+const json = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
 
 // ============================================================================
 // §1  BASIC HTTP METHODS
@@ -162,7 +199,7 @@ suite("Fluent chain API (GET, POST, PUT, etc.)");
 await test("client.GET().json() returns parsed data", async () => {
   const data = await bin.GET("/get").json<{ url: string; origin: string }>();
   console.log(`    → GET().json(): url=${data.url}, origin=${data.origin}`);
-  assert.match(data.url, /^https:\/\/httpbin\.org\/get$/);
+  assert.match(data.url, /^http:\/\/127\.0\.0\.1:18080\/get$/);
   assert.equal(typeof data.origin, "string");
 });
 
@@ -178,7 +215,7 @@ await test("client.GET().bytes() returns Uint8Array", async () => {
   console.log(`    → GET().bytes(): length=${bytes.length}, type=${bytes.constructor.name}`);
   assert.ok(bytes instanceof Uint8Array);
   const parsed = JSON.parse(new TextDecoder().decode(bytes)) as { url: string };
-  assert.match(parsed.url, /^https:\/\/httpbin\.org\/get$/);
+  assert.match(parsed.url, /^http:\/\/127\.0\.0\.1:18080\/get$/);
 });
 
 await test("client.GET().send() returns full response", async () => {
@@ -205,8 +242,8 @@ await test("client.GET().header() adds custom headers", async () => {
     .GET("/headers")
     .header("x-custom", "test-value")
     .json<{ headers: Record<string, string> }>();
-  console.log(`    → GET().header(): x-custom=${data.headers["X-Custom"]}`);
-  assert.equal(data.headers["X-Custom"], "test-value");
+  console.log(`    → GET().header(): x-custom=${data.headers["x-custom"]}`);
+  assert.equal(data.headers["x-custom"], "test-value");
 });
 
 await test("client.POST().withJSON() sends JSON body", async () => {
@@ -222,8 +259,8 @@ await test("client.GET().bearer() adds Authorization header", async () => {
     .GET("/headers")
     .bearer("my-token")
     .json<{ headers: Record<string, string> }>();
-  console.log(`    → GET().bearer(): Authorization=${data.headers["Authorization"]}`);
-  assert.equal(data.headers["Authorization"], "Bearer my-token");
+  console.log(`    → GET().bearer(): Authorization=${data.headers["authorization"]}`);
+  assert.equal(data.headers["authorization"], "Bearer my-token");
 });
 
 await test("client.GET().basic() adds Basic auth header", async () => {
@@ -232,10 +269,10 @@ await test("client.GET().basic() adds Basic auth header", async () => {
     .basic("user", "pass")
     .json<{ headers: Record<string, string> }>();
   console.log(
-    `    → GET().basic(): Authorization starts with Basic=${data.headers["Authorization"]?.startsWith("Basic ")}`,
+    `    → GET().basic(): Authorization starts with Basic=${data.headers["authorization"]?.startsWith("Basic ")}`,
   );
-  assert.ok(data.headers["Authorization"]?.startsWith("Basic "));
-  const decoded = atob(data.headers["Authorization"].slice(6));
+  assert.ok(data.headers["authorization"]?.startsWith("Basic "));
+  const decoded = atob(data.headers["authorization"].slice(6));
   assert.equal(decoded, "user:pass");
 });
 
@@ -253,9 +290,10 @@ await test("client.GET().apiKey() adds API key header", async () => {
 
 await test("config auth with apikey", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     auth: { type: "apikey", header: "x-api-key", key: "my-api-key" },
+    allowPrivateNetwork: true,
   });
   const data = await client.GET("/headers").json<{ headers: Record<string, string> }>();
   console.log(
@@ -278,7 +316,7 @@ await test("client.GET().noThrow() returns 404 without throwing", async () => {
 await test("client.GET().timeout() sets timeout", async () => {
   // Client timeout is 0 (disabled), so the only thing that can end this
   // request is the builder's own 500ms. That makes the failure attributable.
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: 0 });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: 0, allowPrivateNetwork: true });
   const started = Date.now();
   let caughtError: unknown;
   try {
@@ -309,7 +347,7 @@ await test("client.GET().retry() configures retry", async () => {
 });
 
 await test("client.GET().maxSize() sets response size limit", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   let caughtError: unknown;
   try {
     await client.GET("/bytes/1024").maxSize(100).send();
@@ -329,7 +367,7 @@ await test("client.GET().maxSize() sets response size limit", async () => {
 });
 
 await test("client.GET().http2() requests HTTP/2", async () => {
-  const res = await bin.GET("/get").http2().send();
+  const res = await tlsBin.GET("/get").http2().send();
   console.log(`    → GET().http2(): httpVersion=${res.httpVersion}`);
   assert.equal(res.httpVersion, "HTTP/2");
 });
@@ -456,7 +494,7 @@ await test("client.GET().withForm() sets FormData body", async () => {
   // the failure this test used to miss behind `notEqual(data, null)`.
   assert.deepEqual(data.form, { key: "value", count: "42" });
   assert.match(
-    data.headers?.["Content-Type"] ?? "",
+    data.headers?.["content-type"] ?? "",
     /^multipart\/form-data; boundary=/,
     "a multipart body must carry a boundary in its content type",
   );
@@ -472,18 +510,20 @@ await test("meta.traceId generates traceparent header without error", async () =
 await test("retry with onRetry callback", async () => {
   const retryInfo: Array<{ attempt: number; delayMs: number }> = [];
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     retry: {
       maxRetries: 2,
       baseDelayMs: 50,
       statuses: [503],
-      onRetry: (ctx, delayMs) => retryInfo.push({ attempt: ctx.attempt, delayMs }),
+      onRetry: (ctx, delayMs) => {
+        retryInfo.push({ attempt: ctx.attempt, delayMs });
+      },
     },
+    allowPrivateNetwork: true,
   });
   const res = await client.get("/status/503", { throwOnError: false });
   console.log(`    → retry onStatus: status=${res.status}, retries=${retryInfo.length}`);
-  if (skipOnUpstreamDrift("retry onStatus: retries on configured 503", res.status, 503)) return;
   assert.equal(res.status, 503);
   assert.deepEqual(
     retryInfo.map((r) => r.attempt),
@@ -497,17 +537,17 @@ await test("retry with onRetry callback", async () => {
 
 await test("retry with shouldRetry custom function", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     retry: {
       maxRetries: 1,
       baseDelayMs: 50,
       shouldRetry: async (ctx) => ctx.response?.status === 429,
     },
+    allowPrivateNetwork: true,
   });
   const res = await client.get("/status/503", { throwOnError: false });
   console.log(`    → custom shouldRetry: status=${res.status}`);
-  if (skipOnUpstreamDrift("custom shouldRetry: not called for a 503", res.status, 503)) return;
   assert.equal(res.status, 503);
 });
 
@@ -515,7 +555,7 @@ await test("onError hook is called on error", async () => {
   let hookCalls = 0;
   let hookError: unknown;
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     hooks: {
       onError: [
@@ -525,18 +565,13 @@ await test("onError hook is called on error", async () => {
         },
       ],
     },
+    allowPrivateNetwork: true,
   });
   try {
     await client.get("/status/500");
   } catch (err) {
     // A 5xx must surface as an HTTPStatusError carrying the response.
     assert.ok(err instanceof HTTPStatusError, `expected HTTPStatusError, got ${String(err)}`);
-    if (
-      skipOnUpstreamDrift("onError hook is called on error", (err as HTTPStatusError).status, 500)
-    ) {
-      client.destroy();
-      return;
-    }
     assert.equal((err as HTTPStatusError).status, 500);
   }
   // The hook must have fired exactly once, with that same error.
@@ -547,15 +582,16 @@ await test("onError hook is called on error", async () => {
 
 await test("onSuccess hook is called on success", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     hooks: {
-      onSuccess: [
+      onAfterResponse: [
         (res) => {
           console.log(`    → onSuccess hook: status=${res.status}`);
         },
       ],
     },
+    allowPrivateNetwork: true,
   });
   const res = await client.get("/get");
   console.log(`    → onSuccess hook: done`);
@@ -564,22 +600,25 @@ await test("onSuccess hook is called on success", async () => {
 
 await test("transformRequest modifies request", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     transformRequest: async (req) => {
       return { ...req, headers: { ...req.headers, "x-transformed": "yes" } };
     },
+    allowPrivateNetwork: true,
   });
   const data = await client.GET("/headers").json<{ headers: Record<string, string> }>();
-  console.log(`    → transformRequest: ${data.headers["X-Transformed"]}`);
-  assert.equal(data.headers["X-Transformed"], "yes");
+  console.log(`    → transformRequest: ${data.headers["x-transformed"]}`);
+  assert.equal(data.headers["x-transformed"], "yes");
 });
 
 await test("transformResponse modifies response", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
-    transformResponse: (data) => ({ transformed: true, ...(data as object) }),
+    transformResponse: <T,>(data: unknown): T =>
+      ({ transformed: true, ...(data as object) }) as unknown as T,
+    allowPrivateNetwork: true,
   });
   const data = await client.GET("/get").json<{ transformed: boolean }>();
   console.log(`    → transformResponse: ${data.transformed}`);
@@ -587,10 +626,15 @@ await test("transformResponse modifies response", async () => {
 });
 
 await test("httpsOnly blocks http URLs", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, httpsOnly: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    httpsOnly: true,
+    allowPrivateNetwork: true,
+  });
   let caughtError: unknown;
   try {
-    await client.get("http://httpbin.org/get");
+    await client.get(`${HTTPBIN_LOCAL_ORIGIN}/get`);
   } catch (err) {
     caughtError = err;
   }
@@ -604,7 +648,12 @@ await test("httpsOnly blocks http URLs", async () => {
 });
 
 await test("maxRequestSize blocks large bodies", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, maxRequestSize: 10 });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    maxRequestSize: 10,
+    allowPrivateNetwork: true,
+  });
   let caughtError: unknown;
   try {
     await client.post("/post", "this is a very long body that exceeds the limit", {
@@ -634,7 +683,7 @@ await test("meta.traceId is stored in request meta", async () => {
 });
 
 await test("client.GET().cache() sets cache config", async () => {
-  const res = await bin.GET("/get").cache({ ttl: 60 }).send();
+  const res = await bin.GET("/get").cache({ ttlMs: 60 }).send();
   console.log(`    → cache() executed: ${res.status}`);
   assert.equal(res.status, 200);
 });
@@ -649,9 +698,10 @@ await test("retry with already aborted signal throws", async () => {
   const controller = new AbortController();
   controller.abort();
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: 5000,
     retry: { maxRetries: 1, baseDelayMs: 10 },
+    allowPrivateNetwork: true,
   });
   let threw = false;
   let caughtErr: unknown;
@@ -701,25 +751,29 @@ await test("client.GET().headers() merges multiple headers", async () => {
     .GET("/headers")
     .headers({ "X-Test-Header": "test-value", "X-Another": "another" })
     .send();
-  const sent = res.data.headers as Record<string, string>;
+  const sent = (res.data as { headers: Record<string, string> }).headers;
   console.log(`    → headers(): X-Test-Header=${sent["X-Test-Header"]}`);
   // Both headers have to survive the merge, exactly once each, with their
   // values intact — a status of 200 says nothing about any of that.
-  assert.equal(sent["X-Test-Header"], "test-value");
-  assert.equal(sent["X-Another"], "another");
+  // Lower-cased: this is the server's echo of what was sent, and kinetex sends
+  // header names that way.
+  assert.equal(sent["x-test-header"], "test-value");
+  assert.equal(sent["x-another"], "another");
   const count = (k: string) => Object.keys(sent).filter((h) => h.toLowerCase() === k).length;
   assert.equal(count("x-test-header"), 1, "X-Test-Header must appear exactly once");
   assert.equal(count("x-another"), 1, "X-Another must appear exactly once");
 });
 
 await test("client.destroy() cleans up resources", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   // Make a real request first, so the transport has something to release.
   await client.get("/get");
   const transport = (client as unknown as { transport: unknown }).transport as {
     sessions?: Map<string, unknown>;
+    destroy?: () => void;
   };
   assert.ok(transport.sessions instanceof Map, "expected the Node HTTP/2 transport");
+  assert.ok(transport.destroy, "destroy() must exist before it is called");
 
   transport.destroy();
 
@@ -728,27 +782,27 @@ await test("client.destroy() cleans up resources", async () => {
   await assert.doesNotReject(() => client.destroy(), "destroy() must be idempotent");
 });
 
-await test("client.extend() with debug enabled", async () => {
-  const child = bin.extend({ debug: true });
-  console.log(`    → extend with debug: created`);
-  assert.notEqual(child, null);
+await test("client.extend() inherits the base config", async () => {
+  const child = bin.extend({});
+  assert.ok(child !== null);
   // A child that merely exists proves nothing — it has to be a working
   // client that inherited the base URL and can complete a request.
   const res = await child.get("/get");
   assert.equal(res.status, 200);
-  assert.match(res.url, /^https:\/\/httpbin\.org\/get$/);
+  assert.match(res.url, /^http:\/\/127\.0\.0\.1:18080\/get$/);
   await child.destroy();
 });
 
 // Test query param merging
 await test("client.GET().params() merges with config params", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     params: { configParam: "config-value" },
+    allowPrivateNetwork: true,
   });
   const res = await client.GET("/get").params({ extraParam: "extra-value" }).send();
-  const sent = res.data.args as Record<string, string>;
+  const sent = (res.data as { args: Record<string, string> }).args;
   console.log(`    → params merge: ${JSON.stringify(sent)}`);
   // The whole point is that both survive. Either one alone means the merge
   // dropped a side — a request param clobbering the config, or vice versa.
@@ -759,7 +813,12 @@ await test("client.GET().params() merges with config params", async () => {
 
 // Test custom fetch
 await test("client with custom fetch function", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, fetch: fetch });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    fetch: fetch,
+    allowPrivateNetwork: true,
+  });
   const res = await client.get("/get");
   console.log(`    → custom fetch option accepted: ${res.status}`);
   assert.equal(res.status, 200);
@@ -777,9 +836,10 @@ await test("throwOnError:true with 200 response", async () => {
 await test("abort during retry delay", async () => {
   const controller = new AbortController();
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: 10000,
     retry: { maxRetries: 2, baseDelayMs: 200 },
+    allowPrivateNetwork: true,
   });
 
   // Abort after first failure but before first retry
@@ -810,11 +870,12 @@ await test("abort during retry delay", async () => {
 // Test with complex client options - simplified
 await test("client with basic options", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: 10000,
     headers: { "X-Client-Header": "client-value" },
     params: { clientParam: "client-param" },
     throwOnError: false,
+    allowPrivateNetwork: true,
   });
   const res = await client.get("/get");
   console.log(`    → basic options: ${res.status}`);
@@ -825,11 +886,12 @@ await test("client with basic options", async () => {
 // Test client with cache option
 await test("client with cache option", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
-    cache: { ttl: 300 },
+    cache: { defaultTtlMs: 300 },
+    allowPrivateNetwork: true,
   });
-  const res = await client.get("/get");
+  const res = await client.get<{ args: unknown }>("/get");
   console.log(`    → cache option: ${res.status}`);
   assert.equal(res.status, 200);
   client.destroy();
@@ -838,7 +900,7 @@ await test("client with cache option", async () => {
 // Test params() method
 await test("client.GET().params() adds multiple params", async () => {
   const res = await bin.GET("/get").params({ a: "1", b: "2" }).send();
-  const sent = res.data.args as Record<string, string>;
+  const sent = (res.data as { args: Record<string, string> }).args;
   console.log(`    → params(): a=${sent["a"]}, b=${sent["b"]}`);
   assert.equal(sent["a"], "1");
   assert.equal(sent["b"], "2");
@@ -854,20 +916,26 @@ await test("client.GET().noThrow() returns error status", async () => {
 
 // Test client level throwOnError:false
 await test("client with throwOnError:false config", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, throwOnError: false });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    throwOnError: false,
+    allowPrivateNetwork: true,
+  });
   const res = await client.get("/status/500");
   console.log(`    → throwOnError:false config: ${res.status}`);
-  if (skipOnUpstreamDrift("client with throwOnError:false config", res.status, 500)) {
-    client.destroy();
-    return;
-  }
   assert.equal(res.status, 500);
   client.destroy();
 });
 
 // Test client level throwOnError:true
 await test("client with throwOnError:true config throws on error", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, throwOnError: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    throwOnError: true,
+    allowPrivateNetwork: true,
+  });
   let threw = false;
   let caughtErr: unknown;
   try {
@@ -896,32 +964,35 @@ suite("Authentication (config-level auth)");
 
 await test("config auth with bearer token", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     auth: { type: "bearer", token: "config-token-123" },
+    allowPrivateNetwork: true,
   });
   const data = await client.GET("/headers").json<{ headers: Record<string, string> }>();
-  console.log(`    → config bearer: ${data.headers["Authorization"]}`);
-  assert.equal(data.headers["Authorization"], "Bearer config-token-123");
+  console.log(`    → config bearer: ${data.headers["authorization"]}`);
+  assert.equal(data.headers["authorization"], "Bearer config-token-123");
 });
 
 await test("config auth with basic auth", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     auth: { type: "basic", username: "admin", password: "secret" },
+    allowPrivateNetwork: true,
   });
   const data = await client.GET("/headers").json<{ headers: Record<string, string> }>();
-  console.log(`    → config basic: ${data.headers["Authorization"]?.slice(0, 20)}...`);
-  const decoded = atob(data.headers["Authorization"].slice(6));
+  console.log(`    → config basic: ${data.headers["authorization"]?.slice(0, 20)}...`);
+  const decoded = atob(data.headers["authorization"].slice(6));
   assert.equal(decoded, "admin:secret");
 });
 
 await test("config auth with apikey", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     auth: { type: "apikey", header: "x-api-key", key: "my-api-key" },
+    allowPrivateNetwork: true,
   });
   const data = await client.GET("/headers").json<{ headers: Record<string, string> }>();
   const headerVal = data.headers["x-api-key"] || "not found";
@@ -934,7 +1005,7 @@ await test("config auth with apikey", async () => {
 await test("config auth with dynamic token function", async () => {
   let callCount = 0;
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     auth: {
       type: "bearer",
@@ -943,38 +1014,41 @@ await test("config auth with dynamic token function", async () => {
         return `dynamic-${callCount}`;
       },
     },
+    allowPrivateNetwork: true,
   });
   const r1 = await client.GET("/headers").json<{ headers: Record<string, string> }>();
   const r2 = await client.GET("/headers").json<{ headers: Record<string, string> }>();
   console.log(`    → dynamic token calls: ${callCount}`);
-  assert.equal(r1.headers["Authorization"], "Bearer dynamic-1");
-  assert.equal(r2.headers["Authorization"], "Bearer dynamic-2");
+  assert.equal(r1.headers["authorization"], "Bearer dynamic-1");
+  assert.equal(r2.headers["authorization"], "Bearer dynamic-2");
   assert.equal(callCount, 2);
 });
 
 await test("per-request auth overrides config auth", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     auth: { type: "bearer", token: "config-token" },
+    allowPrivateNetwork: true,
   });
   const data = await client
     .GET("/headers")
     .bearer("override-token")
     .json<{ headers: Record<string, string> }>();
-  console.log(`    → override: ${data.headers["Authorization"]}`);
-  assert.equal(data.headers["Authorization"], "Bearer override-token");
+  console.log(`    → override: ${data.headers["authorization"]}`);
+  assert.equal(data.headers["authorization"], "Bearer override-token");
 });
 
 await test("noAuth() disables auth", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     auth: { type: "bearer", token: "should-be-ignored" },
+    allowPrivateNetwork: true,
   });
   const data = await client.GET("/headers").noAuth().json<{ headers: Record<string, string> }>();
-  console.log(`    → noAuth: Authorization=${data.headers["Authorization"] || "not set"}`);
-  assert.equal(data.headers["Authorization"], undefined);
+  console.log(`    → noAuth: Authorization=${data.headers["authorization"] || "not set"}`);
+  assert.equal(data.headers["authorization"], undefined);
 });
 
 // ============================================================================
@@ -984,17 +1058,17 @@ await test("noAuth() disables auth", async () => {
 suite("Interceptors (useRequest, useResponse, useError)");
 
 await test("useRequest interceptor modifies request", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   client.useRequest((ctx) => {
     ctx.request.headers["x-added-by-interceptor"] = "intercepted";
   });
   const data = await client.GET("/headers").json<{ headers: Record<string, string> }>();
-  console.log(`    → request interceptor: ${data.headers["X-Added-By-Interceptor"]}`);
-  assert.equal(data.headers["X-Added-By-Interceptor"], "intercepted");
+  console.log(`    → request interceptor: ${data.headers["x-added-by-interceptor"]}`);
+  assert.equal(data.headers["x-added-by-interceptor"], "intercepted");
 });
 
 await test("useResponse interceptor receives response", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   let capturedStatus = 0;
   client.useResponse(async (ctx) => {
     await new Promise((r) => setTimeout(r, 10)); // Small delay to ensure ctx is populated
@@ -1006,7 +1080,12 @@ await test("useResponse interceptor receives response", async () => {
 });
 
 await test("useError interceptor receives error", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, throwOnError: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    throwOnError: true,
+    allowPrivateNetwork: true,
+  });
   let capturedError = "";
   client.useError(async (ctx) => {
     await new Promise((r) => setTimeout(r, 10));
@@ -1029,18 +1108,18 @@ await test("useError interceptor receives error", async () => {
 });
 
 await test("eject() removes interceptor", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const eject = client.useRequest((ctx) => {
     ctx.request.headers["x-should-be-removed"] = "yes";
   });
   eject();
   const data = await client.GET("/headers").json<{ headers: Record<string, string> }>();
-  console.log(`    → eject: ${data.headers["X-Should-Be-Removed"] || "not present"}`);
-  assert.equal(data.headers["X-Should-Be-Removed"], undefined);
+  console.log(`    → eject: ${data.headers["x-should-be-removed"] || "not present"}`);
+  assert.equal(data.headers["x-should-be-removed"], undefined);
 });
 
 await test("multiple interceptors chain in order", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   client.useRequest((ctx) => {
     ctx.request.headers["x-order"] = "1";
   });
@@ -1048,8 +1127,8 @@ await test("multiple interceptors chain in order", async () => {
     ctx.request.headers["x-order"] = (ctx.request.headers["x-order"] || "") + "2";
   });
   const data = await client.GET("/headers").json<{ headers: Record<string, string> }>();
-  console.log(`    → chain: x-order=${data.headers["X-Order"]}`);
-  assert.equal(data.headers["X-Order"], "12");
+  console.log(`    → chain: x-order=${data.headers["x-order"]}`);
+  assert.equal(data.headers["x-order"], "12");
 });
 
 // ============================================================================
@@ -1060,37 +1139,40 @@ suite("Headers and Query Params");
 
 await test("config headers sent on every request", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     headers: { "x-config-header": "config-value" },
+    allowPrivateNetwork: true,
   });
   const data = await client.GET("/headers").json<{ headers: Record<string, string> }>();
-  console.log(`    → config header: ${data.headers["X-Config-Header"]}`);
-  assert.equal(data.headers["X-Config-Header"], "config-value");
+  console.log(`    → config header: ${data.headers["x-config-header"]}`);
+  assert.equal(data.headers["x-config-header"], "config-value");
 });
 
 await test("per-request headers merged with config headers", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     headers: { "x-config": "config-value" },
+    allowPrivateNetwork: true,
   });
   const data = await client
     .GET("/headers")
     .header("x-per-request", "request-value")
     .json<{ headers: Record<string, string> }>();
   console.log(
-    `    → merged: config=${data.headers["X-Config"]}, request=${data.headers["X-Per-Request"]}`,
+    `    → merged: config=${data.headers["x-config"]}, request=${data.headers["x-per-request"]}`,
   );
-  assert.equal(data.headers["X-Config"], "config-value");
-  assert.equal(data.headers["X-Per-Request"], "request-value");
+  assert.equal(data.headers["x-config"], "config-value");
+  assert.equal(data.headers["x-per-request"], "request-value");
 });
 
 await test("config params sent on every request", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     params: { configParam: "config-value" },
+    allowPrivateNetwork: true,
   });
   const data = await client.GET("/get").json<{ args: Record<string, string> }>();
   console.log(`    → config params: ${JSON.stringify(data.args)}`);
@@ -1099,9 +1181,10 @@ await test("config params sent on every request", async () => {
 
 await test("per-request params merged with config params", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     params: { base: "base-value" },
+    allowPrivateNetwork: true,
   });
   const data = await client
     .GET("/get")
@@ -1129,7 +1212,11 @@ await test("array params sent as repeated keys", async () => {
 suite("Timeout and Retry");
 
 await test("client-level timeout throws TimeoutError", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: 100 });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: 100,
+    allowPrivateNetwork: true,
+  });
   const started = Date.now();
   let caughtError: unknown;
   try {
@@ -1153,16 +1240,16 @@ await test("client-level timeout throws TimeoutError", async () => {
 await test("retry on 503 with maxRetries", async () => {
   let attempts = 0;
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     retry: { maxRetries: 2, baseDelayMs: 50, statuses: [503] },
+    allowPrivateNetwork: true,
   });
   client.useRequest(() => {
     attempts++;
   });
   const res = await client.get("/status/503", { throwOnError: false });
   console.log(`    → retry attempts: ${attempts}, status=${res.status}`);
-  if (skipOnUpstreamDrift("retry on configured status", res.status, 503)) return;
   assert.equal(attempts, 3); // 1 initial + 2 retries
 });
 
@@ -1170,9 +1257,10 @@ await test("retry NOT on non-configured status", async () => {
   // The meaningful assertion is that exactly one attempt was made.
   let attempts = 0;
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     retry: { maxRetries: 3, baseDelayMs: 50, statuses: [503] },
+    allowPrivateNetwork: true,
   });
   client.useRequest(() => {
     attempts++;
@@ -1184,13 +1272,13 @@ await test("retry NOT on non-configured status", async () => {
 
 await test("retry on network error when onNetworkError=true", async () => {
   const client = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     retry: { maxRetries: 1, baseDelayMs: 50, onNetworkError: true },
+    allowPrivateNetwork: true,
   });
   const res = await client.get("/status/500", { throwOnError: false });
   console.log(`    → network retry: status=${res.status}`);
-  if (skipOnUpstreamDrift("retry on network error", res.status, 500)) return;
   assert.equal(res.status, 500);
   assert.equal(res.attempt, 2, "maxRetries: 1 means exactly 2 attempts");
 });
@@ -1246,7 +1334,12 @@ await test("response.httpVersion is set", async () => {
 suite("Error Handling");
 
 await test("throwOnError:true throws HTTPStatusError on 4xx", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, throwOnError: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    throwOnError: true,
+    allowPrivateNetwork: true,
+  });
   let caughtError: unknown;
   try {
     await client.get("/status/404");
@@ -1262,7 +1355,12 @@ await test("throwOnError:true throws HTTPStatusError on 4xx", async () => {
 });
 
 await test("throwOnError:true throws HTTPStatusError on 5xx", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, throwOnError: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    throwOnError: true,
+    allowPrivateNetwork: true,
+  });
   let caughtError: unknown;
   try {
     await client.get("/status/503");
@@ -1275,15 +1373,6 @@ await test("throwOnError:true throws HTTPStatusError on 5xx", async () => {
   // being flattened by a retry loop on its way out.
   assert.ok(caughtError instanceof HTTPStatusError, "expected an HTTPStatusError");
   assert.equal(caughtError.code, "EHTTPSTATUS");
-  if (
-    skipOnUpstreamDrift(
-      "throwOnError:true throws HTTPStatusError on 5xx",
-      caughtError.response?.status ?? 0,
-      503,
-    )
-  ) {
-    return;
-  }
   assert.equal(caughtError.response?.status, 503);
   assert.equal(caughtError.isHTTPError, true);
   assert.equal(caughtError.status, 503, "the status shorthand must agree");
@@ -1298,15 +1387,12 @@ await test("throwOnError:false returns 4xx without throwing", async () => {
 await test("throwOnError:false returns 5xx without throwing", async () => {
   const res = await bin.get("/status/503", { throwOnError: false });
   console.log(`    → 503 no throw: status=${res.status}`);
-  if (skipOnUpstreamDrift("throwOnError:false returns 5xx without throwing", res.status, 503)) {
-    return;
-  }
   assert.equal(res.status, 503);
 });
 
 await test("options.onError callback is called on error", async () => {
   let callbackCalled = false;
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   // Previously `console.log`-ed, so the callback firing was never checked.
   await assert.rejects(
     () =>
@@ -1314,29 +1400,11 @@ await test("options.onError callback is called on error", async () => {
         onError: (err) => {
           callbackCalled = true;
           assert.ok(err instanceof Error, "onError receives the KinetexError");
-          if (
-            skipOnUpstreamDrift(
-              "options.onError callback is called on error",
-              (err as { status?: number }).status ?? 0,
-              500,
-            )
-          ) {
-            return;
-          }
           assert.equal((err as { status?: number }).status, 500);
         },
       }),
     (err: unknown) => {
       assert.ok(err instanceof Error);
-      if (
-        skipOnUpstreamDrift(
-          "options.onError callback is called on error",
-          (err as { status?: number }).status ?? 0,
-          500,
-        )
-      ) {
-        return true;
-      }
       assert.equal((err as { status?: number }).status, 500);
       return true;
     },
@@ -1348,7 +1416,7 @@ await test("options.onError callback is called on error", async () => {
 
 await test("options.onSuccess callback is called on success", async () => {
   let callbackCalled = false;
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   await client.get("/get", {
     onSuccess: () => {
       callbackCalled = true;
@@ -1365,7 +1433,7 @@ await test("options.onSuccess callback is called on success", async () => {
 suite("Child Clients (extend)");
 
 await test("extend() inherits baseURL", async () => {
-  const parent = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const parent = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const child = parent.extend({});
   const res = await child.get("/get");
   console.log(`    → extend baseURL: status=${res.status}`);
@@ -1374,49 +1442,55 @@ await test("extend() inherits baseURL", async () => {
 
 await test("extend() inherits headers", async () => {
   const parent = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     headers: { "x-from-parent": "yes" },
+    allowPrivateNetwork: true,
   });
   const child = parent.extend({});
   const data = await child.GET("/headers").json<{ headers: Record<string, string> }>();
-  console.log(`    → extend headers: ${data.headers["X-From-Parent"]}`);
-  assert.equal(data.headers["X-From-Parent"], "yes");
+  console.log(`    → extend headers: ${data.headers["x-from-parent"]}`);
+  assert.equal(data.headers["x-from-parent"], "yes");
 });
 
 await test("extend() adds its own headers", async () => {
-  const parent = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const parent = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const child = parent.extend({ headers: { "x-child": "yes" } });
   const data = await child.GET("/headers").json<{ headers: Record<string, string> }>();
-  console.log(`    → extend add: ${data.headers["X-Child"]}`);
-  assert.equal(data.headers["X-Child"], "yes");
+  console.log(`    → extend add: ${data.headers["x-child"]}`);
+  assert.equal(data.headers["x-child"], "yes");
 });
 
 await test("extend() overrides config", async () => {
   const parent = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     auth: { type: "bearer", token: "parent" },
+    allowPrivateNetwork: true,
   });
   const child = parent.extend({ auth: { type: "bearer", token: "child" } });
   const data = await child.GET("/headers").json<{ headers: Record<string, string> }>();
-  console.log(`    → extend override: ${data.headers["Authorization"]}`);
-  assert.equal(data.headers["Authorization"], "Bearer child");
+  console.log(`    → extend override: ${data.headers["authorization"]}`);
+  assert.equal(data.headers["authorization"], "Bearer child");
 });
 
 await test("extend() copies runtime interceptors", async () => {
-  const parent = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const parent = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   parent.useRequest((ctx) => {
     ctx.request.headers["x-from-parent"] = "yes";
   });
   const child = parent.extend({});
   const data = await child.GET("/headers").json<{ headers: Record<string, string> }>();
-  console.log(`    → extend interceptors: ${data.headers["X-From-Parent"]}`);
-  assert.equal(data.headers["X-From-Parent"], "yes");
+  console.log(`    → extend interceptors: ${data.headers["x-from-parent"]}`);
+  assert.equal(data.headers["x-from-parent"], "yes");
 });
 
 await test("extend() with new timeout overrides", async () => {
-  const parent = kinetex({ baseURL: "https://httpbin.org", timeout: 30_000 });
+  const parent = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: 30_000,
+    allowPrivateNetwork: true,
+  });
   const child = parent.extend({ timeout: 500 });
   const started = Date.now();
   let caughtError: unknown;
@@ -1521,10 +1595,15 @@ await test("httpsOnly throws on HTTP URL", async () => {
   // Same guard as §4, asserted at the *builder* level rather than the
   // convenience method, so the two cases exercise different entry points
   // into the same check instead of repeating one request shape.
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, httpsOnly: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    httpsOnly: true,
+    allowPrivateNetwork: true,
+  });
   let caughtError: unknown;
   try {
-    await client.GET("http://httpbin.org/get").send();
+    await client.GET(`${HTTPBIN_LOCAL_ORIGIN}/get`).send();
   } catch (err) {
     caughtError = err;
   }
@@ -1535,7 +1614,13 @@ await test("httpsOnly throws on HTTP URL", async () => {
 
 await test("httpsOnly still allows https on the same client", async () => {
   // The guard is scheme-specific: it must not degrade into "reject everything".
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, httpsOnly: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_TLS_ORIGIN,
+    timeout: T,
+    httpsOnly: true,
+    ca: LOCAL_TLS_CA,
+    allowPrivateNetwork: true,
+  });
   const res = await client.get("/get");
   console.log(`    → httpsOnly allows https: status=${res.status}`);
   assert.equal(res.status, 200);
@@ -1548,7 +1633,12 @@ await test("httpsOnly still allows https on the same client", async () => {
 suite("HAR Recording");
 
 await test("HAR recording captures request/response", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, har: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    har: true,
+    allowPrivateNetwork: true,
+  });
   await client.get("/get");
   await client.post("/post", JSON.stringify({ x: 1 }), {
     headers: { "content-type": "application/json" },
@@ -1561,7 +1651,12 @@ await test("HAR recording captures request/response", async () => {
 });
 
 await test("clearHAR() resets entries", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, har: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    har: true,
+    allowPrivateNetwork: true,
+  });
   await client.get("/get");
   assert.equal(client.getHAR().entries.length, 1);
   client.clearHAR();
@@ -1570,16 +1665,16 @@ await test("clearHAR() resets entries", async () => {
 });
 
 await test("client.ws() method exists", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   console.log(`    → ws method exists: ${typeof client.ws === "function"}`);
   assert.equal(typeof client.ws, "function");
   client.destroy();
 });
 
 await test("client.paginate() with jsonplaceholder", async () => {
-  const client = kinetex({ baseURL: "https://jsonplaceholder.typicode.com", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   try {
-    const gen = await client.paginate<Post>("/posts", {
+    const gen = await client.paginate<{ id: number; title: string }>("/posts", {
       perPage: 5,
       paramNames: { page: "_page", perPage: "_limit" },
       getItems: (data: any) => data || [],
@@ -1588,7 +1683,7 @@ await test("client.paginate() with jsonplaceholder", async () => {
 
     let pageCount = 0;
     for await (const page of gen) {
-      console.log(`    → page ${page.page}: ${page.data?.length || 0} items`);
+      console.log(`    → page ${page.page}: ${page.items?.length || 0} items`);
       pageCount++;
       if (pageCount >= 2) break;
     }
@@ -1602,9 +1697,9 @@ await test("client.paginate() with jsonplaceholder", async () => {
 });
 
 await test("client.paginate() with maxPages limit", async () => {
-  const client = kinetex({ baseURL: "https://jsonplaceholder.typicode.com", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   try {
-    const gen = await client.paginate<Post>("/posts", {
+    const gen = await client.paginate<{ id: number; title: string }>("/posts", {
       perPage: 10,
       maxPages: 2,
       paramNames: { page: "_page", perPage: "_limit" },
@@ -1614,7 +1709,7 @@ await test("client.paginate() with maxPages limit", async () => {
     let pageCount = 0;
     for await (const page of gen) {
       pageCount++;
-      console.log(`    → maxPages page ${page.page}: ${page.data?.length || 0} items`);
+      console.log(`    → maxPages page ${page.page}: ${page.items?.length || 0} items`);
     }
     console.log(`    → maxPages total: ${pageCount}`);
     assert.equal(pageCount, 2);
@@ -1657,7 +1752,7 @@ await test("client.ws() connects to WebSocket server", async () => {
   // has no `closed` property, so the assertion this replaces could never have
   // passed — it was masked by the sandbox SSRF skip above.
   const deadline = Date.now() + 5_000;
-  while (ws.state !== "CLOSED" && Date.now() < deadline) {
+  while ((ws.state as string) !== "CLOSED" && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 25));
   }
   assert.equal(ws.state, "CLOSED", "close() must reach the CLOSED state");
@@ -1666,8 +1761,22 @@ await test("client.ws() connects to WebSocket server", async () => {
   ws.destroy();
 });
 
+await test("client.graphql() routes queries through the client pipeline", async () => {
+  // `client.graphql()` wraps a GraphQLClient in a `pipeFetch` that re-enters the
+  // client so auth, retry, cache and interceptors apply. The graphql suite
+  // constructs `GraphQLClient` directly almost everywhere, so the wrapper —
+  // including its content-encoding strip and Response reconstruction — was a
+  // path no assertion reached.
+  const gql = await bin.graphql("/graphql");
+  const result = await gql.query<{ country: { code: string; name: string } }>(
+    `query { country(code: "US") { code name } }`,
+  );
+  assert.equal(result.country.code, "US", "the query must round-trip through the client");
+  assert.equal(result.country.name, "United States");
+});
+
 await test("client.graphql() creates GraphQL client", async () => {
-  const client = kinetex({ baseURL: "https://countries.trevorblades.com", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   let gql: Awaited<ReturnType<typeof client.graphql>> | undefined;
   try {
     gql = await client.graphql("/graphql");
@@ -1730,16 +1839,21 @@ await test("client.sse() refuses a private base URL", async () => {
 
 await test("client.getCache() returns cache or null", async () => {
   const clientWithCache = kinetex({
-    baseURL: "https://httpbin.org",
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
-    cache: { ttl: 60 },
+    cache: { defaultTtlMs: 60 },
+    allowPrivateNetwork: true,
   });
   const cache = await clientWithCache.getCache();
   console.log(`    → cache instance: ${cache !== null}`);
-  assert.notEqual(cache, null);
+  assert.ok(cache !== null);
   clientWithCache.destroy();
 
-  const clientNoCache = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const clientNoCache = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    allowPrivateNetwork: true,
+  });
   const noCache = await clientNoCache.getCache();
   console.log(`    → no cache: ${noCache === null}`);
   assert.equal(noCache, null);
@@ -1758,11 +1872,16 @@ suite("Regressions (client round)");
 
 // ── noCache() was a no-op: `forceRefresh` was declared and read nowhere ──
 await test("regression: noCache() bypasses a warm cache entry", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, cache: { ttl: 60_000 } });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    cache: { defaultTtlMs: 60_000 },
+    allowPrivateNetwork: true,
+  });
   // Warm the entry. A second identical request must be served from cache,
   // otherwise the "bypass" assertion below would pass for the wrong reason.
-  const first = await client.get("/uuid");
-  const second = await client.get("/uuid");
+  const first = await client.get<{ uuid: unknown }>("/uuid");
+  const second = await client.get<{ uuid: unknown }>("/uuid");
   console.log(`    → warm cache: cached=${first.cached}/${second.cached}`);
   assert.equal(first.cached, false, "the first request must go to the network");
   assert.equal(second.cached, true, "the second request must be served from cache");
@@ -1786,7 +1905,12 @@ await test("regression: a plain request is still served from cache", async () =>
   // The counterpart to the case above: the fix must not have turned the
   // cache off. A mutation that forced `forceRefresh` true unconditionally
   // would make this fail.
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, cache: { ttl: 60_000 } });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    cache: { defaultTtlMs: 60_000 },
+    allowPrivateNetwork: true,
+  });
   await client.get("/get");
   const second = await client.get("/get");
   console.log(`    → plain second read: cached=${second.cached}`);
@@ -1802,7 +1926,17 @@ await test("regression: a redirect to a loopback address is blocked", async () =
   // Redirects` was only entered for cookie-jar or forwarded-credential
   // requests; an ordinary GET was left to the transport, which dialled
   // 127.0.0.1:9 itself and reported ECONNREFUSED — a socket was opened.
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  // No `allowPrivateNetwork` here: that option disables the SSRF screen for
+  // every hop by design, so with it set the redirect was simply followed and
+  // the test asserted ENETWORK where it meant to assert EVALIDATION.
+  // Screening stays ON: the origin is a public-looking name and `fetch`
+  // resolves it to the fixture, so only the *redirect target* can be what is
+  // refused here.
+  const client = kinetex({
+    baseURL: "http://public-looking.test:18080",
+    timeout: T,
+    fetch: loopbackResolvingFetch(),
+  });
   let caughtError: unknown;
   try {
     await client.get("/redirect-to?url=http%3A%2F%2F127.0.0.1%3A9%2F&status_code=302");
@@ -1817,7 +1951,11 @@ await test("regression: a redirect to a loopback address is blocked", async () =
 });
 
 await test("regression: a redirect to the cloud metadata service is blocked", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({
+    baseURL: "http://public-looking.test:18080",
+    timeout: T,
+    fetch: loopbackResolvingFetch(),
+  });
   let caughtError: unknown;
   try {
     await client.get(
@@ -1840,7 +1978,12 @@ await test("regression: httpsOnly is enforced on the redirect target", async () 
   // `httpsOnly` gates the *initial* URL, but a 302 to a cleartext target
   // walks straight past it. Before the fix this returned an opaque
   // `ENETWORK "Protocol error"` from the transport instead.
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, httpsOnly: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    httpsOnly: true,
+    allowPrivateNetwork: true,
+  });
   let caughtError: unknown;
   try {
     await client.get("/redirect-to?url=http%3A%2F%2Fexample.com%2F&status_code=302");
@@ -1859,7 +2002,7 @@ await test("regression: maxRedirects is enforced on ordinary requests", async ()
   // is genuinely too small. The hop counter only exists inside the manual
   // follower, so a request that skipped it could never observe `maxRedirects`
   // at all — this is the assertion that would go missing.
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   let caughtError: unknown;
   try {
     await client.get("/redirect/3", { maxRedirects: 2 });
@@ -1886,12 +2029,12 @@ await test("regression: maxRedirects is enforced on ordinary requests", async ()
 
 await test("regression: a same-origin redirect is still followed", async () => {
   // The counterpart: screening every hop must not stop legitimate ones.
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   const res = await client.get("/redirect-to?url=%2Fget&status_code=302");
   console.log(`    → same-origin redirect: status=${res.status}, redirected=${res.redirected}`);
   assert.equal(res.status, 200);
   assert.equal(res.redirected, true);
-  assert.equal(res.url, "https://httpbin.org/get");
+  assert.equal(res.url, `${HTTPBIN_LOCAL_ORIGIN}/get`);
   await client.destroy();
 });
 
@@ -1900,7 +2043,12 @@ await test("regression: the HTTP/2 transport gates its own redirect target", asy
   // users. It resolved the Location and dialled it with no protocol gate and
   // no `isSafeURL` screen, so the client's own gates were not the only thing
   // standing between a 302 and a private address on that path.
-  const transport = new NodeHTTP2Transport();
+  // `allowPrivateNetwork` is required here for the *initial* URL only: the
+  // transport's own DNS pinning refuses loopback before a request is even made,
+  // and the fixture is on loopback. It must not weaken the hop screens — which
+  // is precisely what the two assertions below are for, since
+  // `allowPrivateNetwork: true` turns the client's own hop screen off.
+  const transport = new NodeHTTP2Transport({ ca: LOCAL_TLS_CA, allowPrivateNetwork: true });
   const base = {
     method: "GET" as const,
     headers: {} as Record<string, string>,
@@ -1916,7 +2064,7 @@ await test("regression: the HTTP/2 transport gates its own redirect target", asy
   try {
     await transport.send({
       ...base,
-      url: "https://httpbin.org/redirect-to?url=http%3A%2F%2Fexample.com%2F&status_code=302",
+      url: `${HTTPBIN_LOCAL_TLS_ORIGIN}/redirect-to?url=http%3A%2F%2Fexample.com%2F&status_code=302`,
     } as never);
   } catch (err) {
     downgraded = err;
@@ -1933,7 +2081,7 @@ await test("regression: the HTTP/2 transport gates its own redirect target", asy
   try {
     await transport.send({
       ...base,
-      url: "https://httpbin.org/redirect-to?url=https%3A%2F%2F127.0.0.1%3A9%2F&status_code=302",
+      url: `${HTTPBIN_LOCAL_TLS_ORIGIN}/redirect-to?url=https%3A%2F%2F127.0.0.1%3A9%2F&status_code=302`,
     } as never);
   } catch (err) {
     loopback = err;
@@ -1962,12 +2110,12 @@ await test("regression: FormData reaches the server over HTTP/2", async () => {
   console.log(`    → h2 form upload: ${JSON.stringify(data.form)}`);
   assert.deepEqual(data.form, { k: "v", n: "42" });
   assert.match(
-    data.headers?.["Content-Type"] ?? "",
+    data.headers?.["content-type"] ?? "",
     /^multipart\/form-data; boundary=\S+$/,
     "the boundary must be generated and sent in the content type",
   );
   assert.equal(
-    (data.headers?.["Content-Type"] ?? "").includes("kinetexFormBoundary"),
+    (data.headers?.["content-type"] ?? "").includes("kinetexFormBoundary"),
     true,
     "the generated boundary should be the documented one",
   );
@@ -2036,10 +2184,15 @@ await test("regression: a transport given a FormData body serializes it", async 
   server.on("stream", (stream, headers) => {
     sentType = headers["content-type"] as string | undefined;
     const chunks: Buffer[] = [];
-    stream.on("data", (c: Buffer) => chunks.push(c));
+    stream.on("data", (c: Buffer) => {
+      chunks.push(c);
+    });
     stream.on("end", () => {
       bodies.push(Buffer.concat(chunks).toString("latin1"));
-      stream.respond({ ":status": 200, "content-type": "application/json" });
+      (stream as unknown as { respond: (h: Record<string, string | number>) => void }).respond({
+        ":status": 200,
+        "content-type": "application/json",
+      });
       stream.end("{}");
     });
   });
@@ -2047,7 +2200,7 @@ await test("regression: a transport given a FormData body serializes it", async 
   const port = (server.address() as { port: number }).port;
 
   // `ca` is a transport constructor option, not a per-request field.
-  const transport = new NodeHTTP2Transport({ ca: readFileSync(certPath) });
+  const transport = new NodeHTTP2Transport({ ca: readFileSync(certPath, "utf8") });
   const form = new FormData();
   form.append("k", "v");
   let sent = false;
@@ -2136,7 +2289,9 @@ await test("regression: the HTTP/1.1 fallback path encodes a FormData body", asy
     (req, res) => {
       sentType = req.headers["content-type"];
       const chunks: Buffer[] = [];
-      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("data", (c: Buffer) => {
+        chunks.push(c);
+      });
       req.on("end", () => {
         bodies.push(Buffer.concat(chunks).toString("latin1"));
         res.writeHead(200, { "content-type": "application/json" });
@@ -2158,7 +2313,7 @@ await test("regression: the HTTP/1.1 fallback path encodes a FormData body", asy
     configurable: true,
     writable: true,
   });
-  const transport = new NodeHTTP2Transport({ ca: readFileSync(certPath) });
+  const transport = new NodeHTTP2Transport({ ca: readFileSync(certPath, "utf8") });
   const form = new FormData();
   form.append("k", "v");
   let sent = false;
