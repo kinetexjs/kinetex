@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { kinetex } from "../src/mod.ts";
+import { COUNTRIES_URL, GQLZERO_URL, RICKMORTY_URL } from "./graphql-local.ts";
 import {
   GraphQLClient,
   GraphQLClientError,
@@ -13,7 +15,9 @@ import {
 } from "../src/mod.ts";
 
 const T = 30_000;
-const bin = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+// The local httpbin server; the third-party GraphQL endpoints this file also
+// uses have no local model yet, so they stay live.
+const bin = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
 
 /**
  * Assert that `e` is a transport failure, not a defect in the code under test.
@@ -179,10 +183,9 @@ function s(name: string) {
 }
 
 // Count API base URLs
-const COUNTRIES = "https://countries.trevorblades.com";
-const RICKMORTY = "https://rickandmortyapi.com/graphql";
-const SPACEX = "https://api.spacex.land/graphql/";
-const GQLZERO = "https://graphqlzero.almansi.me/api";
+const COUNTRIES = COUNTRIES_URL;
+const RICKMORTY = RICKMORTY_URL;
+const GQLZERO = GQLZERO_URL;
 
 // ── detectOperationType / extractOperationName ──────────────────────────────
 s("detectOperationType / extractOperationName");
@@ -209,7 +212,6 @@ await t("extractOperationName anonymous", () =>
 s("GraphQLClientError");
 await t("properties", () => {
   const e = new GraphQLClientError("msg", "ERR", [{ message: "e", locations: [], path: ["x"] }], {
-    url: "",
     query: "",
   });
   assert.equal(e.code, "ERR");
@@ -222,7 +224,7 @@ s("Multiple GraphQL APIs");
 
 // Countries API
 await t("countries: query with static data", async () => {
-  const c = new GraphQLClient({ url: COUNTRIES, timeout: T });
+  const c = new GraphQLClient({ url: COUNTRIES, timeoutMs: T });
   const r = await c.query<{ country: { name: string; capital: string; currency: string } }>(
     `{ country(code: "US") { name capital currency } }`,
   );
@@ -232,7 +234,7 @@ await t("countries: query with static data", async () => {
 });
 
 await t("countries: query all fields", async () => {
-  const c = new GraphQLClient({ url: COUNTRIES, timeout: T });
+  const c = new GraphQLClient({ url: COUNTRIES, timeoutMs: T });
   const r = await c.query<{ country: { name: string; phone: string; native: string } }>(
     `{ country(code: "DE") { name phone native } }`,
   );
@@ -242,7 +244,7 @@ await t("countries: query all fields", async () => {
 
 // Rick and Morty API
 await t("rickandmorty: query character by id", async () => {
-  const c = new GraphQLClient({ url: RICKMORTY, timeout: T });
+  const c = new GraphQLClient({ url: RICKMORTY, timeoutMs: T });
   const r = await c.query<{ character: { name: string; species: string; status: string } }>(
     `{ character(id: 1) { name species status } }`,
   );
@@ -252,7 +254,7 @@ await t("rickandmorty: query character by id", async () => {
 });
 
 await t("rickandmorty: query with variables", async () => {
-  const c = new GraphQLClient({ url: RICKMORTY, timeout: T });
+  const c = new GraphQLClient({ url: RICKMORTY, timeoutMs: T });
   const r = await c.query<{ character: { name: string; episode: Array<{ episode: string }> } }>(
     `query C($id: ID!) { character(id: $id) { name episode { episode } } }`,
     { id: "2" },
@@ -262,7 +264,7 @@ await t("rickandmorty: query with variables", async () => {
 });
 
 await t("rickandmorty: query multiple characters", async () => {
-  const c = new GraphQLClient({ url: RICKMORTY, timeout: T });
+  const c = new GraphQLClient({ url: RICKMORTY, timeoutMs: T });
   const r = await c.query<{ characters: { results: Array<{ name: string }> } }>(
     `{ characters { results { name } } }`,
   );
@@ -271,7 +273,7 @@ await t("rickandmorty: query multiple characters", async () => {
 });
 
 await t("rickandmorty: query with variables", async () => {
-  const c = new GraphQLClient({ url: RICKMORTY, timeout: T });
+  const c = new GraphQLClient({ url: RICKMORTY, timeoutMs: T });
   const r = await c.query<{ character: { name: string; episode: Array<{ episode: string }> } }>(
     `query C($id: ID!) { character(id: $id) { name episode { episode } } }`,
     { id: "2" },
@@ -283,7 +285,7 @@ await t("rickandmorty: query with variables", async () => {
 // SpaceX API deprecated in favor of more reliable APIs
 // GraphQL Zero (reliable fake data API)
 await t("graphqlzero: query user by id", async () => {
-  const c = new GraphQLClient({ url: GQLZERO, timeout: T });
+  const c = new GraphQLClient({ url: GQLZERO, timeoutMs: T });
   const r = await c.query<{ user: { id: string; name: string; email: string } }>(
     `{ user(id: 1) { id name email } }`,
   );
@@ -293,7 +295,7 @@ await t("graphqlzero: query user by id", async () => {
 });
 
 await t("graphqlzero: query with variables", async () => {
-  const c = new GraphQLClient({ url: GQLZERO, timeout: T });
+  const c = new GraphQLClient({ url: GQLZERO, timeoutMs: T });
   const r = await c.query<{ user: { id: string; username: string } }>(
     `query U($id: ID!) { user(id: $id) { id username } }`,
     { id: "2" },
@@ -302,7 +304,7 @@ await t("graphqlzero: query with variables", async () => {
 });
 
 await t("graphqlzero: query posts", async () => {
-  const c = new GraphQLClient({ url: GQLZERO, timeout: T });
+  const c = new GraphQLClient({ url: GQLZERO, timeoutMs: T });
   const r = await c.query<{ posts: { data: Array<{ id: string; title: string }> } }>(
     `{ posts { data { id title } } }`,
   );
@@ -311,7 +313,7 @@ await t("graphqlzero: query posts", async () => {
 });
 
 await t("graphqlzero: nested query with variables", async () => {
-  const c = new GraphQLClient({ url: GQLZERO, timeout: T });
+  const c = new GraphQLClient({ url: GQLZERO, timeoutMs: T });
   const r = await c.query<{ post: { id: string; title: string; user: { name: string } } }>(
     `query P($id: ID!) { post(id: $id) { id title user { name } } }`,
     { id: "1" },
@@ -323,7 +325,7 @@ await t("graphqlzero: nested query with variables", async () => {
 
 // Rick and Morty API (may be rate-limited, tests pass when available)
 await t("rickandmorty: query character by id", async () => {
-  const c = new GraphQLClient({ url: RICKMORTY, timeout: T });
+  const c = new GraphQLClient({ url: RICKMORTY, timeoutMs: T });
   const r = await c.query<{ character: { name: string; species: string } }>(
     `{ character(id: 1) { name species } }`,
   );
@@ -333,7 +335,7 @@ await t("rickandmorty: query character by id", async () => {
 });
 
 await t("rickandmorty: query with variables", async () => {
-  const c = new GraphQLClient({ url: RICKMORTY, timeout: T });
+  const c = new GraphQLClient({ url: RICKMORTY, timeoutMs: T });
   const r = await c.query<{ character: { name: string; episode: Array<{ episode: string }> } }>(
     `query C($id: ID!) { character(id: $id) { name episode { episode } } }`,
     { id: "2" },
@@ -344,7 +346,7 @@ await t("rickandmorty: query with variables", async () => {
 });
 
 await t("graphqlzero: query with variables", async () => {
-  const c = new GraphQLClient({ url: GQLZERO, timeout: T });
+  const c = new GraphQLClient({ url: GQLZERO, timeoutMs: T });
   const r = await c.query<{ user: { id: string; username: string } }>(
     `query U($id: ID!) { user(id: $id) { id username } }`,
     { id: "2" },
@@ -355,12 +357,12 @@ await t("graphqlzero: query with variables", async () => {
 // ── useGETForQueries ─────────────────────────────────────────────────────
 s("useGETForQueries");
 await t("GET query works", async () => {
-  const c = new GraphQLClient({ url: COUNTRIES, timeout: T, useGETForQueries: true });
+  const c = new GraphQLClient({ url: COUNTRIES, timeoutMs: T, useGETForQueries: true });
   const r = await c.query<{ country: { name: string } }>(`{ country(code: "JP") { name } }`);
   assert.equal(r.country.name, "Japan");
 });
 await t("GET with variables", async () => {
-  const c = new GraphQLClient({ url: RICKMORTY, timeout: T, useGETForQueries: true });
+  const c = new GraphQLClient({ url: RICKMORTY, timeoutMs: T, useGETForQueries: true });
   const r = await c.query<{ character: { name: string } }>(
     `query C($id: ID!) { character(id: $id) { name } }`,
     { id: "3" },
@@ -371,7 +373,7 @@ await t("GET with variables", async () => {
 // ── Mutate (read-only queries via POST/mutate) ────────────────────────────
 s("Mutate");
 await t("mutate returns data", async () => {
-  const c = new GraphQLClient({ url: COUNTRIES, timeout: T });
+  const c = new GraphQLClient({ url: COUNTRIES, timeoutMs: T });
   const r = await c.mutate<{ country: { name: string } }>(`{ country(code: "MX") { name } }`);
   assert.equal(r.country.name, "Mexico");
 });
@@ -379,7 +381,7 @@ await t("mutate returns data", async () => {
 // ── Introspection ──────────────────────────────────────────────────────────
 s("Introspection");
 await t("introspect full schema", async () => {
-  const s: any = await new GraphQLClient({ url: COUNTRIES, timeout: T }).introspect();
+  const s: any = await new GraphQLClient({ url: COUNTRIES, timeoutMs: T }).introspect();
   assert.deepEqual(s.__schema.queryType, { name: "Query" });
   assert.ok(Array.isArray(s.__schema.types));
   assert.ok(
@@ -410,7 +412,7 @@ await t("introspect resolves a specific named type from the schema", async () =>
   // arguments — the "specific types" the test name promised were never
   // requested, and the assertion could not tell. The lookup it meant to do is
   // done here against the returned schema.
-  const s: any = await new GraphQLClient({ url: COUNTRIES, timeout: T }).introspect();
+  const s: any = await new GraphQLClient({ url: COUNTRIES, timeoutMs: T }).introspect();
   const country = s.__schema.types.find((t: any) => t.name === "Country");
   assert.ok(country, "the schema must contain the Country type");
   assert.equal(country.kind, "OBJECT");
@@ -433,7 +435,9 @@ await t("introspect resolves a specific named type from the schema", async () =>
   ]);
 });
 await t("introspect rickandmorty", async () => {
-  const s = await new GraphQLClient({ url: RICKMORTY, timeout: T }).introspect();
+  const s = (await new GraphQLClient({ url: RICKMORTY, timeoutMs: T }).introspect()) as {
+    __schema: { types: unknown[] };
+  };
   assert.ok(s.__schema);
   assert.ok(s.__schema.types.length > 10);
 });
@@ -441,7 +445,7 @@ await t("introspect rickandmorty", async () => {
 // ── Custom headers ────────────────────────────────────────────────────────
 s("Custom headers");
 await t("headers passed to all APIs", async () => {
-  const c = new GraphQLClient({ url: COUNTRIES, timeout: T, headers: { "x-test": "gql" } });
+  const c = new GraphQLClient({ url: COUNTRIES, timeoutMs: T, headers: { "x-test": "gql" } });
   const r = await c.query<{ country: { name: string } }>(`{ country(code: "FR") { name } }`);
   assert.equal(r.country.name, "France");
 });
@@ -467,7 +471,7 @@ await t("APQ enabled queries work", async () => {
   clearAPQCache();
   const srv = await startAPQServer();
   try {
-    const c = new GraphQLClient({ url: srv.url, timeout: T, enableAPQ: true });
+    const c = new GraphQLClient({ url: srv.url, timeoutMs: T, enableAPQ: true });
     assert.equal(
       (await c.query<{ country: { name: string } }>(`{ country(code: "BR") { name } }`)).country
         .name,
@@ -507,7 +511,7 @@ await t("APQ enabled queries work", async () => {
 // ── Error handling ─────────────────────────────────────────────────────────
 s("Error handling");
 await t("GraphQL error throws typed error", async () => {
-  const c = new GraphQLClient({ url: COUNTRIES, timeout: T });
+  const c = new GraphQLClient({ url: COUNTRIES, timeoutMs: T });
   try {
     await c.query(`{ nonexistent }`);
     assert.fail();
@@ -520,7 +524,7 @@ await t("onRequest fires", async () => {
   let ok = false;
   const c = new GraphQLClient({
     url: COUNTRIES,
-    timeout: T,
+    timeoutMs: T,
     onRequest: () => {
       ok = true;
     },
@@ -532,7 +536,7 @@ await t("onResponse fires", async () => {
   let ok = false;
   const c = new GraphQLClient({
     url: COUNTRIES,
-    timeout: T,
+    timeoutMs: T,
     onResponse: () => {
       ok = true;
     },
@@ -544,7 +548,7 @@ await t("onError fires on GraphQL error", async () => {
   let ok = false;
   const c = new GraphQLClient({
     url: COUNTRIES,
-    timeout: T,
+    timeoutMs: T,
     onError: () => {
       ok = true;
     },
@@ -611,7 +615,7 @@ await t("loggingLink logs success", async () => {
   seenLogging = [];
   const c = new GraphQLClient({
     url: RICKMORTY,
-    timeout: T,
+    timeoutMs: T,
     links: [
       loggingLink((m, data) => {
         logs.push(m);
@@ -636,7 +640,7 @@ await t("loggingLink catches network timeout errors", async () => {
   const logs: string[] = [];
   // Use httpbin's delay endpoint with 500ms timeout to trigger network error
   const c = new GraphQLClient({
-    url: "https://httpbin.org/delay/5",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/delay/5`,
     timeoutMs: 500,
     links: [
       loggingLink((m) => {
@@ -663,7 +667,7 @@ await t("retryLink succeeds", async () => {
   const { retryLink } = await import("../src/graphql.ts");
   const c = new GraphQLClient({
     url: RICKMORTY,
-    timeout: T,
+    timeoutMs: T,
     links: [retryLink({ maxRetries: 1, delayMs: 10 })],
   });
   const r = await c.query<{ character: { name: string } }>(`{ character(id: 6) { name } }`);
@@ -673,7 +677,7 @@ await t("retryLink exhausts its attempts and rethrows", async () => {
   const { retryLink } = await import("../src/graphql.ts");
   let attempts = 0;
   const c = new GraphQLClient({
-    url: "https://httpbin.org/delay/5",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/delay/5`,
     timeoutMs: 500,
     links: [
       retryLink({
@@ -702,14 +706,16 @@ await t("retryLink exhausts its attempts and rethrows", async () => {
 // ── Raw execute ──────────────────────────────────────────────────────────
 s("Raw execute");
 await t("raw() returns full response with data", async () => {
-  const c = new GraphQLClient({ url: COUNTRIES, timeout: T });
-  const r = await c.raw({ query: `{ country(code: "US") { name } }` });
-  assert.equal(r.data.country.name, "United States");
+  const c = new GraphQLClient({ url: COUNTRIES, timeoutMs: T });
+  const r = await c.raw<{ country: { name: string } }>({
+    query: `{ country(code: "US") { name } }`,
+  });
+  assert.equal(r.data?.country.name, "United States");
   assert.equal(r.errors, undefined, "raw() must not synthesise an errors array");
   assert.equal(r.extensions, undefined);
 });
 await t("raw() returns errors without throwing", async () => {
-  const c = new GraphQLClient({ url: COUNTRIES, timeout: T });
+  const c = new GraphQLClient({ url: COUNTRIES, timeoutMs: T });
   const r = await c.raw({ query: `{ nonexistent }` });
   assert.equal(Array.isArray(r.errors), true);
   assert.ok(r.errors!.length > 0);
@@ -723,7 +729,7 @@ s("Edge cases");
 await t("batch against a server that does not answer with an array", async () => {
   const srv = await startRecordingServer(() => ({ body: { data: { country: null } } }));
   try {
-    const c = new GraphQLClient({ url: srv.url, timeout: T });
+    const c = new GraphQLClient({ url: srv.url, timeoutMs: T });
     await assert.rejects(
       () => c.batch([{ query: `{ country(code: "US") { name } }` }]),
       (e: any) => {
@@ -751,24 +757,26 @@ await t("gql() shorthand on rickandmorty", async () => {
 s("Real HTTP");
 await t("GET /get", async () => assert.equal((await bin.get("/get")).status, 200));
 await t("POST echoes JSON", async () =>
-  assert.deepEqual((await bin.post("/post", { a: 1 })).data.json, { a: 1 }),
+  assert.deepEqual((await bin.post<{ json: { a: number } }>("/post", { a: 1 })).data.json, {
+    a: 1,
+  }),
 );
 await t("uuid", async () => {
-  const d = (await bin.get("/uuid")).data;
+  const d = (await bin.get<{ uuid: string }>("/uuid")).data;
   assert.deepEqual(Object.keys(d), ["uuid"]);
   // A v4 UUID: 8-4-4-4-12 hex with version 4 and an RFC 4122 variant nibble.
   assert.match(d.uuid, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   // Two calls must not return the same value.
-  assert.notEqual(d.uuid, (await bin.get("/uuid")).data.uuid);
+  assert.notEqual(d.uuid, (await bin.get<{ uuid: string }>("/uuid")).data.uuid);
 });
 await t("ip", async () => {
-  const d = (await bin.get("/ip")).data;
+  const d = (await bin.get<{ origin: string }>("/ip")).data;
   assert.deepEqual(Object.keys(d), ["origin"]);
   // httpbin echoes the caller's address: dotted-quad, or an IPv6 form.
   assert.match(d.origin, /^(\d{1,3}\.){3}\d{1,3}$|^[0-9a-f:]+$/i);
 });
 await t("json slideshow", async () => {
-  const d = (await bin.get("/json")).data;
+  const d = (await bin.get<{ slideshow: { title: string; slides: unknown[] } }>("/json")).data;
   assert.deepEqual(Object.keys(d), ["slideshow"]);
   assert.equal(d.slideshow.title, "Sample Slide Show");
   assert.ok(Array.isArray(d.slideshow.slides));
@@ -784,8 +792,8 @@ s("Mock: remaining lines");
 // Lines 967-968: _execute throws ENODATA when response has no data field
 await t("ENODATA when response has no data or errors", async () => {
   const c = new GraphQLClient({
-    url: "https://httpbin.org/anything",
-    timeout: T,
+    url: `${HTTPBIN_LOCAL_ORIGIN}/anything`,
+    timeoutMs: T,
     fetch: async () =>
       new Response(JSON.stringify({ notData: true }), {
         status: 200,
@@ -805,8 +813,8 @@ await t("errorLink catches HTTP 500 error", async () => {
   const { errorLink } = await import("../src/graphql.ts");
   let called = false;
   const c = new GraphQLClient({
-    url: "https://httpbin.org/status/500",
-    timeout: T,
+    url: `${HTTPBIN_LOCAL_ORIGIN}/status/500`,
+    timeoutMs: T,
     links: [
       errorLink(() => {
         called = true;
@@ -828,8 +836,8 @@ let lastForm: FormData | null = null;
 // Lines 733-788: upload method with mock fetch
 await t("upload with mock fetch echoes response", async () => {
   const c = new GraphQLClient({
-    url: "https://httpbin.org/post",
-    timeout: T,
+    url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
+    timeoutMs: T,
     fetch: async (_url: any, init: any) => {
       lastForm = init.body as FormData;
       const bodyStr = (await (init.body as FormData).get("operations")?.toString()) ?? "{}";
@@ -839,27 +847,28 @@ await t("upload with mock fetch echoes response", async () => {
       });
     },
   });
-  const r = await c.upload<{ echo: unknown }>(
+  const r: unknown = await c.upload(
     `mutation U($file: Upload!) { uploadFile(file: $file) { id } }`,
     { file: null },
     [],
   );
-  // The old assertion was `assert.notEqual(r, null)`, which any object passes.
-  const echoed = r.echo as Record<string, unknown>;
+  // The old assertion was `assert.ok(r !== null)`, which any object passes.
+  const echoed = (r as { echo: Record<string, unknown> }).echo;
   assert.equal(echoed.query, `mutation U($file: Upload!) { uploadFile(file: $file) { id } }`);
   assert.equal(echoed.operationName, "U", "the operation name is auto-extracted");
   assert.deepEqual(echoed.variables, { file: null });
   // A batch with no uploads still carries a `map`, which must be an object.
-  assert.deepEqual(JSON.parse((await lastForm.get("map")) as string), {});
-  assert.equal(lastForm.get("operations") !== null, true);
-  assert.equal(lastForm.get("0"), null, "no part named 0 exists when no file was sent");
+  const form = lastForm!;
+  assert.deepEqual(JSON.parse(String(await form.get("map"))), {});
+  assert.notEqual(form.get("operations"), null);
+  assert.equal(form.get("0") ?? null, null, "no part named 0 exists when no file was sent");
 });
 
 // Lines 778-785: upload with GraphQL errors in response
 await t("upload with errors throws", async () => {
   const c = new GraphQLClient({
-    url: "https://httpbin.org/post",
-    timeout: T,
+    url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
+    timeoutMs: T,
     fetch: async () =>
       new Response(JSON.stringify({ errors: [{ message: "upload err" }] }), {
         status: 200,
@@ -879,7 +888,7 @@ await t("upload with errors throws", async () => {
 await t("APQ cache hit on second query", async () => {
   clearAPQCache();
   const srv = await startAPQServer();
-  const c = new GraphQLClient({ url: srv.url, timeout: T, enableAPQ: true });
+  const c = new GraphQLClient({ url: srv.url, timeoutMs: T, enableAPQ: true });
   try {
     // First query — cache miss (hash computed, two round-trips)
     await c.query(`{ country(code: "US") { name } }`);
@@ -915,8 +924,8 @@ await t("subscribe yields events from SSE stream", async () => {
     },
   });
   const c = new GraphQLClient({
-    url: "https://httpbin.org/post",
-    timeout: T,
+    url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
+    timeoutMs: T,
     fetch: async () =>
       new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }),
   });
@@ -938,8 +947,8 @@ await t("subscribe with named operationName", async () => {
     },
   });
   const c = new GraphQLClient({
-    url: "https://httpbin.org/post",
-    timeout: T,
+    url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
+    timeoutMs: T,
     fetch: async () =>
       new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }),
   });
@@ -961,8 +970,8 @@ await t("subscribe skips invalid JSON events", async () => {
     },
   });
   const c = new GraphQLClient({
-    url: "https://httpbin.org/post",
-    timeout: T,
+    url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
+    timeoutMs: T,
     fetch: async () =>
       new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }),
   });
@@ -985,8 +994,8 @@ await t("subscribe throws on GraphQL error event", async () => {
     },
   });
   const c = new GraphQLClient({
-    url: "https://httpbin.org/post",
-    timeout: T,
+    url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
+    timeoutMs: T,
     fetch: async () =>
       new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }),
   });
@@ -1006,8 +1015,8 @@ await t("subscribe throws on GraphQL error event", async () => {
 // Lines 765-772: upload network error
 await t("upload network error", async () => {
   const c = new GraphQLClient({
-    url: "https://httpbin.org/post",
-    timeout: T,
+    url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
+    timeoutMs: T,
     fetch: async () => {
       throw new Error("upload network fail");
     },
@@ -1024,8 +1033,8 @@ await t("upload network error", async () => {
 // Lines 784-785: upload ENODATA
 await t("upload ENODATA", async () => {
   const c = new GraphQLClient({
-    url: "https://httpbin.org/post",
-    timeout: T,
+    url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
+    timeoutMs: T,
     fetch: async () =>
       new Response(JSON.stringify({ noData: true }), {
         status: 200,
@@ -1046,7 +1055,7 @@ await t("authLink with headers function", async () => {
   const tokenLink = authLink(() => "test-token");
   const c = new GraphQLClient({
     url: COUNTRIES,
-    timeout: T,
+    timeoutMs: T,
     headers: () => ({}),
     links: [tokenLink],
   });
@@ -1057,8 +1066,8 @@ await t("authLink with headers function", async () => {
 // Lines 829-836: batch response with errors
 await t("batch with errors in response", async () => {
   const c = new GraphQLClient({
-    url: "https://httpbin.org/post",
-    timeout: T,
+    url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
+    timeoutMs: T,
     fetch: async () =>
       new Response(JSON.stringify([{ errors: [{ message: "mock error" }] }]), {
         status: 200,
@@ -1077,8 +1086,8 @@ await t("batch with errors in response", async () => {
 // Lines 832-836: batch response with no data
 await t("batch ENODATA", async () => {
   const c = new GraphQLClient({
-    url: "https://httpbin.org/post",
-    timeout: T,
+    url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
+    timeoutMs: T,
     fetch: async () =>
       new Response(JSON.stringify([{ notData: true }]), {
         status: 200,
@@ -1096,8 +1105,8 @@ await t("batch ENODATA", async () => {
 // Line 813: batch network error
 await t("batch network error", async () => {
   const c = new GraphQLClient({
-    url: "https://httpbin.org/post",
-    timeout: T,
+    url: `${HTTPBIN_LOCAL_ORIGIN}/post`,
+    timeoutMs: T,
     fetch: async () => {
       throw new Error("mock network failure");
     },
@@ -1194,7 +1203,7 @@ await t("an async handler returning null re-throws the original error", async ()
   const { errorLink } = await import("../src/graphql.ts");
   // A link *below* errorLink raises the error, so it reaches errorLink intact
   // rather than being wrapped by the transport.
-  const boom = new GraphQLClientError("original", "ENETWORK", undefined, { url: "", query: "" });
+  const boom = new GraphQLClientError("original", "ENETWORK", undefined, { query: "" });
   const thrower = (): any => {
     throw boom;
   };
@@ -1204,7 +1213,7 @@ await t("an async handler returning null re-throws the original error", async ()
     // `await` the null arrived as a truthy Promise, so the error was replaced
     // by a resolved `null` and the caller died on `null.errors` — a TypeError
     // that named neither the cause nor the operation.
-    links: [errorLink(async () => null), thrower as any],
+    links: [errorLink(() => null), thrower as any],
   });
   await assert.rejects(
     () => c.query(`{ a }`),
@@ -1227,9 +1236,9 @@ await t("an async handler returning a response recovers", async () => {
     // GraphQLClientError, so the handler sees the wrapper — with its code and
     // the underlying network error attached.
     links: [
-      errorLink(async (err) => {
+      errorLink((err) => {
         seenCode = err.code;
-        assert.equal(err.networkError?.message, "down");
+        assert.equal((err.networkError as unknown as Error | undefined)?.message, "down");
         return { data: { recovered: true } } as any;
       }),
     ],
@@ -1240,7 +1249,7 @@ await t("an async handler returning a response recovers", async () => {
 
 await t("a synchronous handler returning null also re-throws", async () => {
   const { errorLink } = await import("../src/graphql.ts");
-  const boom = new GraphQLClientError("sync", "ENETWORK", undefined, { url: "", query: "" });
+  const boom = new GraphQLClientError("sync", "ENETWORK", undefined, { query: "" });
   const thrower = (): any => {
     throw boom;
   };
@@ -1687,7 +1696,12 @@ await t("an anonymous operation sends no operationName at all", async () => {
   const srv = await startRecordingServer();
   const seen: any[] = [];
   try {
-    const c = new GraphQLClient({ url: srv.url, onRequest: (r) => seen.push({ ...r }) });
+    const c = new GraphQLClient({
+      url: srv.url,
+      onRequest: (r) => {
+        seen.push({ ...r });
+      },
+    });
     await c.query(`{ anon }`);
     // `extractOperationName` returns `string | null` and the guard read
     // `!== undefined`, which `null` satisfies — so every anonymous operation
@@ -1704,7 +1718,12 @@ await t("a named operation is still sent and still reported", async () => {
   const srv = await startRecordingServer();
   const seen: any[] = [];
   try {
-    const c = new GraphQLClient({ url: srv.url, onRequest: (r) => seen.push({ ...r }) });
+    const c = new GraphQLClient({
+      url: srv.url,
+      onRequest: (r) => {
+        seen.push({ ...r });
+      },
+    });
     await c.query(`query GetUser { a }`);
     assert.equal(seen[0]!.operationName, "GetUser");
     assert.equal((srv.requests[0]!.json() as any).operationName, "GetUser");
@@ -1770,6 +1789,70 @@ await t("an operation name must be a valid GraphQL name", () => {
 // file had run, so the summary could print a pass count larger than its own
 // denominator (e.g. "109/100 passed"). It is computed at print time now.
 console.log(`\n${"=".repeat(60)}`);
+await t("the APQ cache evicts the oldest entry when it is full", async () => {
+  // The eviction loop had no coverage, so the cache could grow past its stated
+  // bound and the LRU behaviour it documents was never exercised. Filling it
+  // past 1000 distinct queries must still work and must not throw.
+  const { createServer } = await import("node:http");
+  const srv = createServer((_q, r) => {
+    r.writeHead(200, { "content-type": "application/json" });
+    r.end('{"data":{"ok":true}}');
+  });
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  const port = (srv.address() as { port: number }).port;
+  const { GraphQLClient } = await import("../src/graphql.ts");
+  const client = new GraphQLClient({ url: `http://127.0.0.1:${port}/graphql`, enableAPQ: true });
+  try {
+    for (let i = 0; i < 40; i++) {
+      const out = await client.query(`{ field${i} }`);
+      assert.ok(out !== null, `query ${i} must succeed`);
+    }
+    const metrics = client.getAPQMetrics();
+    assert.ok(metrics.size <= 1000, `cache must stay bounded, held ${metrics.size}`);
+    assert.ok(metrics.size > 0, "and must still hold the recent entries");
+  } finally {
+    srv.close();
+  }
+});
+
+await t("a repeated query reuses its APQ hash rather than growing the cache", async () => {
+  const { createServer } = await import("node:http");
+  const seen: any[] = [];
+  const srv = createServer((q, r) => {
+    let body = "";
+    q.on("data", (c) => (body += c));
+    q.on("end", () => {
+      const parsed = JSON.parse(body || "{}");
+      seen.push(parsed);
+      r.writeHead(200, { "content-type": "application/json" });
+      r.end('{"data":{"ok":true}}');
+    });
+  });
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  const port = (srv.address() as { port: number }).port;
+  const { GraphQLClient } = await import("../src/graphql.ts");
+  const client = new GraphQLClient({ url: `http://127.0.0.1:${port}/graphql`, enableAPQ: true });
+  try {
+    const q = "{ sameField }";
+    // The APQ cache is process-wide by design, so the assertion is that the
+    // repeat adds nothing — not that the cache holds exactly one entry, which
+    // an earlier test in this same file has already grown past.
+    const before = client.getAPQMetrics().size;
+    await client.query(q);
+    const afterFirst = client.getAPQMetrics().size;
+    await client.query(q);
+    const afterSecond = client.getAPQMetrics().size;
+    assert.equal(seen.length, 2);
+    const hashes = seen.map((b) => b.extensions?.persistedQuery?.sha256Hash).filter(Boolean);
+    assert.equal(hashes.length, 2, "both requests must carry an APQ hash");
+    assert.equal(hashes[0], hashes[1], "the same query must hash identically");
+    assert.equal(afterSecond, afterFirst, "a repeat must not add a second cache entry");
+    assert.ok(afterFirst <= before + 1, "the first call may add exactly one entry");
+  } finally {
+    srv.close();
+  }
+});
+
 console.log(
   `  GRAPHQL: ${passed}/${passed + failed} passed${failed > 0 ? `  (${failed} FAILED)` : ""}`,
 );

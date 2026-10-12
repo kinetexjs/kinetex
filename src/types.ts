@@ -181,7 +181,7 @@ export interface RequestState {
   auth?: AuthConfig;
   /** Proxy configuration. */
   proxy?: ProxyConfig;
-  /** Per-request cache configuration. */
+
   cache?: CacheRequestConfig;
   /** Maximum response body size in bytes. */
   sizeLimit?: number;
@@ -213,6 +213,22 @@ export interface KinetexResponse<T = unknown> {
   readonly data: T;
   /** Raw response body bytes (before parsing). */
   readonly rawBody: Uint8Array | null;
+  /**
+   * The same bytes as a string, for an interceptor-phase view of this response.
+   *
+   * Always the same bytes as {@link rawBody}. It exists so a response
+   * satisfies `InterceptorResponse` without a cast, which is what lets one
+   * interceptor type serve both sides of the pipeline; prefer `rawBody` in new
+   * code.
+   */
+  readonly body: string | Uint8Array | null;
+  /**
+   * The underlying runtime response, when one exists.
+   *
+   * Absent on a response the client synthesised (a cache hit or a redirect-free
+   * replay), which is why it is optional rather than `null`.
+   */
+  readonly raw?: unknown;
   /** Final URL after redirects. */
   readonly url: string;
   /** Whether this response was served from cache. */
@@ -259,6 +275,8 @@ export type KinetexErrorCode =
   | "EAUTH"
   | "EPROXY"
   | "EREDIRECT"
+  /** A host was refused because it resolves into blocked address space. */
+  | "EBLOCKEDHOST"
   | "EUNKNOWN";
 
 const VALID_ERROR_CODES = [
@@ -566,6 +584,19 @@ export interface ProxyConfig {
 export interface RetryConfig {
   /** Maximum number of retry attempts. Default: 3 */
   maxRetries: number;
+  /**
+   * Ceiling on the total wall-clock time for the request, retries and backoff
+   * included. Defaults to the request `timeout`, so `timeout` bounds the whole
+   * call rather than each attempt. `0` disables the ceiling entirely.
+   *
+   * `timeout` applies to one attempt, and the backoff between attempts is not
+   * bounded by it either: with `timeout: 1_000`, `maxRetries: 5` and a growing
+   * `baseDelayMs`, a failing endpoint held the caller for well over a minute.
+   * That is fine for a background job and wrong for anything on a request path,
+   * so this bounds the whole thing. When the budget is exhausted the last
+   * error is rethrown rather than replaced, so the cause is still visible.
+   */
+  totalTimeoutMs?: number;
   /** Base delay in ms (exponential back-off base). Default: 300 */
   baseDelayMs: number;
   /** Maximum delay cap in ms. Default: 30_000 */
@@ -668,9 +699,17 @@ export type RequestInterceptor = (
   ctx: InterceptorContext,
 ) =>
   | void
+  | undefined
   | KinetexRequest
   | KinetexResponse<unknown>
-  | Promise<void | KinetexRequest | KinetexResponse<unknown>>;
+  | import("./interceptors.ts").InterceptorResponse
+  | Promise<
+      | void
+      | undefined
+      | KinetexRequest
+      | KinetexResponse<unknown>
+      | import("./interceptors.ts").InterceptorResponse
+    >;
 
 /**
  * An interceptor that can modify or replace a response, or trigger a retry.
@@ -685,9 +724,17 @@ export type ResponseInterceptor = (
   ctx: InterceptorContext,
 ) =>
   | void
+  | undefined
   | KinetexResponse<unknown>
+  | import("./interceptors.ts").InterceptorResponse
   | KinetexRequest
-  | Promise<void | KinetexResponse<unknown> | KinetexRequest>;
+  | Promise<
+      | void
+      | undefined
+      | KinetexResponse<unknown>
+      | import("./interceptors.ts").InterceptorResponse
+      | KinetexRequest
+    >;
 
 /**
  * An interceptor that can recover from errors.
@@ -702,22 +749,18 @@ export type ErrorInterceptor = (
 ) => void | KinetexResponse<unknown> | Promise<void | KinetexResponse<unknown>>;
 
 /** Context threaded through the interceptor pipeline. */
-export interface InterceptorContext {
-  /** Mutable request — modify in place or return a new one. */
-  request: KinetexRequest;
-  /** Set once the response is received. */
-  response: KinetexResponse<unknown> | null;
-  /** Set when an error occurs. */
-  error: unknown | null;
-  /** Monotonic start time (ms). */
-  startedAt: number;
-  /** Current attempt number. */
-  attempt: number;
-  /** Whether the pipeline has been aborted. */
-  aborted: boolean;
-  /** Arbitrary pipeline-scoped storage. */
-  store: Map<symbol | string, unknown>;
-}
+/**
+ * The context an interceptor receives.
+ *
+ * This is an alias, not a second declaration. There used to be two incompatible
+ * `InterceptorContext` types — one here over `KinetexRequest` /
+ * `KinetexResponse`, one in `src/interceptors.ts` over `InterceptorRequest` /
+ * `InterceptorResponse` — so an interceptor written against one could not be
+ * passed to an API typed against the other, and every crossing point needed a
+ * cast. `InterceptorRequest` is now an alias of `KinetexRequest` and both
+ * responses share a shape, so one definition is correct.
+ */
+export type InterceptorContext = import("./interceptors.ts").InterceptorContext;
 
 // ============================================================================
 // §12  LIFECYCLE HOOKS (public types)
@@ -764,8 +807,15 @@ export interface LifecycleHooks {
 export interface HookContext {
   /** The request being processed. */
   request: KinetexRequest;
-  /** The response received (null before dispatch or on error). */
-  response: KinetexResponse<unknown> | null;
+  /**
+   * The response received (null before dispatch or on error).
+   *
+   * Typed as the shared {@link import("./interceptors.ts").InterceptorResponse}
+   * rather than `KinetexResponse`: hooks run during the interceptor phase, so
+   * they see `body`, not `data`. Naming the richer type here was the third copy
+   * of the same shape, and every hook had to be narrowed at its boundary.
+   */
+  response: import("./interceptors.ts").InterceptorResponse | null;
   /** The error that occurred (null on success). */
   error: unknown | null;
   /** Monotonic start time in ms. */
@@ -865,6 +915,13 @@ export interface KinetexConfig {
 
   /** Default request timeout in ms. 0 = no timeout. Default: 30_000 */
   timeout?: number;
+  /**
+   * Ceiling on the whole request — every attempt and every backoff. Defaults to
+   * `timeout`, so `timeout` bounds the whole call rather than each attempt.
+   * Set `0` to disable, or a larger value to allow a longer retry chain than a
+   * single attempt may take.
+   */
+  totalTimeoutMs?: number;
 
   /** Default retry policy. */
   retry?: Partial<RetryConfig>;
@@ -874,6 +931,41 @@ export interface KinetexConfig {
 
   /** Proxy configuration. */
   proxy?: ProxyConfig;
+  /**
+   * Permit requests to hosts that resolve into private, loopback or link-local
+   * address space. Default: `false`.
+   *
+   * A hostname is screened as written, but the socket is dialled at whatever the
+   * name resolves to. By default the resolved address is checked too, so a name
+   * answering with `127.0.0.1` or `169.254.169.254` is refused — the DNS
+   * rebinding case, which needs only control of the domain being requested.
+   *
+   * Set this to `true` to reach a service on `localhost`, a private network or a
+   * container network: local development, a service mesh, and any test that
+   * stands up a local server all need it. Leave it unset wherever the URLs being
+   * requested are influenced by someone else.
+   *
+   * Node's HTTP/2 and HTTP/1.1 transports only. A configured custom `fetch` or
+   * `dispatcher` resolves through that implementation instead, which has no
+   * `lookup` hook to install — with those set, this option has no effect.
+   */
+  allowPrivateNetwork?: boolean;
+
+  /**
+   * Additional CA certificate(s) to trust, as PEM strings, on top of the
+   * system store.
+   *
+   * Node's HTTP/2 and HTTP/1.1 transports only. A configured custom `fetch` or
+   * `dispatcher` negotiates TLS through that implementation instead, and
+   * `fetch` exposes no CA option — honouring it would need an undici
+   * `Agent`, which this package does not depend on. Give such a setup its own
+   * dispatcher instead. The same caveat applies to
+   * {@link allowPrivateNetwork}.
+   *
+   * Needed to reach an origin whose certificate a private CA issued, which is
+   * every internal service mesh and most enterprise proxies.
+   */
+  ca?: string | string[];
 
   /** HTTP cache configuration. */
   cache?: import("./cache.ts").CacheConfig; // Import type from cache module
@@ -884,7 +976,13 @@ export interface KinetexConfig {
   /** Whether to throw on HTTP error status codes (4xx/5xx). Default: true */
   throwOnError?: boolean;
 
-  /** Maximum response body size in bytes. 0 = no limit. Default: 0 */
+  /**
+   * Maximum response body size in bytes, applied while the body is buffered.
+   * `0` disables the limit. Default: 104857600 (100 MB).
+   *
+   * Without a ceiling a hostile or broken server can drive the process out of
+   * memory: the body is read in full before the caller sees any of it.
+   */
   maxResponseSize?: number;
 
   /** Maximum request body size in bytes. 0 = no limit. Default: 0 */
@@ -1227,6 +1325,8 @@ export interface SendOptions<T = unknown> {
   body?: RequestBody;
   /** Override timeout in ms. */
   timeout?: number;
+  /** Override the whole-request ceiling for this request. 0 disables it. */
+  totalTimeoutMs?: number;
   /** Override retry config. */
   retry?: Partial<RetryConfig> | false;
   /** Override auth. */

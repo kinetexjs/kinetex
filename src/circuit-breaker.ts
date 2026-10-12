@@ -30,7 +30,7 @@ export type CircuitState = "CLOSED" | "OPEN" | "HALF_OPEN";
 export interface FailureFilter {
   /** Count network errors (ENETWORK). Default: true */
   networkErrors?: boolean;
-  /** Count timeout errors (ETIMEOUT). Default: true */
+  /** Count timeout errors (`ETIMEOUT`, and the interceptor's `ETIMEDOUT`). Default: true */
   timeouts?: boolean;
   /** Count HTTP 5xx responses (requires `throwOnError: true`). Default: false */
   serverErrors?: boolean;
@@ -439,7 +439,14 @@ export class CircuitBreaker {
     const code = (err as { code?: string }).code;
 
     if (this.failureFilter.networkErrors && code === "ENETWORK") return true;
-    if (this.failureFilter.timeouts && code === "ETIMEOUT") return true;
+    // `ETIMEDOUT` as well as `ETIMEOUT`. The timeout interceptor raises its own
+    // `TimeoutError` (src/interceptors.ts), which carries `ETIMEDOUT`, so a
+    // request that timed out at the interceptor was never counted toward the
+    // threshold no matter what `failureFilter.timeouts` was set to. Both codes
+    // are kept because `ETIMEDOUT` is also a node:net errno (see
+    // `TRANSIENT_DIAL_CODES` in socks5.ts), so accepting it is right
+    // independently of the interceptor.
+    if (this.failureFilter.timeouts && (code === "ETIMEOUT" || code === "ETIMEDOUT")) return true;
 
     if (this.failureFilter.serverErrors) {
       const status = (err as { status?: number }).status;

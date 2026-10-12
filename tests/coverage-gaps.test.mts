@@ -118,7 +118,7 @@ await test("rejects an endpoint outside the IMDS allowlist", () => {
 suite("DedupMap window handling");
 
 await test("registering a new window clears the previous timer for that key", async () => {
-  const dedup = new DedupMap<string>({ windowMs: 60_000 });
+  const dedup = new DedupMap({ windowMs: 60_000 });
   // `timeouts` is internal bookkeeping; reading it is the point of this test.
   const timeouts = (
     dedup as unknown as {
@@ -157,7 +157,7 @@ await test("an in-flight request is coalesced regardless of the window", async (
   // above ("a fresh request runs") only means that because its first call had
   // already completed. Nothing pinned that distinction, and reading the test
   // above the other way round would assert the opposite of the design.
-  const dedup = new DedupMap<string>({ windowMs: 60_000 });
+  const dedup = new DedupMap({ windowMs: 60_000 });
   let calls = 0;
   let release: (() => void) | undefined;
   const gate = new Promise<void>((r) => {
@@ -237,7 +237,9 @@ await test("a caller-supplied meta.traceId produces a traceparent header", async
       request: [
         (ctx) => {
           traceparent = ctx.request.headers.traceparent;
-          return ctx;
+          // A request interceptor mutates in place and returns nothing; the
+          // returned context was never a valid `RequestInterceptor` result.
+          return undefined;
         },
       ],
     },
@@ -262,7 +264,9 @@ await test("an explicit traceparent header is not overwritten", async () => {
       request: [
         (ctx) => {
           traceparent = ctx.request.headers.traceparent;
-          return ctx;
+          // A request interceptor mutates in place and returns nothing; the
+          // returned context was never a valid `RequestInterceptor` result.
+          return undefined;
         },
       ],
     },

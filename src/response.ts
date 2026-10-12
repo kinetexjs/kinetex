@@ -390,6 +390,56 @@ function normaliseOnExceed(mode: SizeLimitConfig["onExceed"]): "throw" | "trunca
 }
 
 /**
+ * What to do with a chunk that would cross the size limit.
+ *
+ * `keep`   — accept the whole chunk.
+ * `truncate`— accept the part that fits, then stop.
+ * `stop`   — stop without accepting anything more.
+ * `throw` is raised, not returned, because the error class belongs to the caller.
+ */
+type LimitAction = { kind: "keep" } | { kind: "truncate"; chunk: Uint8Array } | { kind: "stop" };
+
+/**
+ * The single size-limit policy, shared by the buffering reader and the
+ * streaming one.
+ *
+ * Both had the same four decisions — when to fire `onExceedCallback`, when to
+ * throw, how much of the crossing chunk to keep, when to stop — written out
+ * twice. They drifted: the streaming version cancelled with `"size limit"` where
+ * the buffered one used `"size limit exceeded"`, which is the kind of difference
+ * that only matters in a log nobody diffs.
+ *
+ * `makeError` is supplied by the caller because the two entry points raise
+ * different public classes (`ResponseSizeLimitError` here,
+ * `SizeLimitError` from `types.ts` via `core.ts`). Both carry the code
+ * `"ESIZELIMIT"`, but they are different classes with different prototypes and
+ * collapsing them is a breaking change, so each keeps its own.
+ */
+export function limitAction(
+  chunk: Uint8Array,
+  bytesRead: number,
+  limit: SizeLimitConfig,
+  onExceed: "throw" | "truncate" | "abort",
+  makeError: (newTotal: number, maxBytes: number) => Error,
+): LimitAction {
+  const newTotal = bytesRead + chunk.byteLength;
+  if (newTotal <= limit.maxBytes) return { kind: "keep" };
+
+  limit.onExceedCallback?.(newTotal, limit.maxBytes);
+
+  if (onExceed === "throw") throw makeError(newTotal, limit.maxBytes);
+
+  if (onExceed === "truncate") {
+    const remaining = limit.maxBytes - bytesRead;
+    // `remaining > 0` always holds here: `newTotal > maxBytes` with a
+    // non-negative chunk length implies `bytesRead < maxBytes`.
+    return { kind: "truncate", chunk: chunk.slice(0, remaining) };
+  }
+
+  return { kind: "stop" };
+}
+
+/**
  * Read a ReadableStream with a hard size limit.
  *
  * @param stream The source ReadableStream.
@@ -428,35 +478,41 @@ export async function readBodyWithLimit(
         break;
       }
 
-      const newTotal = bytesRead + value.byteLength;
+      let action: LimitAction;
+      try {
+        action = limitAction(
+          value,
+          bytesRead,
+          limit,
+          onExceed,
+          (n, max) => new ResponseSizeLimitError(n, max, url),
+        );
+      } catch (err) {
+        await reader.cancel("size limit exceeded");
+        throw err;
+      }
 
-      if (newTotal > limit.maxBytes) {
-        limit.onExceedCallback?.(newTotal, limit.maxBytes);
-
-        if (onExceed === "throw") {
-          await reader.cancel("size limit exceeded");
-          throw new ResponseSizeLimitError(newTotal, limit.maxBytes, url);
-        }
-
-        if (onExceed === "abort") {
-          await reader.cancel("size limit exceeded");
-          break;
-        }
-
-        if (onExceed === "truncate") {
-          const remaining = limit.maxBytes - bytesRead;
-          if (remaining > 0) {
-            chunks.push(value.slice(0, remaining));
-            bytesRead += remaining;
-          }
-          break;
-        }
+      if (action.kind === "stop") {
+        await reader.cancel("size limit exceeded");
+        break;
+      }
+      if (action.kind === "truncate") {
+        chunks.push(action.chunk);
+        bytesRead += action.chunk.byteLength;
+        break;
       }
 
       chunks.push(value);
       bytesRead += value.byteLength;
     }
   } finally {
+    // Cancel before releasing when bailing out, so the unread remainder of the
+    // body is discarded rather than left buffered on a released lock. The loop
+    // already cancels on every abort it observes; this covers the race where the
+    // signal fired between the last read and the loop exiting.
+    if (signal?.aborted) {
+      await reader.cancel("aborted").catch(() => {});
+    }
     reader.releaseLock();
   }
 
@@ -519,7 +575,14 @@ function detectBOM(bytes: Uint8Array): string | null {
  * @returns The decoded string.
  * @throws {ResponseDecodeError} If decoding fails even with lenient fallback.
  */
-export function decodeBody(bytes: Uint8Array, charset: string | null, url: string): string {
+/**
+ * Decode a response body to a string.
+ *
+ * `url` is optional: it is only used to name the originating URL on a
+ * `ResponseDecodeError`, and requiring every caller to thread one through just
+ * to decode a body it already has in hand made the third parameter a formality.
+ */
+export function decodeBody(bytes: Uint8Array, charset: string | null, url?: string): string {
   const detected = detectBOM(bytes);
   const resolved = detected ?? resolveCharset(charset);
 
@@ -533,7 +596,7 @@ export function decodeBody(bytes: Uint8Array, charset: string | null, url: strin
     try {
       return new TextDecoder(resolved, { fatal: false }).decode(data);
     } catch (err2) {
-      throw new ResponseDecodeError(String(err2), resolved, url);
+      throw new ResponseDecodeError(String(err2), resolved, url ?? "<unknown url>");
     }
   }
 }
@@ -585,6 +648,13 @@ export function decompressStream(
 ): ReadableStream<Uint8Array> {
   const normalized = encoding.trim().toLowerCase();
 
+  // An empty body carrying a Content-Encoding is an ordinary response — an
+  // empty 204, an empty error body — and every decoder here rejects it,
+  // `DecompressionStream("gzip")` and node:zlib alike, with `Z_BUF_ERROR:
+  // unexpected end of file` because there is no frame to parse. Without this
+  // check the client turned a normal empty reply into an exception. zstd
+  // happened to tolerate it on Node 22, which made the defect look
+  // runtime-specific when it was encoding-independent and had always been there.
   // ── Brotli (br) ──────────────────────────────────────────────────────────
   // WHATWG DecompressionStream does NOT support brotli in any current runtime.
   // On Node.js we use node:zlib.createBrotliDecompress() via a stream adapter.
@@ -611,15 +681,105 @@ export function decompressStream(
     // CompressionFormat is a browser type, we normalize to it
     // Type assertion is safe as we validated the encoding above
     const format = normalized as "gzip" | "deflate" | "deflate-raw";
-    const ds = new DecompressionStream(format);
-    // DecompressionStream and TransformStream have compatible pipeThrough signatures
-    // in all modern runtimes, but TypeScript doesn't recognize this type compatibility
-    // Type assertion is safe here as we've validated the format above
-    return stream.pipeThrough(ds as unknown as TransformStream<Uint8Array, Uint8Array>);
+    // Constructed here, inside this `try`, so an unrecognised format still
+    // throws synchronously and falls through to the pass-through below. Built
+    // lazily inside the stream it would throw from `start()`, where nothing
+    // catches it, and an unknown encoding would surface as an unhandled
+    // TypeError instead of the raw bytes.
+    const decoder = new DecompressionStream(format) as unknown as TransformStream<
+      Uint8Array,
+      Uint8Array
+    >;
+    return decodeUnlessEmpty(stream, decoder);
   } catch {
     // Unsupported format — return raw (caller sent Accept-Encoding conservatively)
     return stream;
   }
+}
+
+/**
+ * Decodes `source`, or yields nothing at all when `source` is empty.
+ *
+ * `DecompressionStream("gzip")` rejects a zero-byte stream with the same
+ * `Z_BUF_ERROR: unexpected end of file` the node:zlib decoders raise, because
+ * there is no frame to parse. An empty body carrying `Content-Encoding` is an
+ * ordinary response — an empty 204, an empty error body — so it must produce
+ * nothing rather than fail. zstd happened to tolerate this on Node 22, which
+ * made the defect look runtime-specific when it was encoding-independent.
+ *
+ * The decoder is constructed on the first non-empty chunk rather than up front,
+ * because that is the only point at which emptiness is known and this has to
+ * stay synchronous. Only the chunk that was already in flight is held, so a
+ * streaming body still streams.
+ */
+function decodeUnlessEmpty(
+  source: ReadableStream<Uint8Array>,
+  decoder: TransformStream<Uint8Array, Uint8Array>,
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      // A source may hand over zero-length chunks before its real payload, or
+      // instead of one — counting the chunk rather than its bytes would send an
+      // empty body to the decoder and get `Z_BUF_ERROR` back. So: read until
+      // something with bytes arrives, or the source ends.
+      let first: ReadableStreamReadResult<Uint8Array> | null = null;
+      for (;;) {
+        const next = await reader
+          .read()
+          .catch(() => ({ done: true, value: undefined }) as ReadableStreamReadResult<Uint8Array>);
+        if (next.done || next.value!.byteLength > 0) {
+          first = next;
+          break;
+        }
+      }
+      if (first!.done) {
+        // Nothing to decode: an empty body carrying a Content-Encoding is an
+        // ordinary response, not a malformed one.
+        controller.close();
+        return;
+      }
+
+      // Re-hydrate the peeked chunk in front of the rest of the source, then
+      // let `pipeThrough` do the piping. Doing the write/read interleaving by
+      // hand deadlocked on backpressure: a TransformStream's `write()` does not
+      // settle until its readable queue drains, and nothing was reading yet.
+      const rehydrated = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(first!.value!);
+        },
+        async pull(c) {
+          const next = await reader.read();
+          if (next.done) c.close();
+          else c.enqueue(next.value);
+        },
+        cancel(reason) {
+          void reader.cancel(reason).catch(() => undefined);
+        },
+      });
+
+      const out = rehydrated.pipeThrough(decoder);
+      const pump = out.getReader();
+      void (async () => {
+        try {
+          for (;;) {
+            const chunk = await pump.read();
+            if (chunk.done) {
+              controller.close();
+              return;
+            }
+            controller.enqueue(chunk.value);
+          }
+        } catch (err) {
+          controller.error(err);
+        }
+      })();
+    },
+    cancel(reason) {
+      void reader.cancel(reason).catch(() => undefined);
+    },
+  });
 }
 
 /**
@@ -683,6 +843,14 @@ function nodeZlibDecompressStream(
   // can land in that window — an immediately-aborted request is the common
   // case, not an edge one. Remember it and apply it once the reader exists.
   let cancelRequested = false;
+  // A zero-byte source is a legitimate response — an empty 204, an empty error
+  // body — and it carries a Content-Encoding header like any other. Every
+  // zlib decoder rejects it (`Z_BUF_ERROR: unexpected end of file`), so
+  // without this the client turned an ordinary empty reply into an exception.
+  // zstd happened to tolerate it on Node 22 only, which is why this went
+  // unnoticed: the failure looked runtime-specific and was actually encoding-
+  // independent, and had been there for gzip, deflate and br the whole time.
+  let sawBytes = false;
 
   return new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -720,9 +888,23 @@ function nodeZlibDecompressStream(
         while (true) {
           const { done, value } = await reader.read();
           if (done) {
+            // Nothing was ever fed to the decoder, so there is no frame to
+            // parse and nothing to fail on. Close with what we have: nothing.
+            if (!sawBytes) {
+              if (!settled) {
+                settled = true;
+                controller.close();
+              }
+              br.destroy();
+              break;
+            }
             br.end();
             break;
           }
+          // Count bytes, not chunks: a source may hand over a zero-length
+          // chunk and then close, which is still an empty body. Counting the
+          // chunk instead let exactly that case reach the decoder and fail.
+          if (value.byteLength > 0) sawBytes = true;
           br.write(value);
         }
       } catch (e) {
@@ -1614,12 +1796,12 @@ export function extractServerTiming(headers: Record<string, string>): ServerTimi
 // §14  UTILITIES
 // ============================================================================
 
-async function readBodyBytes(
+function readBodyBytes(
   response: Response,
   url: string,
   options: ResponseParseOptions,
 ): Promise<Uint8Array> {
-  if (!response.body) return new Uint8Array(0);
+  if (!response.body) return Promise.resolve(new Uint8Array(0));
 
   const headers = normalizeHeaders(response.headers);
   let stream: ReadableStream<Uint8Array> = response.body as ReadableStream<Uint8Array>;
@@ -1638,33 +1820,11 @@ async function readBodyBytes(
     return readBodyWithLimit(stream, url, options.sizeLimit, options.signal);
   }
 
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  try {
-    while (true) {
-      if (options.signal?.aborted) {
-        throw new DOMException("Response reading aborted", "AbortError");
-      }
-      const { done, value } = await readWithAbort(reader, options.signal);
-      if (done) {
-        // See readWithAbort: an aborted read also resolves as done.
-        if (options.signal?.aborted) {
-          throw new DOMException("Response reading aborted", "AbortError");
-        }
-        break;
-      }
-      chunks.push(value);
-    }
-  } finally {
-    // Cancel before releasing when we are bailing out, so the unread remainder
-    // of the body is discarded rather than left buffered on a released lock.
-    if (options.signal?.aborted) {
-      await reader.cancel("aborted").catch(() => {});
-    }
-    reader.releaseLock();
-  }
-
-  return concatUint8Arrays(chunks);
+  // No configured limit is the same read with an unreachable one. `newTotal`
+  // can never exceed `Infinity`, so the limit policy never engages and
+  // `onExceedCallback` never fires — which is exactly the previous behaviour,
+  // minus a second copy of the read loop to keep in step with the first.
+  return readBodyWithLimit(stream, url, { maxBytes: Infinity }, options.signal);
 }
 
 function applySizeLimit(
@@ -1699,27 +1859,25 @@ function applySizeLimit(
             break;
           }
 
-          const newTotal = bytesRead + value.byteLength;
-          if (newTotal > limit.maxBytes) {
-            limit.onExceedCallback?.(newTotal, limit.maxBytes);
-
-            if (onExceed === "throw") {
-              await reader.cancel("size limit");
-              controller.error(new ResponseSizeLimitError(newTotal, limit.maxBytes, url));
-              return;
-            }
-            if (onExceed === "abort") {
-              await reader.cancel("size limit");
-              controller.close();
-              return;
-            }
-            if (onExceed === "truncate") {
-              const remaining = limit.maxBytes - bytesRead;
-              if (remaining > 0) controller.enqueue(value.slice(0, remaining));
-              controller.close();
-              await reader.cancel("size limit");
-              return;
-            }
+          let action: LimitAction;
+          try {
+            action = limitAction(
+              value,
+              bytesRead,
+              limit,
+              onExceed,
+              (n, max) => new ResponseSizeLimitError(n, max, url),
+            );
+          } catch (err) {
+            await reader.cancel("size limit exceeded");
+            controller.error(err);
+            return;
+          }
+          if (action.kind !== "keep") {
+            if (action.kind === "truncate") controller.enqueue(action.chunk);
+            controller.close();
+            await reader.cancel("size limit exceeded");
+            return;
           }
 
           bytesRead += value.byteLength;

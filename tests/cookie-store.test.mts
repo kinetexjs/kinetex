@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { Kinetex } from "../src/client.ts";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 import { kinetex } from "../src/mod.ts";
 import { CookieJar, createCookieJar, loadCookieJar } from "../src/cookiejar.ts";
+import type { SameSite } from "../src/cookie-parser.ts";
 
 let passed = 0;
 let failed = 0;
@@ -24,7 +29,7 @@ function suite(name: string) {
 }
 
 const T = 30_000;
-const httpbin = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+const httpbin = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
 
 // ============================================================================
 // §1  setCookie — RFC 6265 §5.3 FULL COVERAGE
@@ -447,7 +452,7 @@ await test("fromJSON restores cookies and they can be retrieved", () => {
       maxAge: null,
       secure: false,
       httpOnly: false,
-      sameSite: "Unset",
+      sameSite: "Unset" as SameSite,
       createdAt: Date.now(),
       lastAccessed: Date.now(),
       hostOnly: true,
@@ -469,7 +474,7 @@ await test("fromJSON skips expired entries", () => {
       maxAge: null,
       secure: false,
       httpOnly: false,
-      sameSite: "Unset",
+      sameSite: "Unset" as SameSite,
       createdAt: Date.now(),
       lastAccessed: Date.now(),
       hostOnly: true,
@@ -490,7 +495,7 @@ await test("fromJSON from string works", () => {
       maxAge: null,
       secure: false,
       httpOnly: false,
-      sameSite: "Unset",
+      sameSite: "Unset" as SameSite,
       createdAt: Date.now(),
       lastAccessed: Date.now(),
       hostOnly: true,
@@ -518,7 +523,7 @@ await test("toString returns pretty JSON", () => {
       maxAge: null,
       secure: false,
       httpOnly: false,
-      sameSite: "Unset",
+      sameSite: "Unset" as SameSite,
       createdAt: 0,
       lastAccessed: 0,
       hostOnly: true,
@@ -837,7 +842,7 @@ await test("cookie with Max-Age and Expires both set uses Max-Age", () => {
   const expiresAttr = new Date(Date.now() + 86400000).toUTCString();
   jar.setCookie("x=1; Max-Age=3600; Expires=" + expiresAttr, { url: "https://example.com/" });
   const cookie = jar.getCookies({ url: "https://example.com/" })[0];
-  assert.notEqual(cookie.expires, null);
+  assert.ok(cookie.expires !== null);
 
   // Max-Age is relative to "now" and Expires is absolute, so the two differ by a
   // whole day. Asserting an exact millisecond count races against the clock
@@ -891,7 +896,12 @@ await test("SameSite context 'none' sends Unset and None cookies only", () => {
 suite("Real HTTP Integration");
 
 await test("kinetex cookie jar captures Set-Cookie from /cookies/set", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, cookieJar: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    cookieJar: true,
+    allowPrivateNetwork: true,
+  });
   await client.get("/cookies/set", { params: { battle: "test-value" }, throwOnError: false });
   // Verify the cookie was captured by checking /cookies
   const r = await client.get<{ cookies: Record<string, string> }>("/cookies");
@@ -904,7 +914,12 @@ await test("kinetex cookie jar captures Set-Cookie from /cookies/set", async () 
 });
 
 await test("kinetex cookie jar with multiple cookies from different requests", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, cookieJar: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    cookieJar: true,
+    allowPrivateNetwork: true,
+  });
   await client.get("/cookies/set", { params: { first: "alpha" }, throwOnError: false });
   await client.get("/cookies/set", { params: { second: "beta" }, throwOnError: false });
   const r = await client.get<{ cookies: Record<string, string> }>("/cookies");
@@ -912,8 +927,60 @@ await test("kinetex cookie jar with multiple cookies from different requests", a
   assert.equal(r.data.cookies["second"], "beta");
 });
 
+await test("SameSite=Lax and Strict cookies are sent on a same-site request", async () => {
+  // `getCookieHeader` was called with no SameSite context, so every request used
+  // the `"none"` context — which, by its own documented design, sends only
+  // `Unset` and `None`. A `SameSite=Lax` or `Strict` cookie was therefore never
+  // sent by this client, ever. Lax is what the overwhelming majority of real
+  // sites set, so this silently broke authentication against them: the request
+  // went out with no session cookie and the server answered 401.
+  let first = true;
+  const seen: string[] = [];
+  const srv = createServer((q, r) => {
+    seen.push(q.headers.cookie ?? "(none)");
+    if (first) {
+      first = false;
+      r.writeHead(200, {
+        "content-type": "application/json",
+        "set-cookie": [
+          "strictc=1; Path=/; SameSite=Strict",
+          "laxc=2; Path=/; SameSite=Lax",
+          "plainc=3; Path=/",
+        ],
+      });
+      r.end('{"ok":true}');
+      return;
+    }
+    r.writeHead(200, { "content-type": "application/json" });
+    r.end('{"ok":true}');
+  });
+  await new Promise<void>((res) => srv.listen(0, "127.0.0.1", res));
+  const port = (srv.address() as AddressInfo).port;
+  const client = new Kinetex({
+    baseURL: `http://127.0.0.1:${port}`,
+    allowPrivateNetwork: true,
+    cookieJar: true,
+  });
+  try {
+    await client.get("/set");
+    await client.get("/next");
+    const header = seen[1] ?? "";
+    assert.equal(header.includes("strictc=1"), true, "SameSite=Strict must be sent same-site");
+    assert.equal(header.includes("laxc=2"), true, "SameSite=Lax must be sent same-site");
+    assert.equal(header.includes("plainc=3"), true, "an Unset cookie must be sent");
+  } finally {
+    await client.destroy();
+    srv.close();
+  }
+});
+
 await test("kinetex cookie jar sends cookies back to same domain", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, cookieJar: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    cookieJar: true,
+    allowPrivateNetwork: true,
+  });
   // Set a cookie
   await client.get("/cookies/set", { params: { roundtrip: "working" }, throwOnError: false });
   // Verify it's sent on a subsequent request
@@ -922,14 +989,19 @@ await test("kinetex cookie jar sends cookies back to same domain", async () => {
   // Also verify the request to /headers shows the Cookie header
   const headers = await client.get<{ headers: Record<string, string> }>("/headers");
   assert.ok(
-    headers.data.headers["Cookie"]?.includes("roundtrip=working"),
-    `Cookie header should include roundtrip. Got: ${headers.data.headers["Cookie"]}`,
+    headers.data.headers["cookie"]?.includes("roundtrip=working"),
+    `Cookie header should include roundtrip. Got: ${headers.data.headers["cookie"]}`,
   );
 });
 
 await test("cookie jar with automatic redirect following", async () => {
   // httpbin /cookies/set redirects to /cookies, which should show the cookie
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T, cookieJar: true });
+  const client = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: T,
+    cookieJar: true,
+    allowPrivateNetwork: true,
+  });
   // Follow redirects and read response
   const r = await client.get<{ cookies: Record<string, string> }>("/cookies/set", {
     params: { redirecttest: "works" },
@@ -955,7 +1027,7 @@ await test("cookie jar with multiple Set-Cookie from response-headers", async ()
 });
 
 await test("direct CookieJar with real httpbin Set-Cookie", async () => {
-  const res = await httpbin.get("/cookies/set?direct=test", { redirect: "manual" });
+  const res = await httpbin.get("/cookies/set?direct=test", { followRedirects: false });
   const { extractSetCookieHeaders, parseSetCookieHeader } = await import("../src/cookie-parser.ts");
   const raw = extractSetCookieHeaders(res.headers);
   if (raw.length > 0) {
@@ -984,15 +1056,15 @@ await test("httpbin /cookies endpoint returns cookies object", async () => {
   const r = await httpbin.get("/cookies");
   assert.equal(r.status, 200);
   assert.ok(typeof r.data === "object");
-  assert.ok("cookies" in r.data);
+  assert.ok("cookies" in (r.data as object));
 });
 
 await test("httpbin basic endpoints accessible", async () => {
   assert.equal((await httpbin.get("/get")).status, 200);
   assert.equal((await httpbin.get("/ip")).status, 200);
-  assert.ok((await httpbin.get("/uuid")).data.uuid);
-  assert.ok((await httpbin.get("/headers")).data.headers);
-  assert.ok((await httpbin.get("/json")).data.slideshow);
+  assert.ok((await httpbin.get<{ uuid: string }>("/uuid")).data.uuid);
+  assert.ok((await httpbin.get<{ headers: unknown }>("/headers")).data.headers);
+  assert.ok((await httpbin.get<{ slideshow: unknown }>("/json")).data.slideshow);
   const base64 = await httpbin.get("/base64/SGVsbG8gV29ybGQ=");
   assert.equal(String(base64.data).trim(), "Hello World");
 });
@@ -1200,7 +1272,7 @@ await test("regression: getCookiesForDomain drops public-suffix cookies", () => 
       maxAge: null,
       secure: false,
       httpOnly: false,
-      sameSite: "Unset",
+      sameSite: "Unset" as SameSite,
       createdAt: Date.now(),
       lastAccessed: Date.now(),
       hostOnly: false,
@@ -1214,7 +1286,7 @@ await test("regression: getCookiesForDomain drops public-suffix cookies", () => 
       maxAge: null,
       secure: false,
       httpOnly: false,
-      sameSite: "Unset",
+      sameSite: "Unset" as SameSite,
       createdAt: Date.now(),
       lastAccessed: Date.now(),
       hostOnly: false,

@@ -10,6 +10,7 @@
  */
 
 import { randomBytes, uint8ArrayToBase64 } from "./utils.ts";
+import { sha256Hex } from "./utils.ts";
 
 type DigestHashAlgo = "MD5" | "SHA-256" | "SHA-512-256";
 
@@ -79,11 +80,14 @@ function md5(input: string): string {
   for (let offset = 0; offset < bytes.length; offset += 64) {
     const M: number[] = [];
     for (let i = 0; i < 16; i++) {
-      const b0 = bytes[offset + i * 4]!;
-      const b1 = bytes[offset + i * 4 + 1]!;
-      const b2 = bytes[offset + i * 4 + 2]!;
-      const b3 = bytes[offset + i * 4 + 3]!;
-      M[i] = (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) >>> 0;
+      // Named `w0..w3`, not `b0..b3`: `b0` shadowed the outer MD5 state variable
+      // of the same name, so the running state and the little-endian word read
+      // out of the block were indistinguishable at a glance.
+      const w0 = bytes[offset + i * 4]!;
+      const w1 = bytes[offset + i * 4 + 1]!;
+      const w2 = bytes[offset + i * 4 + 2]!;
+      const w3 = bytes[offset + i * 4 + 3]!;
+      M[i] = (w0 | (w1 << 8) | (w2 << 16) | (w3 << 24)) >>> 0;
     }
 
     let A = a0,
@@ -181,7 +185,7 @@ export interface DigestChallenge {
 function hexToBytes(hex: string): Uint8Array {
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
   }
   return out;
 }
@@ -260,14 +264,6 @@ export function parseDigestChallenge(header: string): DigestChallenge {
  * @param data - String to hash
  * @returns 64-char hex-encoded SHA-256 digest
  */
-async function sha256Hex(data: string): Promise<string> {
-  const enc = new TextEncoder();
-  const buf = await crypto.subtle.digest("SHA-256", enc.encode(data));
-  const bytes = new Uint8Array(buf);
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
 
 // ============================================================================
 // §3c  SHA-512/256 — Pure-JS (FIPS 180-4)
@@ -838,12 +834,37 @@ export function createDigestAuthorizer(): (
 ) => Promise<string> {
   const counters = new Map<string, number>();
 
+  // The server chooses the nonce, and nonce expiry is a routine server-side
+  // control, so a long-lived client sees a fresh `realm\u0000nonce` key on every
+  // challenge. Entries were never evicted, so the map grew by one key per
+  // challenge for the life of the process — keyed on strings an
+  // attacker-influenced server supplies. `Map` preserves insertion order, so
+  // dropping the first key evicts the oldest challenge.
+  //
+  // ponytail: bounded LRU-by-insertion-order rather than a TTL timer. Raise
+  // MAX_TRACKED_NONCES if a deployment is ever seen cycling nonces faster
+  // than this; a timer per key would be the alternative.
+  const MAX_TRACKED_NONCES = 64;
+  const rememberNonce = (scope: string, value: number): void => {
+    if (!counters.has(scope)) {
+      counters.set(scope, value);
+      if (counters.size > MAX_TRACKED_NONCES) {
+        const oldest = counters.keys().next();
+        if (!oldest.done) counters.delete(oldest.value);
+      }
+      return;
+    }
+    // Re-insert so a hot challenge counts as recently used.
+    counters.delete(scope);
+    counters.set(scope, value);
+  };
+
   return async (wwwAuth, username, password, method, uri) => {
     const challenge = parseDigestChallenge(wwwAuth);
     const cnonce = randomBytes(5);
     const scope = `${challenge.realm}\u0000${challenge.nonce}`;
     const next = (counters.get(scope) ?? 0) + 1;
-    counters.set(scope, next);
+    rememberNonce(scope, next);
     const nc = next.toString(16).padStart(8, "0");
     const response = await computeDigestResponse(
       challenge,

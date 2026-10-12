@@ -6,7 +6,7 @@
 
 import { ProgressTracker, withUploadProgress } from "./progress.ts";
 
-import { DedupMap, type DedupOptions } from "./dedup.ts";
+import { DedupMap, dedupKeyFrom, identityFingerprint, type DedupOptions } from "./dedup.ts";
 
 import {
   CircuitBreakerRegistry,
@@ -49,8 +49,10 @@ import {
   isSafeURL,
   uint8ArrayToBase64,
   randomBytes,
+  perfNow,
+  isSensitiveHeader,
 } from "./utils.ts";
-import { getAuthFingerprint, CREDENTIAL_HEADERS } from "./cache.ts";
+import { CREDENTIAL_HEADERS } from "./cache.ts";
 import { createRateLimitInterceptor, ConcurrencyLimiter } from "./interceptors.ts";
 import { SigV4Signer } from "./aws-sigv4.ts";
 import { createDigestAuthorizer } from "./digest.ts";
@@ -287,6 +289,16 @@ function randomHex(len: number): string {
  * Mirrors logging.ts DEFAULT_REDACT_HEADERS — HAR logs are routinely exported
  * and shared, so credentials must never appear verbatim.
  */
+/**
+ * Ceiling on a buffered response body when the caller sets no limit.
+ *
+ * Roughly the largest JSON document that is still sane to hand to
+ * `JSON.parse`, and far below the point where a single response can take a
+ * process down. Not a security boundary on its own — it is the difference
+ * between one bad response being a failed request and being an OOM kill.
+ */
+const DEFAULT_MAX_RESPONSE_SIZE = 100 * 1024 * 1024;
+
 const HAR_REDACT_HEADERS = new Set([
   "authorization",
   "proxy-authorization",
@@ -351,6 +363,88 @@ const HAR_REDACT_PARAMS = new Set([
   "code",
 ]);
 
+/**
+ * Body field names whose values are redacted from a recorded HAR body.
+ *
+ * The same names already redacted from HAR headers and query parameters.
+ * Headers were covered and query parameters were covered, but a JSON request
+ * body was recorded verbatim: `{"password":"..."}` went into the export in
+ * clear text while `{"password":"..."}` in a header was masked. HAR files get
+ * attached to bug reports and handed to support teams, so a body is the most
+ * likely place for a credential to travel. Nested objects and arrays are
+ * walked to any depth.
+ */
+/**
+ * Replace the literal values this request's own credentials take, anywhere in
+ * a recorded body.
+ *
+ * Field-name redaction cannot help a `text/plain` body, where there are no
+ * field names — and a server echoing a token back is the common case (an
+ * error body quoting the offending header, a "session invalid" message).
+ * Matching the exact values kinetex already knows are sensitive is precise: no
+ * pattern matching, no false positives on ordinary text.
+ */
+function scrubKnownSecrets(text: string, req: KinetexRequest): string {
+  const secrets: string[] = [];
+  // Credential headers are usually scheme-prefixed — `Bearer <token>` — and a
+  // body that echoes the token back echoes only the token, not the scheme.
+  // Scrubbing the whole header value would therefore match nothing.
+  const add = (v: string | undefined | null): void => {
+    if (typeof v === "string" && v.length >= 8) secrets.push(v);
+  };
+  for (const [name, value] of Object.entries(req.headers ?? {})) {
+    if (isSensitiveHeader(name, HAR_REDACT_HEADERS) && typeof value === "string") {
+      add(value);
+      const sp = value.indexOf(" ");
+      if (sp !== -1) add(value.slice(sp + 1));
+    }
+  }
+  let query: URLSearchParams;
+  try {
+    query = new URL(req.url).searchParams;
+  } catch {
+    query = new URLSearchParams();
+  }
+  for (const [key, value] of query.entries()) {
+    if (
+      HAR_REDACT_PARAMS.has(key.toLowerCase()) &&
+      typeof value === "string" &&
+      value.length >= 8
+    ) {
+      secrets.push(value);
+    }
+  }
+  let out = text;
+  for (const secret of secrets) out = out.split(secret).join(HAR_REDACT_MASK);
+  return out;
+}
+
+function redactHARBody(text: string, mimeType: string): string {
+  if (!/json/i.test(mimeType)) return text;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return text; // Not valid JSON despite the header; nothing safe to rewrite.
+  }
+  const walk = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(walk);
+    if (node !== null && typeof node === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+        out[key] = HAR_REDACT_PARAMS.has(key.toLowerCase()) ? HAR_REDACT_MASK : walk(value);
+      }
+      return out;
+    }
+    return node;
+  };
+  try {
+    return JSON.stringify(walk(parsed));
+  } catch {
+    return text;
+  }
+}
+
 /** Maximum number of body characters recorded in a HAR entry. */
 const HAR_MAX_BODY_CHARS = 8192;
 
@@ -396,10 +490,21 @@ function redactHARUrl(url: string): string {
 }
 
 /** Redact a single header value for HAR output. */
+/**
+ * HAR entries carry their own mask ("***REDACTED***"), distinct from the
+ * logger's "***" and the logging interceptor's "**REDACTED**". A recorded HAR
+ * is a file a user reads and shares, so the string is part of its output; the
+ * shared helper takes it as an argument rather than the three being merged.
+ */
+const HAR_REDACT_MASK = "***REDACTED***";
+
 function redactHARHeader(name: string, value: string): { name: string; value: string } {
-  return HAR_REDACT_HEADERS.has(name.toLowerCase())
-    ? { name, value: "***REDACTED***" }
-    : { name, value };
+  // A HAR stores headers as `{name, value}` pairs rather than a record, so it
+  // uses the shared case-insensitive predicate rather than the record helper.
+  return {
+    name,
+    value: isSensitiveHeader(name, HAR_REDACT_HEADERS) ? HAR_REDACT_MASK : value,
+  };
 }
 
 /**
@@ -428,7 +533,10 @@ function harPostData(req: KinetexRequest): { postData?: { mimeType: string; text
   } else {
     return {}; // stream / FormData / Blob: not readable without consuming it
   }
-  return { postData: { mimeType, text: text.slice(0, HAR_MAX_BODY_CHARS) } };
+  // Redact before truncating: truncating first could cut a redaction in half
+  // and leave the head of a secret in the export.
+  const redacted = scrubKnownSecrets(redactHARBody(text, mimeType), req);
+  return { postData: { mimeType, text: redacted.slice(0, HAR_MAX_BODY_CHARS) } };
 }
 
 class HARRecorder {
@@ -553,7 +661,12 @@ class HARRecorder {
           // Body text is only kept for non-HTML payloads and is truncated:
           // response bodies routinely carry tokens and PII.
           ...(typeof res.data === "string" && isHARBodySafeToRecord(res.headers["content-type"])
-            ? { text: res.data.slice(0, HAR_MAX_BODY_CHARS) }
+            ? {
+                // Same reason as the request side: a `text/plain` body has no
+                // field names to redact by, and a server that echoes the token
+                // back would otherwise put it in the export verbatim.
+                text: scrubKnownSecrets(res.data, req).slice(0, HAR_MAX_BODY_CHARS),
+              }
             : {}),
         },
         // The Location header can itself carry a signed URL — redact it too.
@@ -742,8 +855,54 @@ function buildURL(
   url: string,
   params: QueryParams | undefined,
   allowedSchemes: string[] = ["http", "https"],
+  allowPrivateNetwork = false,
 ): string {
   const MAX_QUERY_PARAM_COUNT = 100;
+
+  /**
+   * Walk query params once, enforcing the count limit, handing each surviving
+   * key/value pair to `emit`.
+   *
+   * `null` and `undefined` are dropped, and an array expands to one entry per
+   * non-null element. Both URL-assembly paths below did exactly this and each
+   * carried its own copy of the limit check — four copies of the same `throw`,
+   * inside two loops — so the two paths could drift and the cap could end up
+   * enforced in one spelling of the query but not the other.
+   *
+   * Encoding stays with the caller, and so does the array/scalar distinction:
+   * the primary path must `append` array elements (so `?a=1&a=2` survives) but
+   * `set` a scalar (so it replaces a value the URL already carried). The
+   * fallback appends to a list it is building and does not care. That
+   * difference is observable, so `emit` is told which case it is in.
+   */
+  const forEachQueryParam = (
+    params: Record<string, unknown>,
+    emit: (key: string, value: string, fromArray: boolean) => void,
+  ): void => {
+    let paramCount = 0;
+    const count = (): void => {
+      paramCount++;
+      if (paramCount > MAX_QUERY_PARAM_COUNT) {
+        throw new KinetexError(
+          `Query parameter count ${paramCount} exceeds limit of ${MAX_QUERY_PARAM_COUNT}`,
+          "EVALIDATION",
+        );
+      }
+    };
+    for (const [key, value] of Object.entries(params)) {
+      if (value === null || value === undefined) continue;
+      if (Array.isArray(value)) {
+        for (const v of value) {
+          if (v === null || v === undefined) continue;
+          count();
+          emit(key, String(v), true);
+        }
+      } else {
+        count();
+        emit(key, String(value), false);
+      }
+    }
+  };
   const MAX_URL_LENGTH = 8192;
 
   let full: string;
@@ -772,7 +931,7 @@ function buildURL(
   }
 
   if (!params || Object.keys(params).length === 0) {
-    if (!isSafeURL(full, allowedSchemes)) {
+    if (!isSafeURL(full, allowedSchemes, { allowPrivateNetwork })) {
       throw new KinetexError(
         `URL "${redactUserInfo(full)}" failed safety check — blocked private/loopback address or forbidden scheme`,
         "EVALIDATION",
@@ -785,41 +944,18 @@ function buildURL(
     const u = new URL(full);
     // The params branch screens the URL after appending them, so it needs the
     // same scheme list as the no-params branch above.
-    if (!isSafeURL(u, allowedSchemes)) {
+    if (!isSafeURL(u, allowedSchemes, { allowPrivateNetwork })) {
       throw new KinetexError(
         `URL "${redactUserInfo(full)}" failed safety check — blocked private/loopback address or forbidden scheme`,
         "EVALIDATION",
       );
     }
-    let paramCount = 0;
-
-    for (const [key, value] of Object.entries(params)) {
-      if (value === null || value === undefined) continue;
-      const strValue = String(value);
-      if (Array.isArray(value)) {
-        for (const v of value) {
-          if (v !== null && v !== undefined) {
-            paramCount++;
-            if (paramCount > MAX_QUERY_PARAM_COUNT) {
-              throw new KinetexError(
-                `Query parameter count ${paramCount} exceeds limit of ${MAX_QUERY_PARAM_COUNT}`,
-                "EVALIDATION",
-              );
-            }
-            u.searchParams.append(key, String(v));
-          }
-        }
-      } else {
-        paramCount++;
-        if (paramCount > MAX_QUERY_PARAM_COUNT) {
-          throw new KinetexError(
-            `Query parameter count ${paramCount} exceeds limit of ${MAX_QUERY_PARAM_COUNT}`,
-            "EVALIDATION",
-          );
-        }
-        u.searchParams.set(key, strValue);
-      }
-    }
+    // An array element appends, so `?a=1&a=2` survives; a scalar sets, so it
+    // replaces a value the URL already carried under that name.
+    forEachQueryParam(params, (key, value, fromArray) => {
+      if (fromArray) u.searchParams.append(key, value);
+      else u.searchParams.set(key, value);
+    });
     const result = u.toString();
 
     // Check URL length limit
@@ -831,7 +967,7 @@ function buildURL(
     }
 
     // Validate the final URL with params
-    if (!isSafeURL(result)) {
+    if (!isSafeURL(result, allowedSchemes, { allowPrivateNetwork })) {
       throw new KinetexError(
         `URL "${redactUserInfo(result)}" failed safety check — blocked private/loopback address or forbidden scheme`,
         "EVALIDATION",
@@ -848,34 +984,9 @@ function buildURL(
       full += "?";
     }
     const paramParts: string[] = [];
-    let paramCount = 0;
-
-    for (const [key, value] of Object.entries(params ?? {})) {
-      if (value === null || value === undefined) continue;
-      if (Array.isArray(value)) {
-        for (const v of value) {
-          if (v !== null && v !== undefined) {
-            paramCount++;
-            if (paramCount > MAX_QUERY_PARAM_COUNT) {
-              throw new KinetexError(
-                `Query parameter count ${paramCount} exceeds limit of ${MAX_QUERY_PARAM_COUNT}`,
-                "EVALIDATION",
-              );
-            }
-            paramParts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(v))}`);
-          }
-        }
-      } else {
-        paramCount++;
-        if (paramCount > MAX_QUERY_PARAM_COUNT) {
-          throw new KinetexError(
-            `Query parameter count ${paramCount} exceeds limit of ${MAX_QUERY_PARAM_COUNT}`,
-            "EVALIDATION",
-          );
-        }
-        paramParts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
-      }
-    }
+    forEachQueryParam(params ?? {}, (key, value) => {
+      paramParts.push(`${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
+    });
     const result = full + paramParts.join("&");
 
     // Check URL length limit
@@ -888,7 +999,7 @@ function buildURL(
 
     // FIX M4: the manual param-concat fallback previously returned WITHOUT a
     // safety check — validate the assembled URL like every other path.
-    if (!isSafeURL(result)) {
+    if (!isSafeURL(result, allowedSchemes, { allowPrivateNetwork })) {
       throw new KinetexError(
         `URL "${redactUserInfo(result)}" failed safety check — blocked private/loopback address or forbidden scheme`,
         "EVALIDATION",
@@ -957,9 +1068,40 @@ function mergeHeaders(
  * @param ctx - Current retry context (error, response, attempt count).
  * @returns Whether a retry should be attempted.
  */
+/**
+ * A request body rendered for a log entry, or `null` when it cannot be.
+ *
+ * A `ReadableStream` or a `FormData` is deliberately not consumed to log it:
+ * reading either would consume the payload the request is about to send, so
+ * logging would break the request it is describing.
+ */
+function loggableBody(body: unknown): string | Uint8Array | null {
+  if (body === null || body === undefined) return null;
+  if (typeof body === "string") return body;
+  if (body instanceof Uint8Array) return body;
+  try {
+    return JSON.stringify(body);
+  } catch {
+    // Cyclic, or otherwise not serialisable. The request still has to go out.
+    return null;
+  }
+}
+
 function shouldRetry(cfg: RetryConfig, ctx: RetryContext): boolean | Promise<boolean> {
   if (ctx.attempt > cfg.maxRetries) return false;
-  if (!cfg.methods.includes(ctx.request.method as HTTPMethod)) return false;
+  // `Idempotency-Key` is a declaration that this exact request may be
+  // repeated: the whole point of the header is that the server collapses
+  // duplicates. Without this, POST is never retried, so a caller who attached
+  // a key — which kinetex generates for exactly this purpose — still lost the
+  // request to the first transient 503, and the changelog's claim that "every
+  // retry reuses it" described retries that could never happen. A caller opts
+  // in by sending the header, which is the same contract the header carries.
+  const hasIdempotencyKey = Object.keys(ctx.request.headers ?? {}).some(
+    (name) => name.toLowerCase() === "idempotency-key" && ctx.request.headers![name] !== "",
+  );
+  if (!hasIdempotencyKey && !cfg.methods.includes(ctx.request.method as HTTPMethod)) {
+    return false;
+  }
   if (cfg.shouldRetry) return cfg.shouldRetry(ctx); // caller handles it
 
   if (ctx.error) {
@@ -986,6 +1128,10 @@ function shouldRetry(cfg: RetryConfig, ctx: RetryContext): boolean | Promise<boo
       case "EPROXY":
         return false;
       case "EREDIRECT":
+        return false;
+      // A blocked host is a permanent refusal, not a transport hiccup; retrying
+      // resolves the same name to the same blocked address.
+      case "EBLOCKEDHOST":
         return false;
       case "EUNKNOWN":
         return false;
@@ -1186,6 +1332,10 @@ export class Kinetex {
         ...(config.strictHeaders ? { strict: true } : {}),
         ...(config.dispatcher !== undefined ? { dispatcher: config.dispatcher } : {}),
         ...(config.proxy !== undefined ? { proxy: config.proxy } : {}),
+        ...(config.allowPrivateNetwork !== undefined
+          ? { allowPrivateNetwork: config.allowPrivateNetwork }
+          : {}),
+        ...(config.ca !== undefined ? { ca: config.ca } : {}),
       },
     );
 
@@ -1303,7 +1453,7 @@ export class Kinetex {
         status: ctx.response.status,
         statusText: ctx.response.statusText,
         headers: ctx.response.headers,
-        body: ctx.response.rawBody ?? null,
+        body: ctx.response.body ?? null,
         request: {
           url: ctx.request.url,
           method: ctx.request.method,
@@ -1730,12 +1880,13 @@ export class Kinetex {
     // check and threw EVALIDATION on every call, so `client.ws()` could not
     // connect to anything. Only the scheme list is widened: the loopback and
     // private-range checks still apply to WebSocket URLs.
-    const fullURL = buildURL(this.cfg.baseURL, url, this.cfg.params, [
-      "http",
-      "https",
-      "ws",
-      "wss",
-    ]);
+    const fullURL = buildURL(
+      this.cfg.baseURL,
+      url,
+      this.cfg.params,
+      ["http", "https", "ws", "wss"],
+      this.cfg.allowPrivateNetwork,
+    );
     const headers = mergeHeaders(this.cfg.headers, options.headers as Record<string, string>);
 
     // Apply auth headers manually since WS handshake goes through the browser
@@ -1768,7 +1919,11 @@ export class Kinetex {
     // Inject cookies from cookie jar into WS handshake
     const jar = await this.getCookieJar();
     if (jar) {
-      const cookieHeader = jar.getCookieHeader({ url: fullURL, http: false });
+      const cookieHeader = jar.getCookieHeader({
+        url: fullURL,
+        http: false,
+        sameSiteContext: "strict",
+      });
       if (cookieHeader) headers["cookie"] = cookieHeader;
     }
 
@@ -1777,7 +1932,14 @@ export class Kinetex {
       const wsUrl = new URL(fullURL);
       if (this.cfg.baseURL) {
         const baseUrl = new URL(this.cfg.baseURL);
-        const wsIsSecure = wsUrl.protocol === "wss:";
+        // `https:` counts as secure here, not just `wss:`. `fullURL` comes
+        // from `buildURL` against the same baseURL, so it carries the baseURL's
+        // own scheme — `https:` — and the WebSocket upgrade happens later, in
+        // the runtime's `WebSocket`. Testing for `wss:` alone therefore made
+        // `wsIsSecure` false for every https baseURL while `httpIsSecure` was
+        // true, so `client.ws()` rejected its own configuration and could not
+        // open a socket at all. The error even printed two identical origins.
+        const wsIsSecure = wsUrl.protocol === "wss:" || wsUrl.protocol === "https:";
         // A baseURL may itself be a WebSocket URL — `kinetex({ baseURL:
         // "wss://…" })` then `client.ws("/path")` is the natural spelling, and
         // it is what the README's origin-validation section shows. Comparing
@@ -1845,6 +2007,12 @@ export class Kinetex {
 
     await client.connect().catch((err) => {
       this._wsClients.delete(client);
+      // Destroy, not just deregister. A handshake that fails before `open`
+      // rejects with the socket still referenced by the WSClient — its
+      // handlers, its buffer and the underlying handle — so dropping the
+      // registry entry alone left it alive and holding a socket for the life of
+      // the process. A caller that retried on failure leaked one per attempt.
+      client.destroy();
       throw err;
     });
 
@@ -1878,8 +2046,24 @@ export class Kinetex {
       options.timeout !== undefined ? options.timeout : (this.cfg.timeout ?? 30_000);
 
     // ── Resolve retry ──────────────────────────────────────────────────────
+    // `totalTimeoutMs` defaults to the request timeout, so `timeout` bounds the
+    // whole logical request rather than each attempt. It applied per attempt
+    // only, while the backoff between attempts was bounded by nothing: with
+    // `timeout: 1_000`, five retries and a growing `baseDelayMs`, an instantly
+    // failing endpoint held the caller for ~37s. Anyone who reads `timeout` as
+    // "this call must not take longer than this" — most people — was wrong.
+    // `timeout: 0` (no timeout) likewise yields no budget, and an explicit
+    // `totalTimeoutMs: 0` opts back out.
     const retryCfg: RetryConfig | false =
-      options.retry === false ? false : { ...this.retryConfig, ...(options.retry ?? {}) };
+      options.retry === false
+        ? false
+        : {
+            ...this.retryConfig,
+            ...(options.retry ?? {}),
+            ...(options.retry?.totalTimeoutMs !== undefined
+              ? {}
+              : { totalTimeoutMs: options.totalTimeoutMs ?? this.cfg.totalTimeoutMs ?? timeoutMs }),
+          };
 
     // ── Validate HTTP method ────────────────────────────────────────────────
     const VALID_METHODS = [
@@ -1906,6 +2090,8 @@ export class Kinetex {
       options.baseURL ?? this.cfg.baseURL,
       url,
       mergeParams(this.cfg.params, options.params),
+      undefined,
+      this.cfg.allowPrivateNetwork === true,
     );
 
     // A client-level `proxy` is honoured by the Node transport, which tunnels
@@ -2096,7 +2282,11 @@ export class Kinetex {
     // ── Cookie jar (outgoing cookies) ──────────────────────────────────────
     const jar = await this.getCookieJar();
     if (jar) {
-      const cookieHeader = jar.getCookieHeader({ url: req.url, http: true });
+      const cookieHeader = jar.getCookieHeader({
+        url: req.url,
+        http: true,
+        sameSiteContext: "strict",
+      });
       if (cookieHeader) req = { ...req, headers: { ...req.headers, cookie: cookieHeader } };
     }
 
@@ -2112,6 +2302,7 @@ export class Kinetex {
     // abandoning it — an unended span is never exported and never reports the
     // error, and holds its attributes in the tracer's memory.
     let _otelSpan: OTelSpan | null = null;
+    let _dedupKey = "";
     try {
       if (this._otelTracer) {
         _otelSpan = this._otelTracer.startSpan(`HTTP ${req.method}`, { kind: 3 /* CLIENT */ });
@@ -2137,6 +2328,25 @@ export class Kinetex {
           headers: { ...req.headers, traceparent: `00-${traceId}-${spanId}-01` },
           meta: { ...req.meta, spanId },
         };
+      }
+
+      // Dedup key. Computed inside this try, not below it, so that a failure
+      // here ends the span instead of abandoning it. The auth fingerprint needs
+      // Web Crypto, so it can throw on a runtime without `crypto.subtle` — and
+      // because it is an `await`, the throw resumes here, outside the span's
+      // lifecycle when this block sat below the catch. The span was then never
+      // ended, never exported, and held its attributes in the tracer's memory.
+      if (this._dedup) {
+        // Fingerprint *every* header, not just the credential ones. Keying on
+        // `Authorization`/`Cookie` alone is what the comment above promised,
+        // and it held — for the two headers it covered. It did not cover the
+        // header a multi-tenant gateway actually partitions on: two concurrent
+        // GETs to one URL differing only in `X-Tenant` shared a single response,
+        // so one tenant was handed another's data. Hashing keeps the values out
+        // of the key itself, and the trace-id headers are excluded so they
+        // cannot silently disable coalescing.
+        const identity = await identityFingerprint(req.headers);
+        _dedupKey = dedupKeyFrom(req.method, req.url, identity);
       }
     } catch (tracingErr) {
       if (_otelSpan) {
@@ -2177,16 +2387,12 @@ export class Kinetex {
 
     // Dedup: coalesce identical concurrent GET/HEAD requests into one network
     // call. All callers share the same KinetexResponse object once resolved.
-    // SECURITY: The dedup key includes a fingerprint of auth-sensitive headers
-    // so requests from different users (different Authorization / Cookie) are
-    // NEVER coalesced — each user gets their own isolated in-flight slot.
-    // Fingerprinting hashes the credential headers with SHA-256, so it is only
-    // paid when dedup is actually enabled.
-    let _dedupKey = "";
-    if (this._dedup) {
-      const authFp = await getAuthFingerprint(req.headers ?? {});
-      _dedupKey = `${req.method}:${req.url}${authFp ? ":" + authFp : ""}`;
-    }
+    // SECURITY: the dedup key fingerprints every request header, so two
+    // requests are only ever coalesced when they would have received the same
+    // response — including when they differ only by tenant or session header.
+    // Fingerprinting hashes the header set with SHA-256, so credentials never
+    // sit in the key, and it is only paid when dedup is actually enabled. The
+    // key is computed inside the tracing try above, where a throw ends the span.
     const _dedupedFactory: () => Promise<KinetexResponse<T>> = this._dedup
       ? () =>
           (this._dedup as DedupMap<KinetexResponse<unknown>>)
@@ -2386,6 +2592,13 @@ export class Kinetex {
 
           if (doRetry) {
             const delay = computeRetryDelay(retryCfg, attempt, getRetryAfterMs(res.headers));
+            // Total budget: a backoff that would run past it is not worth
+            // sleeping through. The caller gets the response they already have
+            // (a retry-worthy status) instead of a manufactured timeout, which
+            // keeps the real reason visible.
+            if (retryCfg.totalTimeoutMs !== undefined && retryCfg.totalTimeoutMs > 0) {
+              if (perfNow() - startMs + delay >= retryCfg.totalTimeoutMs) return res;
+            }
             await retryCfg.onRetry?.(retryCtx, delay);
             await this.cfg.hooks?.onRetry?.reduce(async (p, fn) => {
               await p;
@@ -2463,6 +2676,14 @@ export class Kinetex {
               attempt,
               errResponse ? getRetryAfterMs(errResponse.headers) : null,
             );
+            // Total budget, as above: do not sleep past the caller's ceiling.
+            // Here there is no response to fall back on, so the original error
+            // stands and is rethrown below.
+            if (retryCfg.totalTimeoutMs !== undefined && retryCfg.totalTimeoutMs > 0) {
+              if (perfNow() - startMs + delay >= retryCfg.totalTimeoutMs) {
+                throw err;
+              }
+            }
             await retryCfg.onRetry?.(retryCtx, delay);
             await this.cfg.hooks?.onRetry?.reduce(async (p, fn) => {
               await p;
@@ -2659,7 +2880,11 @@ export class Kinetex {
           // public host could 302 the client straight at link-local/loopback
           // addresses (169.254.169.254, 127.0.0.1, 10/8, ::1, …) and the whole
           // private-network block list would be bypassable. Re-validate every hop.
-          if (!isSafeURL(nextUrl)) {
+          if (
+            !isSafeURL(nextUrl, undefined, {
+              allowPrivateNetwork: this.cfg.allowPrivateNetwork === true,
+            })
+          ) {
             throw new KinetexError(
               `Unsafe redirect target blocked: ${redactUserInfo(location)}`,
               "EVALIDATION",
@@ -2693,6 +2918,20 @@ export class Kinetex {
         const nextBody: BodyInit | null =
           nextMethod === "GET" || nextMethod === "HEAD" ? null : currentReq.body;
 
+        // A 307/308 keeps the method and the body, so the hop needs the body
+        // again — and a stream or Blob body is spent: the first attempt consumed
+        // and locked it. The retry loop already refuses this case with a clear
+        // EVALIDATION, but the follower had no equivalent check, so it handed
+        // the dead stream to the transport and the caller got an opaque ENETWORK
+        // "Response body object should not be disturbed or locked".
+        if (nextBody !== null && isNonReplayableBody(nextBody)) {
+          throw new KinetexError(
+            "Cannot follow this redirect: a 307/308 preserves the method and body, and this request's body is a stream or Blob that the first attempt already consumed. Buffer it first, or disable redirects for this request.",
+            "EVALIDATION",
+            { request: currentReq },
+          );
+        }
+
         const nextHeaders = { ...currentReq.headers };
 
         // FIX H2: When the redirect crosses origins, strip credential-bearing
@@ -2725,7 +2964,13 @@ export class Kinetex {
         // Jar scoping guarantees only cookies that match the NEW origin are
         // attached, which is exactly the post-strip state we want.
         if (jar) {
-          const cookieHeader = jar.getCookieHeader({ url: nextUrl, http: true });
+          // Same context as the initial hop: a redirect followed to an origin the
+          // client chose is still a same-site request for cookie purposes.
+          const cookieHeader = jar.getCookieHeader({
+            url: nextUrl,
+            http: true,
+            sameSiteContext: "strict",
+          });
           if (cookieHeader) {
             nextHeaders["cookie"] = cookieHeader;
           } else {
@@ -2805,6 +3050,27 @@ export class Kinetex {
       }
     }
     this._trace(_traceId, "lifecycle_before", "end", startMs, attempt);
+
+    // ── Logger: request ────────────────────────────────────────────────────
+    // `HTTPLogger.logRequest` was fully implemented — it registers the id so
+    // the matching `logResponse` can recover the method, URL and duration —
+    // and the client never called it. Nothing had ever been registered, so
+    // every response entry came back with `url: ""`, `method: "GET"`,
+    // `durationMs: 0` and `requestId: "unknown"`: the request line was simply
+    // missing, and a structured log that cannot name the request it describes
+    // is not much use for diagnosing one. Registered here, before dispatch, so
+    // it covers the same span the response entry closes.
+    const _logger = await this.getLogger();
+    if (_logger) {
+      _logger.logRequest(
+        _traceId,
+        req.method,
+        req.url,
+        req.headers,
+        loggableBody(req.body),
+        attempt,
+      );
+    }
 
     // ── Cache lookup ───────────────────────────────────────────────────────
     // `noCache()` sets `cache: { forceRefresh: true }`, and `forceRefresh` was
@@ -3159,7 +3425,12 @@ export class Kinetex {
     }
 
     // ── Read body with size limit ──────────────────────────────────────────
-    const maxSize = options.maxResponseSize ?? this.cfg.maxResponseSize ?? 0;
+    // 100 MB by default rather than unbounded: without a cap a hostile or
+    // simply broken server can drive this process out of memory, because the
+    // body is read in full before the caller sees a byte of it. An explicit
+    // `0` opts back out, which is what that value has always meant.
+    const maxSize =
+      options.maxResponseSize ?? this.cfg.maxResponseSize ?? DEFAULT_MAX_RESPONSE_SIZE;
     const rawBody = await readRawBody(bodyStream, maxSize, raw.url, req.signal);
 
     // ── Cookie jar (incoming Set-Cookie) ──────────────────────────────────
@@ -3193,6 +3464,9 @@ export class Kinetex {
       // the real response object instead of the `{}` placeholder it used to get.
       data,
       rawBody,
+      // The same bytes in the shape an interceptor sees, so one response
+      // object satisfies both the public and the pipeline views.
+      body: rawBody,
       url: raw.url,
       cached: false,
       redirected: raw.redirected,
@@ -3227,10 +3501,10 @@ export class Kinetex {
     }
 
     // ── Logger ─────────────────────────────────────────────────────────────
-    const logger = await this.getLogger();
+    const logger = _logger ?? (await this.getLogger());
     if (logger) {
       const requestId =
-        (ctx.store.get("requestId") as string) ?? (req.meta["requestId"] as string) ?? "unknown";
+        (ctx.store.get("requestId") as string) ?? (req.meta["requestId"] as string) ?? _traceId;
       logger.logResponse(
         requestId,
         res.status,
@@ -3467,6 +3741,8 @@ export class Kinetex {
       status: raw.status,
       statusText: raw.statusText,
       headers: raw.headers,
+      // Present so the object satisfies both response views at once.
+      body: rawBody,
       data,
       rawBody,
       url: responseURL,
@@ -3622,7 +3898,13 @@ export class Kinetex {
   ): Promise<import("./sse.ts").SSEClient> {
     const { SSEClient } = await import("./sse.ts");
     const headers = mergeHeaders(this.cfg.headers, options.headers);
-    const fullURL = buildURL(this.cfg.baseURL, url, this.cfg.params);
+    const fullURL = buildURL(
+      this.cfg.baseURL,
+      url,
+      this.cfg.params,
+      undefined,
+      this.cfg.allowPrivateNetwork,
+    );
 
     // Route through the full kinetex pipeline (auth, interceptors, rate-limit, CB, etc.)
     // by providing a pipeline-aware fetch function.
@@ -3675,7 +3957,13 @@ export class Kinetex {
   ): Promise<import("./graphql.ts").GraphQLClient> {
     const { GraphQLClient } = await import("./graphql.ts");
     const headers = mergeHeaders(this.cfg.headers, options.headers as Record<string, string>);
-    const fullURL = buildURL(this.cfg.baseURL, url, this.cfg.params);
+    const fullURL = buildURL(
+      this.cfg.baseURL,
+      url,
+      this.cfg.params,
+      undefined,
+      this.cfg.allowPrivateNetwork,
+    );
 
     // Route through the full kinetex pipeline (auth, interceptors, rate-limit, CB, OTel, etc.)
     const pipeFetch: typeof fetch = async (input, init) => {
@@ -3726,7 +4014,13 @@ export class Kinetex {
     options: Omit<import("./pagination.ts").PagePaginationOptions<T>, "url" | "fetch">,
   ): Promise<AsyncGenerator<import("./pagination.ts").Page<T>>> {
     const { createPagePaginator } = await import("./pagination.ts");
-    const fullURL = buildURL(this.cfg.baseURL, url, this.cfg.params);
+    const fullURL = buildURL(
+      this.cfg.baseURL,
+      url,
+      this.cfg.params,
+      undefined,
+      this.cfg.allowPrivateNetwork,
+    );
 
     // Route through the full kinetex pipeline
     const pipeFetch: typeof fetch = async (input, init) => {
@@ -4223,11 +4517,6 @@ function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
 function isNonReplayableBody(body: unknown): boolean {
   if (body instanceof ReadableStream) return true;
   return typeof Blob !== "undefined" && body instanceof Blob;
-}
-
-/** Cross-runtime performance.now() — falls back to Date.now(). */
-function perfNow(): number {
-  return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
 
 // ============================================================================

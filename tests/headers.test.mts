@@ -1,6 +1,6 @@
 /**
  * headers.ts — Real-world battle tests
- * Tests all HTTP headers features with real network calls.
+ * Tests all HTTP headers features against the local fixture, over real sockets.
  *
  * Run: npx tsx tests/headers.test.mts
  *
@@ -8,6 +8,7 @@
  */
 
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 import process from "node:process";
 import {
   kinetex,
@@ -51,22 +52,16 @@ import {
   fromNodeHeaders,
   toNodeHeaders,
   fromWebHeaders,
-  RichHeaders,
   createHeaders,
   createRequestHeaders,
   createResponseHeaders,
   createImmutableHeaders,
 } from "../src/mod.ts";
 // `parseContentType` exists in two places and `mod.ts` re-exports
-// `response.ts`'s — a deliberately narrowed, DoS-guarded wrapper. Importing it
-// from `mod.ts` meant this suite exercised the wrapper and never the
-// `headers.ts` function it exists to test, whose `params` field was therefore
-// untested. Take the module's own, like the three names above.
 import {
   parseContentLanguage,
-  parseWarning,
-  parseParams,
   parseContentType,
+  type ContentDispositionValue,
 } from "../src/headers.ts";
 import { parseContentType as parseContentTypeResponse } from "../src/mod.ts";
 
@@ -107,7 +102,7 @@ function suite(name: string): void {
 const T = 30_000;
 
 // Real HTTP client for external API calls
-const bin = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+const bin = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
 
 suite("HttpHeaders - basic operations");
 
@@ -735,8 +730,9 @@ await test("GET /uuid returns unique ID", async () => {
 suite("REAL HTTP CALLS - httpbin.org JSON endpoint");
 
 const json = kinetex({
-  baseURL: "https://httpbin.org",
+  baseURL: HTTPBIN_LOCAL_ORIGIN,
   timeout: T,
+  allowPrivateNetwork: true,
 });
 
 await test("GET /json returns JSON response with headers", async () => {
@@ -749,9 +745,9 @@ await test("GET /get with custom header", async () => {
   const r = await json.get<{ headers: Record<string, string> }>("/get", {
     headers: { "x-api-key": "test-key" },
   });
-  console.log("    Custom header value:", r.data.headers["X-Api-Key"]);
+  console.log("    Custom header value:", r.data.headers["x-api-key"]);
   assert.equal(r.status, 200);
-  assert.equal(r.data.headers["X-Api-Key"], "test-key");
+  assert.equal(r.data.headers["x-api-key"], "test-key");
 });
 
 suite("Edge cases for header parsing");
@@ -1574,7 +1570,7 @@ await test("RichHeaders wwwAuthenticate getter with multiple challenges", async 
   const h = new RichHeaders();
   h.set("www-authenticate", 'Digest realm="test", nonce="abc", Basic realm="other"');
   const challenges = h.wwwAuthenticate;
-  assert.notEqual(challenges, null);
+  assert.ok(challenges !== null, "www-authenticate must yield at least one challenge");
   assert.ok(challenges.length >= 1, `got ${challenges.length} challenges`);
 });
 
@@ -1680,7 +1676,7 @@ await test("formatContentDisposition with non-ASCII filename adds RFC 5987", asy
     filename: "héllo.txt",
     name: null,
     params: new Map(),
-  } as ContentDispositionValue);
+  } as unknown as ContentDispositionValue);
   assert.equal(cd, "attachment; filename=\"héllo.txt\"; filename*=UTF-8''h%C3%A9llo.txt");
 });
 
@@ -1690,7 +1686,7 @@ await test("formatContentDisposition with name field", async () => {
     name: "field1",
     filename: null,
     params: new Map(),
-  } as ContentDispositionValue);
+  } as unknown as ContentDispositionValue);
   assert.equal(cd, 'form-data; name="field1"');
 });
 
@@ -2189,7 +2185,12 @@ await test("HttpHeaders diff detects differing NO_COMBINE headers", async () => 
 
 suite("Real HTTP: httpbin redirect");
 
-const noRedirect = kinetex({ baseURL: "https://httpbin.org", timeout: T, maxRedirects: 0 });
+const noRedirect = kinetex({
+  baseURL: HTTPBIN_LOCAL_ORIGIN,
+  timeout: T,
+  maxRedirects: 0,
+  allowPrivateNetwork: true,
+});
 
 await test("GET /response-headers returns custom header with Location", async () => {
   // httpbin's /response-headers can return arbitrary headers
@@ -2204,7 +2205,7 @@ await test("GET /response-headers returns custom header with Location", async ()
   // reported a pass.
   assert.equal(rh.location, "https://example.com");
   assert.equal(rh.get("location"), "https://example.com", "the header name is case-insensitive");
-  assert.equal(r.params ? undefined : undefined, undefined);
+  assert.equal(rh.get("location"), "https://example.com", "the echoed param must come back");
   assert.match(String(r.url), /[?&]Location=https%3A%2F%2Fexample\.com/);
 });
 
@@ -2306,7 +2307,6 @@ await test("formatters escape quotes in every parameter value", async () => {
       type: "form-data",
       name: `n${Q}ame`,
       filename: null,
-      params: new Map(),
     }),
     `form-data; name="n\\"ame"`,
   );
@@ -2939,14 +2939,14 @@ await test("the object-taking setters format rather than stringify", async () =>
   assert.match(csp.get("content-security-policy")!, /default-src/, "csp formats its map");
 
   const wa = new RichHeaders();
-  wa.wwwAuthenticate = [{ scheme: "Bearer", realm: "r", params: [] }];
+  wa.wwwAuthenticate = [{ scheme: "Bearer", realm: "r", params: new Map() }];
   assert.match(
     wa.get("www-authenticate")!,
     /Bearer realm="r"/,
     "wwwAuthenticate formats challenges",
   );
   const pa = new RichHeaders();
-  pa.proxyAuthenticate = [{ scheme: "Basic", realm: "p", params: [] }];
+  pa.proxyAuthenticate = [{ scheme: "Basic", realm: "p", params: new Map() }];
   assert.match(
     pa.get("proxy-authenticate")!,
     /Basic realm="p"/,
@@ -2958,7 +2958,7 @@ await test("the challenge setters omit an absent realm and empty params", async 
   // Both branches of `if (c.realm)` and `if (params)`: a challenge with
   // neither must format to the bare scheme, not to `scheme realm="undefined"`.
   const bare = new RichHeaders();
-  bare.wwwAuthenticate = [{ scheme: "Negotiate", realm: "", params: [] }];
+  bare.wwwAuthenticate = [{ scheme: "Negotiate", realm: "", params: new Map() }];
   assert.equal(
     bare.get("www-authenticate"),
     "Negotiate",
@@ -2967,7 +2967,7 @@ await test("the challenge setters omit an absent realm and empty params", async 
 
   const withParams = new RichHeaders();
   withParams.proxyAuthenticate = [
-    { scheme: "Bearer", realm: "r", params: [["error", '"invalid_token"']] },
+    { scheme: "Bearer", realm: "r", params: new Map([["error", '"invalid_token"']]) },
   ];
   assert.match(
     withParams.get("proxy-authenticate")!,

@@ -1,4 +1,5 @@
 import { kinetex } from "../src/mod.ts";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 import type { HTTPStatusError } from "../src/types.ts";
 import nodeAssert from "node:assert/strict";
 import { describe as nodeDescribe, it as nodeIt, after } from "node:test";
@@ -62,7 +63,7 @@ const describe = nodeDescribe;
 
 describe("mod - Core Exports", () => {
   it("kinetex factory creates Kinetex instance", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.get("/get", { throwOnError: false });
 
     console.log("kinetex factory - actual response:");
@@ -85,8 +86,8 @@ describe("mod - Core Exports", () => {
   });
 
   it("kinetex with default config", async () => {
-    const client = kinetex();
-    const res = await client.get("https://httpbin.org/get", { throwOnError: false });
+    const client = kinetex({ allowPrivateNetwork: true });
+    const res = await client.get(`${HTTPBIN_LOCAL_ORIGIN}/get`, { throwOnError: false });
 
     console.log("kinetex default config - actual response:");
     console.log(
@@ -107,7 +108,7 @@ describe("mod - Core Exports", () => {
 
 describe("mod - HTTP Methods", () => {
   it("GET request", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.get("/get");
 
     console.log("GET /get - actual response:");
@@ -127,7 +128,7 @@ describe("mod - HTTP Methods", () => {
   });
 
   it("POST request with JSON body", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.post("/post", { test: "value", number: 42 });
 
     console.log("POST /post - actual response:");
@@ -148,7 +149,7 @@ describe("mod - HTTP Methods", () => {
   });
 
   it("PUT request", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.put("/put", { data: "test" });
 
     console.log("PUT /put - actual response:");
@@ -168,7 +169,7 @@ describe("mod - HTTP Methods", () => {
   });
 
   it("PATCH request", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.patch("/patch", { patch: true });
 
     console.log("PATCH /patch - actual response:");
@@ -188,7 +189,7 @@ describe("mod - HTTP Methods", () => {
   });
 
   it("DELETE request", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.delete("/delete", { throwOnError: false });
 
     console.log("DELETE /delete - actual response:");
@@ -208,7 +209,7 @@ describe("mod - HTTP Methods", () => {
   });
 
   it("HEAD request", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.head("/get");
 
     console.log("HEAD /get - actual response:");
@@ -228,7 +229,7 @@ describe("mod - HTTP Methods", () => {
   });
 
   it("OPTIONS request", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.options("/get", { throwOnError: false });
 
     console.log("OPTIONS /get - actual response:");
@@ -250,7 +251,7 @@ describe("mod - HTTP Methods", () => {
 
 describe("mod - Fluent Request Builder", () => {
   it("GET with fluent chain", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const data = await client
       .GET("/get")
       .header("X-Custom", "header")
@@ -262,12 +263,12 @@ describe("mod - Fluent Request Builder", () => {
     console.log("Fluent GET - actual response:");
     console.log(JSON.stringify(data, null, 2));
 
-    assert.notEqual(data, null);
+    assert.ok(data !== null);
     client.destroy();
   });
 
   it("POST with fluent JSON body", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const data = await client
       .POST("/post")
       .withJSON({ fluent: true, method: "json" })
@@ -282,7 +283,7 @@ describe("mod - Fluent Request Builder", () => {
   });
 
   it("Fluent withBody", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client
       .POST("/post")
       .withBody("raw body content")
@@ -307,7 +308,7 @@ describe("mod - Fluent Request Builder", () => {
   });
 
   it("Fluent basic auth", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const data = await client.GET("/basic-auth/user/pass").basic("user", "pass").noThrow().json();
 
     console.log("Fluent basic auth - actual response:");
@@ -319,18 +320,18 @@ describe("mod - Fluent Request Builder", () => {
   });
 
   it("Fluent apiKey", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const data = await client.GET("/headers").apiKey("X-API-Key", "my-key").noThrow().json();
 
     console.log("Fluent apiKey - actual response:");
     console.log(JSON.stringify(data, null, 2));
 
-    assert.strictEqual(data.headers["X-Api-Key"], "my-key");
+    assert.strictEqual(data.headers["x-api-key"], "my-key");
     client.destroy();
   });
 
   it("Fluent retry", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.GET("/get").retry(2).noThrow().send();
 
     console.log("Fluent retry - actual response:");
@@ -351,7 +352,7 @@ describe("mod - Fluent Request Builder", () => {
   });
 
   it("Fluent text() method", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const text = await client.GET("/encoding/utf8").noThrow().text();
 
     console.log("Fluent text() - actual response:");
@@ -370,7 +371,7 @@ describe("mod - Fluent Request Builder", () => {
   });
 
   it("Fluent params() method", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const data = await client
       .GET("/get")
       .params({ page: "1", limit: "10", filter: "active" })
@@ -385,7 +386,7 @@ describe("mod - Fluent Request Builder", () => {
   });
 
   it("Fluent meta() method", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.GET("/get").meta({ requestId: "123", userId: 456 }).send();
 
     console.log("Fluent meta() - actual response:");
@@ -407,7 +408,8 @@ describe("mod - Fluent Request Builder", () => {
 
   it("Fluent noAuth() method", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       auth: { type: "bearer", token: "should-be-ignored" },
     });
     const res = await client.GET("/headers").noAuth().send();
@@ -425,7 +427,7 @@ describe("mod - Fluent Request Builder", () => {
     );
 
     assert.strictEqual(res.status, 200);
-    assert.ok(!res.data.headers["Authorization"]);
+    assert.ok(!res.data.headers["authorization"]);
     client.destroy();
   });
 
@@ -434,7 +436,8 @@ describe("mod - Fluent Request Builder", () => {
     // same single request. It is now measured against an endpoint that fails,
     // where the two differ.
     const failing = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       retry: { maxRetries: 5, retryDelayMs: 1 },
     });
     const seen = await failing.GET("/status/500").noRetry().noThrow().send();
@@ -443,7 +446,8 @@ describe("mod - Fluent Request Builder", () => {
     failing.destroy();
 
     const retrying = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       retry: { maxRetries: 2, retryDelayMs: 1 },
     });
     const retried = await retrying.GET("/status/500").noThrow().send();
@@ -452,7 +456,8 @@ describe("mod - Fluent Request Builder", () => {
     retrying.destroy();
 
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       retry: { maxRetries: 5 },
     });
     const res = await client.GET("/get").noRetry().send();
@@ -473,7 +478,7 @@ describe("mod - Fluent Request Builder", () => {
   });
 
   it("Fluent noCache() method", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.GET("/get").noCache().send();
 
     console.log("Fluent noCache() - actual response:");
@@ -492,7 +497,7 @@ describe("mod - Fluent Request Builder", () => {
   });
 
   it("Fluent noThrow() method", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.GET("/status/500").noThrow().send();
 
     console.log("Fluent noThrow() - actual response:");
@@ -512,7 +517,7 @@ describe("mod - Fluent Request Builder", () => {
   });
 
   it("Fluent subscribe() callback method", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const callbackCalled = await Promise.race([
       new Promise<boolean>((resolve) => {
         client.GET("/get").subscribe(
@@ -529,7 +534,7 @@ describe("mod - Fluent Request Builder", () => {
 
 describe("mod - Client Configuration", () => {
   it("baseURL configuration", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.get("/get");
 
     console.log("baseURL config - actual response:");
@@ -544,14 +549,15 @@ describe("mod - Client Configuration", () => {
       ),
     );
 
-    assert.equal(res.request.url, "https://httpbin.org/get");
+    assert.equal(res.request.url, `${HTTPBIN_LOCAL_ORIGIN}/get`);
     assert.equal(res.status, 200);
     client.destroy();
   });
 
   it("headers configuration", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       headers: { "X-Global-Header": "global-value" },
     });
     const res = await client.get<{ headers: Record<string, string> }>("/headers");
@@ -568,13 +574,14 @@ describe("mod - Client Configuration", () => {
       ),
     );
 
-    assert.strictEqual(res.data.headers["X-Global-Header"], "global-value");
+    assert.strictEqual(res.data.headers["x-global-header"], "global-value");
     client.destroy();
   });
 
   it("params configuration", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       params: { globalParam: "globalValue" },
     });
     const res = await client.get<{ args: Record<string, string> }>("/get");
@@ -598,7 +605,8 @@ describe("mod - Client Configuration", () => {
 
   it("timeout configuration", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       timeout: 60000,
     });
     const res = await client.get("/get", { throwOnError: false });
@@ -627,14 +635,18 @@ describe("mod - Client Configuration", () => {
 
     // The half of the contract that can actually fail: a budget smaller than
     // the endpoint's delay rejects with ETIMEOUT rather than hanging.
-    const impatient = kinetex({ baseURL: "https://httpbin.org", timeout: 1 });
+    const impatient = kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
+      timeout: 1,
+    });
     let caught: unknown = null;
     try {
       await impatient.get("/delay/3", { throwOnError: false });
     } catch (err) {
       caught = err;
     }
-    assert.notEqual(caught, null, "a 1ms budget must reject against /delay/3");
+    assert.ok(caught !== null, "a 1ms budget must reject against /delay/3");
     assert.strictEqual((caught as { code?: string }).code, "ETIMEOUT");
     assert.strictEqual((caught as { timeoutMs?: number }).timeoutMs, 1);
     impatient.destroy();
@@ -642,7 +654,8 @@ describe("mod - Client Configuration", () => {
 
   it("throwOnError: false", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       throwOnError: false,
     });
     const res = await client.get("/status/404");
@@ -665,7 +678,8 @@ describe("mod - Client Configuration", () => {
 
   it("followRedirects configuration", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       followRedirects: true,
     });
     const res = await client.get("/redirect/1", { throwOnError: false });
@@ -694,18 +708,23 @@ describe("mod - Client Configuration", () => {
     // The counterpart the file never had. `redirected` used to be `true` on
     // this path — a caller branching on it to spot a cross-origin bounce was
     // told it had been redirected somewhere it never went.
-    const client = kinetex({ baseURL: "https://httpbin.org", followRedirects: false });
+    const client = kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
+      followRedirects: false,
+    });
     const res = await client.get("/redirect/1", { throwOnError: false });
     assert.strictEqual(res.status, 302);
     assert.strictEqual(res.redirected, false, "no hop was taken");
-    assert.strictEqual(res.url, "https://httpbin.org/redirect/1");
+    assert.strictEqual(res.url, `${HTTPBIN_LOCAL_ORIGIN}/redirect/1`);
     assert.ok(res.headers["location"], "the caller is handed the Location to act on");
     client.destroy();
   });
 
   it("maxRedirects configuration", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       maxRedirects: 5,
     });
     const res = await client.get("/redirect/1", { throwOnError: false });
@@ -728,7 +747,8 @@ describe("mod - Client Configuration", () => {
 
   it("httpVersion configuration", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       httpVersion: "HTTP/1.1" as const,
     });
     const res = await client.get("/get", { throwOnError: false });
@@ -754,7 +774,8 @@ describe("mod - Client Configuration", () => {
 describe("mod - Authentication", () => {
   it("bearer token auth", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       auth: { type: "bearer", token: "test-token" },
     });
     const res = await client.get<{ headers: Record<string, string> }>("/headers");
@@ -772,13 +793,14 @@ describe("mod - Authentication", () => {
     );
 
     assert.strictEqual(res.status, 200);
-    assert.strictEqual(res.data.headers["Authorization"], "Bearer test-token");
+    assert.strictEqual(res.data.headers["authorization"], "Bearer test-token");
     client.destroy();
   });
 
   it("basic auth", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       auth: { type: "basic", username: "user", password: "pass" },
     });
     const res = await client.get("/basic-auth/user/pass", { throwOnError: false });
@@ -801,7 +823,8 @@ describe("mod - Authentication", () => {
 
   it("apikey auth", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       auth: { type: "apikey", header: "X-API-Key", key: "my-key" },
     });
     const res = await client.get<{ headers: Record<string, string> }>("/headers");
@@ -819,13 +842,14 @@ describe("mod - Authentication", () => {
     );
 
     assert.strictEqual(res.status, 200);
-    assert.strictEqual(res.data.headers["X-Api-Key"], "my-key");
+    assert.strictEqual(res.data.headers["x-api-key"], "my-key");
     client.destroy();
   });
 
   it("custom auth", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       auth: {
         type: "custom",
         apply: async (req) => ({
@@ -855,7 +879,8 @@ describe("mod - Authentication", () => {
 
   it("async bearer token function", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       auth: { type: "bearer", token: async () => "async-token" },
     });
     const res = await client.get<{ headers: Record<string, string> }>("/headers");
@@ -873,7 +898,7 @@ describe("mod - Authentication", () => {
     );
 
     assert.strictEqual(res.status, 200);
-    assert.strictEqual(res.data.headers["Authorization"], "Bearer async-token");
+    assert.strictEqual(res.data.headers["authorization"], "Bearer async-token");
     client.destroy();
   });
 });
@@ -884,7 +909,8 @@ describe("mod - Interceptors", () => {
     // request interceptors passed: nothing below looked at `seen`.
     const seen: Array<{ method: string; url: string; attempt: number }> = [];
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       interceptors: {
         request: [
           (ctx) => {
@@ -921,7 +947,7 @@ describe("mod - Interceptors", () => {
     );
 
     assert.strictEqual(res.status, 200);
-    assert.deepEqual(seen, [{ method: "GET", url: "https://httpbin.org/get", attempt: 1 }]);
+    assert.deepEqual(seen, [{ method: "GET", url: `${HTTPBIN_LOCAL_ORIGIN}/get`, attempt: 1 }]);
     client.destroy();
   });
 
@@ -929,7 +955,8 @@ describe("mod - Interceptors", () => {
     let interceptorCalled = false;
 
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       interceptors: {
         response: [
           (ctx) => {
@@ -977,7 +1004,8 @@ describe("mod - Interceptors", () => {
     let errorInterceptorCalled = false;
 
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       interceptors: {
         error: [
           (ctx) => {
@@ -1019,7 +1047,7 @@ describe("mod - Interceptors", () => {
     // request interceptor passed: the only assertion was the status, which the
     // server produced regardless.
     const seen: string[] = [];
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
 
     client.useRequest((ctx) => {
       seen.push(`${ctx.request.method} ${ctx.request.url}`);
@@ -1051,13 +1079,13 @@ describe("mod - Interceptors", () => {
     );
 
     assert.strictEqual(res.status, 200);
-    assert.deepEqual(seen, ["GET https://httpbin.org/get"]);
+    assert.deepEqual(seen, [`GET ${HTTPBIN_LOCAL_ORIGIN}/get`]);
     client.destroy();
   });
 
   it("useResponse() method", async () => {
     const seen: number[] = [];
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
 
     client.useResponse((ctx) => {
       if (ctx.response) {
@@ -1096,7 +1124,7 @@ describe("mod - Interceptors", () => {
 
   it("useError() method", async () => {
     const seen: string[] = [];
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
 
     client.useError((ctx) => {
       seen.push(
@@ -1130,7 +1158,8 @@ describe("mod - Lifecycle Hooks", () => {
     let hookCalled = false;
 
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       hooks: {
         onBeforeRequest: [
           (req, ctx) => {
@@ -1170,7 +1199,8 @@ describe("mod - Lifecycle Hooks", () => {
     const seenAfter: Array<{ method: string; url: string; attempt: number }> = [];
 
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       hooks: {
         onAfterRequest: [
           (req, ctx) => {
@@ -1198,7 +1228,9 @@ describe("mod - Lifecycle Hooks", () => {
     console.log("Response status:", res.status);
     assert.strictEqual(res.status, 200);
     assert.strictEqual(hookCalled, true, "onAfterRequest must run");
-    assert.deepEqual(seenAfter, [{ method: "GET", url: "https://httpbin.org/get", attempt: 1 }]);
+    assert.deepEqual(seenAfter, [
+      { method: "GET", url: `${HTTPBIN_LOCAL_ORIGIN}/get`, attempt: 1 },
+    ]);
     client.destroy();
   });
 
@@ -1206,7 +1238,8 @@ describe("mod - Lifecycle Hooks", () => {
     let hookCalled = false;
 
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       hooks: {
         onBeforeResponse: [
           (res, ctx) => {
@@ -1241,7 +1274,8 @@ describe("mod - Lifecycle Hooks", () => {
     let hookCalled = false;
 
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       hooks: {
         onAfterResponse: [
           (res, ctx) => {
@@ -1276,7 +1310,8 @@ describe("mod - Lifecycle Hooks", () => {
     let hookCalled = false;
 
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       hooks: {
         onError: [
           (err, ctx) => {
@@ -1314,7 +1349,8 @@ describe("mod - Lifecycle Hooks", () => {
     let hookCalled = false;
 
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       hooks: {
         onUploadProgress: [
           (event) => {
@@ -1339,7 +1375,8 @@ describe("mod - Lifecycle Hooks", () => {
     let hookCalled = false;
 
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       hooks: {
         onDownloadProgress: [
           (event) => {
@@ -1364,7 +1401,8 @@ describe("mod - Lifecycle Hooks", () => {
 describe("mod - Retry Configuration", () => {
   it("default retry config", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       retry: {
         maxRetries: 3,
         statuses: [500, 502, 503, 504],
@@ -1394,7 +1432,8 @@ describe("mod - Retry Configuration", () => {
     let retryCount = 0;
 
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       retry: {
         maxRetries: 2,
         statuses: [500],
@@ -1430,7 +1469,8 @@ describe("mod - Retry Configuration", () => {
 describe("mod - Cookie Jar", () => {
   it("cookieJar with true", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       cookieJar: true,
     });
 
@@ -1458,7 +1498,8 @@ describe("mod - Cookie Jar", () => {
 describe("mod - HAR Recording", () => {
   it("HAR recording enabled", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       har: true,
     });
 
@@ -1505,7 +1546,8 @@ describe("mod - HAR Recording", () => {
 
   it("clearHAR() method", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       har: true,
     });
 
@@ -1523,7 +1565,8 @@ describe("mod - HAR Recording", () => {
 describe("mod - Client Extend", () => {
   it("extend() creates child client", async () => {
     const parent = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       headers: { "X-Parent": "parent-value" },
     });
 
@@ -1566,10 +1609,10 @@ describe("mod - Client Extend", () => {
     assert.strictEqual(parentRes.status, 200);
     // What `extend` is *for*: the child keeps the parent's header and gains its
     // own. Neither was checked — the parent carried no header at all before.
-    assert.strictEqual(childRes.data.headers["X-Parent"], "parent-value");
-    assert.strictEqual(childRes.data.headers["X-Child"], "child-value");
+    assert.strictEqual(childRes.data.headers["x-parent"], "parent-value");
+    assert.strictEqual(childRes.data.headers["x-child"], "child-value");
     assert.strictEqual(
-      parentRes.data.headers["X-Child"],
+      parentRes.data.headers["x-child"],
       undefined,
       "the parent must not inherit from the child",
     );
@@ -1581,7 +1624,8 @@ describe("mod - Client Extend", () => {
 describe("mod - Deduplication", () => {
   it("enableDedup() and disableDedup()", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
     });
 
     client.enableDedup();
@@ -1613,7 +1657,7 @@ describe("mod - Deduplication", () => {
     // did nothing — and returned two different objects — passed.
     assert.equal(res1, res2, "a deduplicated response is the same object");
     const metrics = client.dedupMetrics;
-    assert.notEqual(metrics, null, "dedup is on, so metrics must exist");
+    assert.ok(metrics !== null, "dedup is on, so metrics must exist");
     assert.strictEqual(metrics!.totalRequests, 2);
     assert.strictEqual(metrics!.misses, 1);
     assert.strictEqual(metrics!.hits, 1);
@@ -1629,7 +1673,8 @@ describe("mod - Deduplication", () => {
 describe("mod - Circuit Breaker", () => {
   it("enableCircuitBreaker() and disableCircuitBreaker()", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
     });
 
     client.enableCircuitBreaker();
@@ -1658,13 +1703,13 @@ describe("mod - Circuit Breaker", () => {
     // which is true of `{}` — the value returned when no registry exists at
     // all. Nothing checked that a tripped circuit stops traffic, which is the
     // entire purpose of the call.
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
 
     client.enableCircuitBreaker({ failureThreshold: 5, resetTimeoutMs: 30_000 });
     assert.deepEqual(client.circuitSnapshots, {}, "no origin is tracked until one is used");
 
-    client.tripCircuit("https://httpbin.org");
-    const tripped = client.circuitSnapshots["https://httpbin.org"];
+    client.tripCircuit(`${HTTPBIN_LOCAL_ORIGIN}`);
+    const tripped = client.circuitSnapshots[`${HTTPBIN_LOCAL_ORIGIN}`];
     assert.notEqual(tripped, undefined, "tripCircuit must register the origin");
     assert.strictEqual(tripped!.state, "OPEN");
 
@@ -1676,16 +1721,16 @@ describe("mod - Circuit Breaker", () => {
     } catch (err) {
       caught = err;
     }
-    assert.notEqual(caught, null, "a tripped circuit must refuse the request");
+    assert.ok(caught !== null, "a tripped circuit must refuse the request");
     assert.strictEqual((caught as { code?: string }).code, "ECIRCUITOPEN");
     assert.strictEqual(
-      client.circuitSnapshots["https://httpbin.org"]!.totalRequests,
+      client.circuitSnapshots[`${HTTPBIN_LOCAL_ORIGIN}`]!.totalRequests,
       0,
       "a refused request must never be dispatched",
     );
 
-    client.resetCircuit("https://httpbin.org");
-    assert.strictEqual(client.circuitSnapshots["https://httpbin.org"]!.state, "CLOSED");
+    client.resetCircuit(`${HTTPBIN_LOCAL_ORIGIN}`);
+    assert.strictEqual(client.circuitSnapshots[`${HTTPBIN_LOCAL_ORIGIN}`]!.state, "CLOSED");
 
     // And the circuit really is open again afterwards.
     const res = await client.get("/get", { throwOnError: false });
@@ -1696,7 +1741,7 @@ describe("mod - Circuit Breaker", () => {
 
 describe("mod - send() method", () => {
   it("low-level send() with all options", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
 
     const res = await client.send("/get", "GET", {
       headers: { "X-Send-Header": "test" },
@@ -1725,7 +1770,7 @@ describe("mod - send() method", () => {
     assert.strictEqual(res.status, 200);
     // The test is named "with all options" and checked the status. Each option
     // is now read back off the request the server actually received.
-    assert.strictEqual(res.request.url, "https://httpbin.org/get?sendParam=value");
+    assert.strictEqual(res.request.url, `${HTTPBIN_LOCAL_ORIGIN}/get?sendParam=value`);
     assert.strictEqual(res.request.headers["x-send-header"], "test");
     assert.deepEqual(res.request.meta, { custom: "data" });
     assert.strictEqual(res.request.method, "GET");
@@ -1733,7 +1778,7 @@ describe("mod - send() method", () => {
   });
 
   it("send() with body and auth", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
 
     const res = await client.send("/post", "POST", {
       body: JSON.stringify({ key: "value" }),
@@ -1760,7 +1805,7 @@ describe("mod - send() method", () => {
   });
 
   it("send() with parseResponse", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
 
     const res = await client.send("/get", "GET", {
       parseResponse: (raw) => {
@@ -1796,7 +1841,7 @@ describe("mod - Progress Callbacks", () => {
   it("onUploadProgress option", async () => {
     let progressEvents: any[] = [];
 
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
 
     const res = await client.post(
       "/post",
@@ -1840,7 +1885,7 @@ describe("mod - Progress Callbacks", () => {
   it("onDownloadProgress option", async () => {
     let progressEvents: any[] = [];
 
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
 
     const res = await client.get("/bytes/500", {
       onDownloadProgress: (event) => {
@@ -1881,7 +1926,7 @@ describe("mod - Error Handling", () => {
     [500, "isServerError"],
   ] as const) {
     it(`HTTPStatusError for ${status}`, async () => {
-      const client = kinetex({ baseURL: "https://httpbin.org" });
+      const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
 
       let caught: unknown = null;
       try {
@@ -1889,7 +1934,7 @@ describe("mod - Error Handling", () => {
       } catch (err) {
         caught = err;
       }
-      assert.notEqual(caught, null, `${status} must reject with the default throwOnError`);
+      assert.ok(caught !== null, `${status} must reject with the default throwOnError`);
 
       const err = caught as HTTPStatusError;
       assert.equal(err.name, "HTTPStatusError");
@@ -1908,7 +1953,7 @@ describe("mod - Error Handling", () => {
       );
       assert.match(err.message, new RegExp(String(status)));
       assert.equal(err.request.method, "GET");
-      assert.equal(err.request.url, `https://httpbin.org/status/${status}`);
+      assert.equal(err.request.url, `${HTTPBIN_LOCAL_ORIGIN}/status/${status}`);
 
       client.destroy();
     });
@@ -1918,7 +1963,7 @@ describe("mod - Error Handling", () => {
     let successCalled = false;
     let successResponse: any = null;
 
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
 
     await client.get("/get", {
       onSuccess: (res) => {
@@ -1949,7 +1994,7 @@ describe("mod - Error Handling", () => {
     let errorCalled = false;
     let errorResponse: any = null;
 
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
 
     try {
       await client.get("/status/500", {
@@ -1987,7 +2032,7 @@ describe("mod - Error Handling", () => {
 
 describe("mod - Real API Tests", () => {
   it("httpbin.org/get", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.get<{
       url: string;
       args: Record<string, string>;
@@ -2015,7 +2060,7 @@ describe("mod - Real API Tests", () => {
   });
 
   it("httpbin.org/post", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.post<{
       data: string;
       json: Record<string, any>;
@@ -2039,7 +2084,8 @@ describe("mod - Real API Tests", () => {
 
   it("httpbin.org/headers", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       headers: { "X-Custom-Test": "header-value" },
     });
 
@@ -2062,7 +2108,7 @@ describe("mod - Real API Tests", () => {
   });
 
   it("httpbin.org/uuid", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.get<{ uuid: string }>("/uuid");
 
     console.log("Real API /uuid - actual response:");
@@ -2083,7 +2129,7 @@ describe("mod - Real API Tests", () => {
   });
 
   it("httpbin.org/bytes/100", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.get("/bytes/100", { throwOnError: false });
 
     console.log("Real API /bytes/100 - actual response:");
@@ -2105,7 +2151,7 @@ describe("mod - Real API Tests", () => {
   });
 
   it("httpbin.org/status/201", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.get("/status/201", { throwOnError: false });
 
     console.log("Real API /status/201 - actual response:");
@@ -2125,7 +2171,7 @@ describe("mod - Real API Tests", () => {
   });
 
   it("httpbin.org/redirect/1", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.get("/redirect/1", { throwOnError: false });
 
     console.log("Real API /redirect/1 - actual response:");
@@ -2151,7 +2197,7 @@ describe("mod - Real API Tests", () => {
   });
 
   it("httpbin.org/delay/1", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.get("/delay/1", { timeout: 10000, throwOnError: false });
 
     console.log("Real API /delay/1 - actual response:");
@@ -2171,7 +2217,7 @@ describe("mod - Real API Tests", () => {
   });
 
   it("httpbin.org/image", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.get("/image", { throwOnError: false });
 
     console.log("Real API /image - actual response:");
@@ -2200,7 +2246,7 @@ describe("mod - Real API Tests", () => {
   });
 
   it("httpbin.org/json", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.get("/json", { throwOnError: false });
 
     console.log("Real API /json - actual response:");
@@ -2222,7 +2268,8 @@ describe("mod - Real API Tests", () => {
 
   it("httpbin.org/anything", async () => {
     const client = kinetex({
-      baseURL: "https://httpbin.org",
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      allowPrivateNetwork: true,
       headers: { "Content-Type": "application/json" },
     });
 
@@ -2248,7 +2295,7 @@ describe("mod - Real API Tests", () => {
   });
 
   it("httpbin.org/encoding/utf8", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
     const res = await client.get("/encoding/utf8", { throwOnError: false });
 
     console.log("Real API /encoding/utf8 - actual response:");
@@ -2270,7 +2317,7 @@ describe("mod - Real API Tests", () => {
 
 describe("mod - AbortController", () => {
   it("request cancellation", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
 
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 100);
@@ -2596,7 +2643,7 @@ describe("Regressions (mod round)", () => {
     } catch (err) {
       caught = err;
     }
-    assert.notEqual(caught, null, "an endless chain must eventually be refused");
+    assert.ok(caught !== null, "an endless chain must eventually be refused");
     assert.equal((caught as { code?: string }).code, "EREDIRECT");
     assert.equal((caught as Error).name, "RedirectError");
     assert.match((caught as Error).message, /Too many redirects \(exceeded 3\)/);
@@ -2702,11 +2749,25 @@ describe("Regressions (mod round)", () => {
     const entry = json.getHAR().entries[0]!;
     assert.equal(entry.request.method, "POST");
     assert.equal(entry.request.postData?.mimeType, "application/json");
+    // The password is masked. It used to be asserted verbatim here, which
+    // pinned the leak in place: headers and query parameters were redacted from
+    // HAR output and this one body field was not, and HAR files get shared.
     assert.deepEqual(JSON.parse(entry.request.postData!.text), {
       user: "ada",
-      password: "hunter2",
+      password: "***REDACTED***",
     });
-    assert.equal(entry.request.bodySize, entry.request.postData!.text.length);
+    // `bodySize` is the size actually sent (HAR: "size of the request body in
+    // bytes"), while `postData.text` is the redacted rendering. They used to be
+    // equal, because the recorded text was the body verbatim; with redaction
+    // the mask makes the recorded text longer than what went on the wire, and
+    // asserting equality again would mean asserting that a secret is recorded
+    // in clear text. Both are pinned so the divergence stays deliberate.
+    assert.equal(
+      entry.request.bodySize,
+      new TextEncoder().encode('{"user":"ada","password":"hunter2"}').byteLength,
+      "bodySize reports the real bytes sent, not the redacted rendering",
+    );
+    assert.notEqual(entry.request.bodySize, entry.request.postData!.text.length);
     json.destroy();
 
     // A body whose content type is not safe to record is omitted rather than
@@ -2737,7 +2798,7 @@ describe("Regressions (mod round)", () => {
 
 describe("mod - destroy() method", () => {
   it("destroy() cleans up resources", async () => {
-    const client = kinetex({ baseURL: "https://httpbin.org" });
+    const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
 
     const res = await client.get("/get", { throwOnError: false });
 

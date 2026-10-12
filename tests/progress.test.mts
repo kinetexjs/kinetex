@@ -21,7 +21,7 @@ function suite(name: string) {
   console.log(`\n${name}`);
 }
 
-async function test(name: string, fn: () => Promise<void>) {
+async function test(name: string, fn: () => Promise<void> | void) {
   try {
     await fn();
     console.log(`  ✅ ${name}`);
@@ -63,8 +63,8 @@ function assertEqual<T>(a: T, b: T, note?: string) {
   }
 }
 
-function assertOk(val: unknown) {
-  if (!val) throw new Error(`Expected truthy got ${String(val)}`);
+function assertOk(val: unknown, message?: string) {
+  if (!val) throw new Error(message ?? `Expected truthy got ${String(val)}`);
 }
 
 /**
@@ -120,8 +120,10 @@ await test("update increments loaded and computes percent", async () => {
   assertEqual(s.done, false);
   // A rate exists the moment any time has passed, so the ETA does too — and
   // it must be finite and non-negative rather than Infinity.
-  assertOk(Number.isFinite(s.eta), `a finite ETA, got ${s.eta}`);
-  assertOk(s.eta >= 0, `a non-negative ETA, got ${s.eta}`);
+  assertOk(s.eta !== null, `a known total must yield an ETA, got ${s.eta}`);
+  const eta = s.eta ?? -1;
+  assertOk(Number.isFinite(eta), `a finite ETA, got ${eta}`);
+  assertOk(eta >= 0, `a non-negative ETA, got ${eta}`);
   assertOk(Number.isFinite(s.rate) && s.rate >= 0, `a non-negative finite rate, got ${s.rate}`);
   assertOk(s.elapsed >= 0, `a non-negative elapsed, got ${s.elapsed}`);
   assertEqual(t.bytesLoaded, 250, "and the getter agrees");
@@ -243,7 +245,12 @@ await test("isDone getter", async () => {
 
 await test("throttle limits callbacks", async () => {
   let count = 0;
-  const t = new ProgressTracker(10000, { throttleHz: 10, onProgress: () => count++ });
+  const t = new ProgressTracker(10000, {
+    throttleHz: 10,
+    onProgress: () => {
+      count++;
+    },
+  });
   // Rapid updates below minInterval should NOT trigger callback
   t.update(100);
   t.update(100);
@@ -536,7 +543,9 @@ suite("throttleProgress");
 
 await test("throttleProgress emits the first call and every done snapshot", async () => {
   let count = 0;
-  const fn = throttleProgress(() => count++, 0.1); // very low Hz → 10s window
+  const fn = throttleProgress(() => {
+    count++;
+  }, 0.1); // very low Hz → 10s window
   fn({ loaded: 100, total: 200, percent: 50, rate: 0, eta: null, elapsed: 100, done: false });
   // The first call is never throttled. It used to be: the baseline was 0 and
   // the gate is `now - last >= interval` against `performance.now()`, so for
@@ -1128,7 +1137,12 @@ await test("regression: the first progress event is never throttled away", async
   // feature whose whole purpose is to move.
   const seen: number[] = [];
 
-  const t1 = new ProgressTracker(1000, { throttleHz: 1, onProgress: (s) => seen.push(s.loaded) });
+  const t1 = new ProgressTracker(1000, {
+    throttleHz: 1,
+    onProgress: (s) => {
+      seen.push(s.loaded);
+    },
+  });
   t1.update(10);
   assertEqual(seen.length, 1, "the first update is delivered");
   t1.update(10);
@@ -1136,7 +1150,12 @@ await test("regression: the first progress event is never throttled away", async
 
   for (const hz of [0.5, 5, 10, 100]) {
     const got: number[] = [];
-    const t = new ProgressTracker(1000, { throttleHz: hz, onProgress: (s) => got.push(s.loaded) });
+    const t = new ProgressTracker(1000, {
+      throttleHz: hz,
+      onProgress: (s) => {
+        got.push(s.loaded);
+      },
+    });
     t.update(1);
     assertEqual(got.length, 1, `throttleHz ${hz} must still deliver the first update`);
   }
@@ -1145,7 +1164,9 @@ await test("regression: the first progress event is never throttled away", async
   const events: number[] = [];
   const t2 = new ProgressTracker(1000, {
     throttleHz: 0.5,
-    onProgress: (s) => events.push(s.loaded),
+    onProgress: (s) => {
+      events.push(s.loaded);
+    },
   });
   for (let i = 0; i < 20; i++) t2.update(50);
   const final = t2.complete();
@@ -1156,7 +1177,9 @@ await test("regression: the first progress event is never throttled away", async
 
   // `throttleProgress`, the standalone helper, had the identical flaw.
   let n = 0;
-  const throttled = throttleProgress(() => n++, 0.1);
+  const throttled = throttleProgress(() => {
+    n++;
+  }, 0.1);
   throttled({ loaded: 1, total: null, percent: null, rate: 0, eta: null, elapsed: 0, done: false });
   assertEqual(n, 1, "the standalone helper delivers its first call too");
   throttled({ loaded: 2, total: null, percent: null, rate: 0, eta: null, elapsed: 1, done: false });
@@ -1168,7 +1191,9 @@ await test("regression: the first progress event is never throttled away", async
 
   // hz 0 means "no throttle" and must still deliver everything.
   let all = 0;
-  const unthrottled = throttleProgress(() => all++, 0);
+  const unthrottled = throttleProgress(() => {
+    all++;
+  }, 0);
   for (let i = 0; i < 5; i++) {
     unthrottled({
       loaded: i,
@@ -1230,10 +1255,12 @@ await test("regression: an aborted upload is not reported as 100% complete", asy
       // never closes, so only the abort can end this
     },
   });
-  const seen: ProgressSnapshot[] = [];
+  const seen: import("../src/progress.ts").ProgressSnapshot[] = [];
   const { stream, tracker } = withUploadProgress(source, 100, {
     signal: ac.signal,
-    onProgress: (s) => seen.push(s),
+    onProgress: (s) => {
+      seen.push(s);
+    },
   });
 
   const reader = stream.getReader();
@@ -1286,8 +1313,12 @@ await test("regression: an aborted upload is not reported as 100% complete", asy
       c.close();
     },
   });
-  const cleanSeen: ProgressSnapshot[] = [];
-  const ok = withUploadProgress(clean, 100, { onProgress: (s) => cleanSeen.push(s) });
+  const cleanSeen: import("../src/progress.ts").ProgressSnapshot[] = [];
+  const ok = withUploadProgress(clean, 100, {
+    onProgress: (s) => {
+      cleanSeen.push(s);
+    },
+  });
   await new Response(ok.stream).arrayBuffer();
   assertEqual(ok.tracker.isDone, true, "a completed upload is still done");
   assertEqual(ok.tracker.snapshot().percent, 100, "and still 100%");
@@ -1329,7 +1360,7 @@ await test("regression: the aggregate percent is bounded below as well as above"
   assertEqual(multi.getOverall().overall.percent, 15, "30 of 200 bytes, floored at zero");
   // Without a filter on the parts there is no path to a negative aggregate, so
   // the value has to come from the clamp rather than from the arithmetic.
-  assertEqual(multi.getOverall().overall.percent >= 0, true, "and never negative");
+  assertEqual((multi.getOverall()?.overall?.percent ?? -1) >= 0, true, "and never negative");
 });
 
 await test("regression: createPartTracker retrieves the part it already made", async () => {

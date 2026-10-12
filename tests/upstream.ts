@@ -1,7 +1,11 @@
 /**
- * Upstream-drift detection for the suites that talk to live httpbin.
+ * Upstream-drift detection, for the rare case a suite talks to a third-party
+ * origin. No suite does any more — see tests/live-network.test.mts — but the
+ * classifier is still exported and still pinned, because the one thing it
+ * protects (a failure turning green without anyone noticing) is worth keeping
+ * testable for whoever needs it next.
  *
- * httpbin.org is a free public service. It rate-limits, and it answers
+ * A free public service is the usual origin for this. It rate-limits, and it answers
  * 429/502/503/504 from its own front end when it is unwell or loaded. That is
  * never a defect in this client, but it is indistinguishable from one unless it
  * is looked for: a red suite during someone else's outage is how a real
@@ -17,7 +21,7 @@
  * implementation here and one test file covering it.
  */
 
-/** Statuses httpbin returns when *it* is unwell, rather than when asked to. */
+/** Statuses a public service returns when *it* is unwell, rather than when asked to. */
 export const UPSTREAM_DRIFT = new Set([429, 502, 503, 504]);
 
 /** Error codes that mean the connection failed, not that the request was wrong. */
@@ -36,7 +40,7 @@ function isStatusish(n: number): boolean {
 /**
  * True when a failed status comparison is the third party drifting rather than
  * the client being wrong: both sides are HTTP statuses, they differ, and what
- * actually came back is one httpbin produces unprompted.
+ * actually came back is one such a service produces unprompted.
  *
  * Deliberately narrow. A 404 or 500 back from `/status/200` is a real failure
  * and must still fail the run, and a `500` is not excused either — httpbin
@@ -143,11 +147,16 @@ const GUARDED = new Set([
  * Everything else falls through to the real assert, so this can never mask a
  * genuine defect.
  */
-export function createDriftGuard<T extends Record<string, unknown>>(base: T): DriftGuard<T> {
+export function createDriftGuard<T extends object>(base: T): DriftGuard<T> {
   const sites: DriftSite[] = [];
   let failures = 0;
 
-  const assert = new Proxy(base, {
+  // Annotated, not inferred: TypeScript only treats a call as an assertion when
+  // every name in the call target carries an explicit type annotation. Inferred
+  // from `new Proxy(...)`, the destructured `assert` in the caller became a
+  // plain callable, which turned every guarded assertion into TS2775 and threw
+  // away the narrowing those assertions exist to provide.
+  const assert: T = new Proxy(base, {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver);
       if (typeof value !== "function") return value;

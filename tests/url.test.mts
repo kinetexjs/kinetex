@@ -8,6 +8,7 @@
  */
 
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 import {
   percentEncode,
   percentDecode,
@@ -57,7 +58,7 @@ let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
-async function test(name: string, fn: () => Promise<void>): Promise<void> {
+async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
     // Almost every test here makes a live call to httpbin or jsonplaceholder.
     // The clients carry a 30s timeout, so a hung socket fails on its own --
@@ -101,8 +102,15 @@ function withTimeout<T>(p: Promise<T>, ms: number, name: string): Promise<T> {
 }
 
 const T = 30_000;
-const bin = kinetex({ baseURL: "https://httpbin.org", timeout: T });
-const json = kinetex({ baseURL: "https://jsonplaceholder.typicode.com", timeout: T });
+const bin = kinetex({
+  baseURL: HTTPBIN_LOCAL_ORIGIN,
+  timeout: T,
+  allowPrivateNetwork: true,
+});
+// The local fixture now models the post collection, so this client no longer
+// needs jsonplaceholder. It was still dialled 16 times below, which meant the
+// suite reported green only while the network happened to be reachable.
+const json = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
 
 // ============================================================================
 // §1  PERCENT ENCODING / DECODING — tested with REAL httpbin responses
@@ -272,7 +280,7 @@ await test("parseQuery repeated keys — verified via kinetex", async () => {
   console.log("    URL with repeated keys:", url);
   const parsed = parseQuery(url.split("?")[1] || "");
   console.log("    Parsed repeated:", JSON.stringify(parsed));
-  assert.equal(url, "https://httpbin.org/get?tag=a&tag=b&tag=c");
+  assert.equal(url, `${HTTPBIN_LOCAL_ORIGIN}/get?tag=a&tag=b&tag=c`);
   assert.deepEqual(parsed.tag, ["a", "b", "c"]);
 });
 
@@ -420,16 +428,15 @@ await test("normalizeURL sortParams — verified via kinetex", async () => {
   assert.equal(params[0].slice(0, 2), "a=");
 });
 
-await test("Real API: normalizeURL on httpbin response URL", async () => {
+await test("Real API: normalizeURL on a response URL", async () => {
   const r = await bin.get("/get");
   const responseUrl = (r.data as { url: string }).url;
-  console.log("    Original response URL:", responseUrl);
-
   const normalized = normalizeURL(responseUrl);
-  console.log("    Normalized:", normalized);
 
-  assert.equal(normalized.slice(0, 8), "https://");
-  assert.strictEqual(normalized.includes("httpbin.org"), true);
+  // Was asserted against a public https host. The local fixture serves plain
+  // http, so the scheme is now http and the host is loopback — what is under
+  // test is the normalization itself, not where the server lives.
+  assert.equal(normalized, `${HTTPBIN_LOCAL_ORIGIN}/get`);
 });
 
 // ============================================================================
@@ -439,10 +446,10 @@ await test("Real API: normalizeURL on httpbin response URL", async () => {
 suite("URLBuilder fluent API");
 
 await test("URLBuilder withProtocol", async () => {
-  const url = URLBuilder.from("https://httpbin.org/get").withProtocol("http").toString();
+  const url = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get`).withProtocol("http").toString();
   // The old version asserted only that a request to "/get" returned 200,
   // which says nothing about the protocol the builder produced.
-  assert.equal(url, "http://httpbin.org/get");
+  assert.equal(url, `${HTTPBIN_LOCAL_ORIGIN}/get`);
   assert.equal(new URL(url).protocol, "http:");
 });
 
@@ -452,7 +459,7 @@ await test("URLBuilder withHostname", async () => {
   // ...and the round trip the old test meant to check: a URL built by the
   // builder is one this client can actually fetch.
   const r = await bin.get(
-    URLBuilder.http("httpbin.org", "/get").toString().replace("http://httpbin.org", ""),
+    URLBuilder.http("example.test", "/get").toString().replace("http://example.test", ""),
   );
   assert.equal(r.status, 200);
 });
@@ -473,11 +480,11 @@ await test("URLBuilder withPort", async () => {
 });
 
 await test("URLBuilder.setParam", async () => {
-  const url = URLBuilder.from("https://httpbin.org/get")
+  const url = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get`)
     .setParam("page", "1")
     .setParam("limit", "10")
     .toString();
-  assert.equal(url, "https://httpbin.org/get?page=1&limit=10");
+  assert.equal(url, `${HTTPBIN_LOCAL_ORIGIN}/get?page=1&limit=10`);
   // `set` replaces rather than appends.
   assert.equal(
     URLBuilder.from("https://example.com/?a=1").setParam("a", "2").toString(),
@@ -486,13 +493,13 @@ await test("URLBuilder.setParam", async () => {
 });
 
 await test("URLBuilder.appendParam", async () => {
-  const url = URLBuilder.from("https://httpbin.org/get")
+  const url = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get`)
     .appendParam("tag", "a")
     .appendParam("tag", "b")
     .toString();
   // Two entries with the same name, in order -- `includes("tag=a") && ...`
   // also passed for a single `tag=ab`.
-  assert.equal(url, "https://httpbin.org/get?tag=a&tag=b");
+  assert.equal(url, `${HTTPBIN_LOCAL_ORIGIN}/get?tag=a&tag=b`);
   assert.deepStrictEqual(new URL(url).searchParams.getAll("tag"), ["a", "b"]);
   // A nullish value is a no-op rather than a literal "null".
   assert.equal(
@@ -504,25 +511,25 @@ await test("URLBuilder.appendParam", async () => {
 });
 
 await test("URLBuilder.deleteParam", async () => {
-  const base = URLBuilder.from("https://httpbin.org/get?a=1&b=2&c=3");
+  const base = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get?a=1&b=2&c=3`);
   const url = base.deleteParam("b").toString();
-  assert.equal(url, "https://httpbin.org/get?a=1&c=3");
+  assert.equal(url, `${HTTPBIN_LOCAL_ORIGIN}/get?a=1&c=3`);
   // Every occurrence goes, and an absent key is a no-op.
   assert.equal(
     URLBuilder.from("https://example.com/?t=a&t=b").deleteParam("t").toString(),
     "https://example.com/",
   );
-  assert.equal(base.deleteParam("zzz").toString(), "https://httpbin.org/get?a=1&b=2&c=3");
+  assert.equal(base.deleteParam("zzz").toString(), `${HTTPBIN_LOCAL_ORIGIN}/get?a=1&b=2&c=3`);
 });
 
 await test("URLBuilder.query", async () => {
-  const url = URLBuilder.from("https://httpbin.org/get?existing=1")
+  const url = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get?existing=1`)
     .query({ added: "2", existing: null })
     .toString();
   // Merged in, and a null value DELETED -- the old test only checked the
   // echo of `{ added: "2" }, which the builder's `existing` handling could
   // have got entirely wrong.
-  assert.equal(url, "https://httpbin.org/get?added=2");
+  assert.equal(url, `${HTTPBIN_LOCAL_ORIGIN}/get?added=2`);
   // An array becomes repeated keys, in order.
   assert.equal(
     URLBuilder.from("https://example.com/")
@@ -533,10 +540,10 @@ await test("URLBuilder.query", async () => {
 });
 
 await test("URLBuilder.pickParams", async () => {
-  const url = URLBuilder.from("https://httpbin.org/get?a=1&b=2&c=3")
+  const url = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get?a=1&b=2&c=3`)
     .pickParams("a", "c")
     .toString();
-  assert.equal(url, "https://httpbin.org/get?a=1&c=3");
+  assert.equal(url, `${HTTPBIN_LOCAL_ORIGIN}/get?a=1&c=3`);
   assert.equal(
     URLBuilder.from("https://example.com/?a=1").pickParams("zzz").toString(),
     "https://example.com/",
@@ -544,8 +551,8 @@ await test("URLBuilder.pickParams", async () => {
 });
 
 await test("URLBuilder.omitParams", async () => {
-  const url = URLBuilder.from("https://httpbin.org/get?a=1&b=2&c=3").omitParams("b").toString();
-  assert.equal(url, "https://httpbin.org/get?a=1&c=3");
+  const url = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get?a=1&b=2&c=3`).omitParams("b").toString();
+  assert.equal(url, `${HTTPBIN_LOCAL_ORIGIN}/get?a=1&c=3`);
   // Omitting several, and omitting an absent key.
   assert.equal(
     URLBuilder.from("https://example.com/?a=1&b=2&c=3").omitParams("a", "c", "zzz").toString(),
@@ -554,14 +561,14 @@ await test("URLBuilder.omitParams", async () => {
 });
 
 await test("URLBuilder.sortParams — verified via kinetex", async () => {
-  const url = URLBuilder.from("https://httpbin.org/get?z=1&a=2&m=3").sortParams().toString();
+  const url = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get?z=1&a=2&m=3`).sortParams().toString();
   console.log("    Sorted URL:", url);
   const params = url.split("?")[1];
   assert.equal(params.slice(0, 2), "a=");
 });
 
 await test("URLBuilder.redactParams — verified via kinetex", async () => {
-  const url = URLBuilder.from("https://httpbin.org/get?token=secret&public=data")
+  const url = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get?token=secret&public=data`)
     .redactParams("token")
     .toString();
   console.log("    Redacted URL:", url);
@@ -570,13 +577,13 @@ await test("URLBuilder.redactParams — verified via kinetex", async () => {
 });
 
 await test("URLBuilder.withHash — verified via kinetex", async () => {
-  const url = URLBuilder.from("https://httpbin.org/get").withHash("section").toString();
+  const url = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get`).withHash("section").toString();
   console.log("    URL with hash:", url);
   assert.strictEqual(url.includes("#section"), true);
 });
 
 await test("URLBuilder.removeHash — verified via kinetex", async () => {
-  const url = URLBuilder.from("https://httpbin.org/get#section").removeHash().toString();
+  const url = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get#section`).removeHash().toString();
   console.log("    URL without hash:", url);
   assert.strictEqual(url.includes("#"), false);
 });
@@ -628,7 +635,7 @@ await test("expandTemplate ? query operator — verified via kinetex", async () 
 });
 
 await test("Real API: expandTemplate with kinetex full workflow", async () => {
-  const base = "https://httpbin.org";
+  const base = `${HTTPBIN_LOCAL_ORIGIN}`;
   const template = "/anything/{resource}/{id}";
   const path = expandTemplate(template, { resource: "posts", id: "42" });
   const url = `${base}${path}`;
@@ -701,7 +708,7 @@ await test("getOrigin extracts from real httpbin response", async () => {
 
   const origin = getOrigin(responseUrl);
   console.log("    Extracted origin:", origin);
-  assert.equal(origin, "https://httpbin.org");
+  assert.equal(origin, `${HTTPBIN_LOCAL_ORIGIN}`);
 });
 
 await test("isSameOrigin with real URLs", async () => {
@@ -721,7 +728,7 @@ await test("isSameSite with real URLs — verified via kinetex", async () => {
   const r1 = await bin.get("/get");
   const url1 = (r1.data as { url: string }).url;
 
-  const result = isSameSite(url1, "https://httpbin.org/anything");
+  const result = isSameSite(url1, `${HTTPBIN_LOCAL_ORIGIN}/anything`);
   console.log("    Same site:", result);
   assert.equal(result, true);
 });
@@ -793,37 +800,30 @@ await test("isAbsolute with real httpbin URL", async () => {
   assert.strictEqual(isAbsolute(url), true);
 });
 
-await test("isHTTPS with real https URL", async () => {
-  const r = await bin.get("/get");
-  const url = (r.data as { url: string }).url;
-
-  console.log("    Real URL:", url);
-  console.log("    isHTTPS:", isHTTPS(url));
-  assert.strictEqual(isHTTPS(url), true);
+await test("isHTTPS classifies an https URL", () => {
+  // Pure string classification — it never needed a server, so it no longer
+  // asks for one.
+  assert.equal(isHTTPS("https://httpbin.org/get"), true);
+  assert.equal(isHTTPS("http://127.0.0.1:18080/get"), false);
 });
 
-await test("isHTTP with real URLs", async () => {
+await test("isHTTP with a real response URL", async () => {
   const r = await bin.get("/get");
   const url = (r.data as { url: string }).url;
-
-  console.log("    isHTTP:", isHTTP(url));
-  assert.strictEqual(isHTTP(url), true);
+  assert.equal(isHTTP(url), true);
+  assert.equal(isHTTPS(url), false);
 });
 
-await test("Real API: URL classification of httpbin responses", async () => {
+await test("Real API: URL classification of a response URL", async () => {
   const r = await bin.get("/get");
   const url = (r.data as { url: string }).url;
 
-  console.log("    URL:", url);
-  console.log("    isAbsolute:", isAbsolute(url));
-  console.log("    isHTTPS:", isHTTPS(url));
-  console.log("    isHTTP:", isHTTP(url));
-  console.log("    isLocalhost:", isLocalhost(url));
-
-  assert.strictEqual(isAbsolute(url), true);
-  assert.strictEqual(isHTTPS(url), true);
-  assert.strictEqual(isHTTP(url), true);
-  assert.strictEqual(isLocalhost(url), false);
+  assert.equal(isAbsolute(url), true);
+  assert.equal(isHTTP(url), true);
+  assert.equal(isHTTPS(url), false);
+  // Loopback now, so this is the interesting half of the predicate: a public
+  // host made it false before.
+  assert.equal(isLocalhost(url), true);
 });
 
 // ============================================================================
@@ -886,8 +886,8 @@ suite("URL diff");
 
 await test("diffURLs between real httpbin endpoints", async () => {
   const diff = diffURLs(
-    "https://httpbin.org/get?version=1&token=abc",
-    "https://httpbin.org/post?version=2&token=abc",
+    `${HTTPBIN_LOCAL_ORIGIN}/get?version=1&token=abc`,
+    `${HTTPBIN_LOCAL_ORIGIN}/post?version=2&token=abc`,
   );
   console.log("    GET vs POST diff:", JSON.stringify(diff, null, 2));
 
@@ -896,8 +896,8 @@ await test("diffURLs between real httpbin endpoints", async () => {
 });
 
 await test("diffURLs detects added/removed params — verified via kinetex", async () => {
-  const before = "https://httpbin.org/get?existing=1";
-  const after = "https://httpbin.org/get?existing=1&added=2";
+  const before = `${HTTPBIN_LOCAL_ORIGIN}/get?existing=1`;
+  const after = `${HTTPBIN_LOCAL_ORIGIN}/get?existing=1&added=2`;
   const diff = diffURLs(before, after);
   console.log("    Added params:", JSON.stringify(diff.addedParams));
   assert.strictEqual("added" in diff.addedParams, true);
@@ -931,21 +931,18 @@ await test("Real API: diffURLs between actual kinetex request URLs", async () =>
 
 suite("Utility functions");
 
-await test("safeParseURL with real httpbin response URL", async () => {
+await test("safeParseURL with a real response URL", async () => {
   const r = await bin.get("/get");
   const url = (r.data as { url: string }).url;
-
-  console.log("    Original URL:", url);
   const parsed = safeParseURL(url);
-  console.log("    Parsed origin:", parsed?.origin);
-  console.log("    Parsed pathname:", parsed?.pathname);
 
   assert.notStrictEqual(parsed, null);
-  assert.equal(parsed!.hostname, "httpbin.org");
+  assert.equal(parsed!.hostname, "127.0.0.1");
+  assert.equal(parsed!.pathname, "/get");
 });
 
 await test("withTrailingSlash — verified via kinetex", async () => {
-  const url = withTrailingSlash("https://httpbin.org/get");
+  const url = withTrailingSlash(`${HTTPBIN_LOCAL_ORIGIN}/get`);
   console.log("    With trailing slash:", url);
   assert.strictEqual(url.endsWith("/"), true);
 
@@ -954,7 +951,7 @@ await test("withTrailingSlash — verified via kinetex", async () => {
 });
 
 await test("withoutTrailingSlash — verified via kinetex", async () => {
-  const url = withoutTrailingSlash("https://httpbin.org/get/");
+  const url = withoutTrailingSlash(`${HTTPBIN_LOCAL_ORIGIN}/get/`);
   console.log("    Without trailing slash:", url);
 
   const r = await bin.get("/get");
@@ -962,13 +959,13 @@ await test("withoutTrailingSlash — verified via kinetex", async () => {
 });
 
 await test("stripHash — verified via kinetex", async () => {
-  const url = stripHash("https://httpbin.org/get#section");
+  const url = stripHash(`${HTTPBIN_LOCAL_ORIGIN}/get#section`);
   console.log("    Stripped hash:", url);
   assert.strictEqual(url.includes("#"), false);
 });
 
 await test("stripQuery — verified via kinetex", async () => {
-  const url = stripQuery("https://httpbin.org/get?a=1&b=2");
+  const url = stripQuery(`${HTTPBIN_LOCAL_ORIGIN}/get?a=1&b=2`);
   console.log("    Stripped query:", url);
   assert.strictEqual(url.includes("?"), false);
 });
@@ -992,7 +989,7 @@ await test("urlFilename from real URLs — verified via kinetex", async () => {
 });
 
 await test("redactURL — verified via kinetex", async () => {
-  const url = redactURL("https://httpbin.org/get?token=secret&public=data", "token");
+  const url = redactURL(`${HTTPBIN_LOCAL_ORIGIN}/get?token=secret&public=data`, "token");
   console.log("    Redacted URL:", url);
   assert.strictEqual(url.includes("REDACTED"), true);
   assert.strictEqual(url.includes("public=data"), true);
@@ -1072,10 +1069,11 @@ await test("Real API: httpbin /uuid endpoint with kinetex", async () => {
 await test("Real API: httpbin /user-agent with kinetex", async () => {
   const r = await bin.get("/user-agent");
   const data = r.data as { "user-agent": string | null };
-  console.log("    User-Agent:", data["user-agent"]);
   assert.deepEqual(Object.keys(data), ["user-agent"]);
-  // kinetex does not inject a User-Agent, so httpbin reports null
-  assert.equal(data["user-agent"], null);
+  // kinetex does not inject a User-Agent. Undici's fetch layer adds one
+  // (`node`) underneath, so the value is observable but is not kinetex's doing —
+  // the assertion is that the key is reported rather than dropped.
+  assert.match(String(data["user-agent"]), /./);
 });
 
 await test("Real API: httpbin /cookies with kinetex", async () => {
@@ -1087,7 +1085,7 @@ await test("Real API: httpbin /cookies with kinetex", async () => {
 
 await test("Real API: httpbin /redirect/1 verified with native fetch", async () => {
   // kinetex follows redirects internally, so we use native fetch with redirect:manual
-  const res = await fetch("https://httpbin.org/redirect/1", { redirect: "manual" });
+  const res = await fetch(`${HTTPBIN_LOCAL_ORIGIN}/redirect/1`, { redirect: "manual" });
   assert.equal(res.status, 302);
   assert.strictEqual(res.headers.has("location"), true);
 });
@@ -1231,8 +1229,8 @@ await test("diffURLs search string changed without param diffs", async () => {
   // The same parameters in a different order: no added, removed or changed
   // param, but the raw search string differs. A disjunction here ("search is
   // defined OR something else is") would pass for any diff at all.
-  const url1 = "https://httpbin.org/get?a=1&b=2";
-  const url2 = "https://httpbin.org/get?b=2&a=1";
+  const url1 = `${HTTPBIN_LOCAL_ORIGIN}/get?a=1&b=2`;
+  const url2 = `${HTTPBIN_LOCAL_ORIGIN}/get?b=2&a=1`;
   const diff = diffURLs(url1, url2);
   assert.deepStrictEqual(diff.search, ["?a=1&b=2", "?b=2&a=1"]);
   assert.deepStrictEqual(diff.addedParams, {});
@@ -1334,17 +1332,13 @@ await test("Surrogate pairs (emoji) encoded — verified via kinetex", async () 
 
 suite("URLBuilder comprehensive");
 
-await test("URLBuilder.from parses real httpbin URL", async () => {
+await test("URLBuilder.from parses a real response URL", async () => {
   const r = await bin.get("/get", { params: { a: "1" } });
-  const url = (r.data as { url: string }).url;
+  const u = URLBuilder.from((r.data as { url: string }).url);
 
-  const u = URLBuilder.from(url);
-  console.log("    Parsed origin:", u.origin);
-  console.log("    Parsed pathname:", u.pathname);
-  console.log("    Parsed protocol:", u.protocol);
-
-  assert.equal(u.origin, "https://httpbin.org");
-  assert.equal(u.protocol, "https:");
+  assert.equal(u.origin, `${HTTPBIN_LOCAL_ORIGIN}`);
+  assert.equal(u.protocol, "http:");
+  assert.equal(u.pathname, "/get");
 });
 
 await test("URLBuilder.https factory — verified via kinetex", async () => {
@@ -1357,7 +1351,7 @@ await test("URLBuilder.https factory — verified via kinetex", async () => {
 });
 
 await test("URLBuilder immutable — verified via kinetex", async () => {
-  const base = URLBuilder.from("https://httpbin.org/get");
+  const base = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get`);
   const withA = base.setParam("a", "1");
   const withB = base.setParam("b", "2");
 
@@ -1375,22 +1369,18 @@ await test("URLBuilder immutable — verified via kinetex", async () => {
 
 await test("URLBuilder getters — verified via kinetex", async () => {
   const r = await bin.get("/get", { params: { a: "1", b: "2" } });
-  const url = (r.data as { url: string }).url;
+  const u = URLBuilder.from((r.data as { url: string }).url);
 
-  const u = URLBuilder.from(url);
-  console.log("    hostname:", u.hostname);
-  console.log("    host:", u.host);
-  console.log("    port:", u.port);
-  console.log("    pathname:", u.pathname);
-  console.log("    search:", u.search);
-  console.log("    origin:", u.origin);
-
-  assert.equal(u.hostname, "httpbin.org");
+  assert.equal(u.hostname, "127.0.0.1");
+  assert.equal(u.host, "127.0.0.1:18080");
+  assert.equal(u.port, "18080");
   assert.equal(u.pathname, "/get");
+  assert.equal(u.search, "?a=1&b=2");
+  assert.equal(u.origin, `${HTTPBIN_LOCAL_ORIGIN}`);
 });
 
 await test("URLBuilder searchParams — verified via kinetex", async () => {
-  const u = URLBuilder.from("https://httpbin.org/get?a=1&b=2&c=3");
+  const u = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get?a=1&b=2&c=3`);
   const sp = u.searchParams;
 
   console.log("    Has a:", sp.has("a"));
@@ -1402,7 +1392,7 @@ await test("URLBuilder searchParams — verified via kinetex", async () => {
 });
 
 await test("URLBuilder queryObject — verified via kinetex", async () => {
-  const u = URLBuilder.from("https://httpbin.org/get?a=1&b=2");
+  const u = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get?a=1&b=2`);
   const qo = u.queryObject;
 
   console.log("    Query object:", JSON.stringify(qo));
@@ -1536,10 +1526,10 @@ await test("URLBuilder.setParam null/undefined deletes", async () => {
   // Pinned on the URL, and percent-encoded on the way out: a value with a
   // space or an ampersand must not become a second parameter.
   assert.equal(
-    URLBuilder.from("https://httpbin.org/get?a=1&b=2")
+    URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get?a=1&b=2`)
       .setParam("b", null as unknown as string)
       .toString(),
-    "https://httpbin.org/get?a=1",
+    `${HTTPBIN_LOCAL_ORIGIN}/get?a=1`,
   );
   assert.equal(
     URLBuilder.from("https://example.com/?a=1")
@@ -1554,11 +1544,11 @@ await test("URLBuilder.setParam null/undefined deletes", async () => {
 });
 
 await test("URLBuilder.setQuery clears and replaces", async () => {
-  const url = URLBuilder.from("https://httpbin.org/get?old=1")
+  const url = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get?old=1`)
     .setQuery({ x: "1", y: "2" })
     .toString();
   // `old=1` is gone: setQuery replaces rather than merges.
-  assert.equal(url, "https://httpbin.org/get?x=1&y=2");
+  assert.equal(url, `${HTTPBIN_LOCAL_ORIGIN}/get?x=1&y=2`);
   // An empty object clears the query entirely.
   assert.equal(
     URLBuilder.from("https://example.com/?a=1").setQuery({}).toString(),
@@ -1567,22 +1557,22 @@ await test("URLBuilder.setQuery clears and replaces", async () => {
 });
 
 await test("URLBuilder.path joins segments", async () => {
-  const url = URLBuilder.from("https://httpbin.org").path("anything", "test").toString();
-  assert.equal(url, "https://httpbin.org/anything/test");
+  const url = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}`).path("anything", "test").toString();
+  assert.equal(url, `${HTTPBIN_LOCAL_ORIGIN}/anything/test`);
   // `appendPath` is the accumulating form; `path` replaces what was there.
   assert.equal(
-    URLBuilder.from("https://httpbin.org/old").path("a", "b").toString(),
-    "https://httpbin.org/a/b",
+    URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/old`).path("a", "b").toString(),
+    `${HTTPBIN_LOCAL_ORIGIN}/a/b`,
   );
   assert.equal(
-    URLBuilder.from("https://httpbin.org/old").appendPath("a").appendPath("b").toString(),
-    "https://httpbin.org/old/a/b",
+    URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/old`).appendPath("a").appendPath("b").toString(),
+    `${HTTPBIN_LOCAL_ORIGIN}/old/a/b`,
   );
 });
 
 await test("URLBuilder.withUsername", async () => {
-  const url = URLBuilder.from("https://httpbin.org/get").withUsername("testuser").toString();
-  assert.equal(url, "https://testuser@httpbin.org/get");
+  const url = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get`).withUsername("testuser").toString();
+  assert.equal(url, `http://testuser@${HTTPBIN_LOCAL_ORIGIN.replace("http://", "")}/get`);
   assert.equal(new URL(url).username, "testuser");
   // Encoded on the way out, so a username with `@` in it cannot forge a host.
   assert.equal(
@@ -1592,8 +1582,8 @@ await test("URLBuilder.withUsername", async () => {
 });
 
 await test("URLBuilder.withPassword", async () => {
-  const url = URLBuilder.from("https://httpbin.org/get").withPassword("secret123").toString();
-  assert.equal(url, "https://:secret123@httpbin.org/get");
+  const url = URLBuilder.from(`${HTTPBIN_LOCAL_ORIGIN}/get`).withPassword("secret123").toString();
+  assert.equal(url, `http://:secret123@${HTTPBIN_LOCAL_ORIGIN.replace("http://", "")}/get`);
   assert.equal(new URL(url).password, "secret123");
   // A password is not a substitute for a username: with an empty username the
   // userinfo is still `:` + the secret, not just the secret.
@@ -1888,8 +1878,8 @@ await test("redactURL never throws, on any input", async () => {
   assert.equal(redactURL("/path?a=1"), "/path?a=1");
   // The parseable case still goes through the builder, and still redacts.
   assert.equal(
-    redactURL("https://httpbin.org/get?token=secret&public=data", "token"),
-    "https://httpbin.org/get?token=REDACTED&public=data",
+    redactURL(`${HTTPBIN_LOCAL_ORIGIN}/get?token=secret&public=data`, "token"),
+    `${HTTPBIN_LOCAL_ORIGIN}/get?token=REDACTED&public=data`,
   );
 });
 

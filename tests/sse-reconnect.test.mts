@@ -20,7 +20,7 @@ let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
-async function test(name: string, fn: () => Promise<void>): Promise<void> {
+async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
     await fn();
     console.log(`  ✅  ${name}`);
@@ -125,7 +125,9 @@ await test("a clean server close triggers a reconnect with back-off", async () =
     // A back-off long enough that the pump does not spin the server.
     reconnectDelayMs: 80,
     reconnectJitter: 0.5,
-    onReconnect: (attempt) => reconnects.push(attempt),
+    onReconnect: (attempt) => {
+      reconnects.push(attempt);
+    },
   });
 
   try {
@@ -141,7 +143,10 @@ await test("a clean server close triggers a reconnect with back-off", async () =
     // restarts with the connection). Both look wrong, but fixing them is a
     // behaviour change, not a test change, so this only pins the parts that are
     // genuinely guaranteed: a reconnect happens and is reported.
-    assert.ok(client.health.totalReconnects >= 1, "totalReconnects must count the reconnections");
+    assert.ok(
+      client.streamHealth.totalReconnects >= 1,
+      "totalReconnects must count the reconnections",
+    );
   } finally {
     client.close();
     await h.close();

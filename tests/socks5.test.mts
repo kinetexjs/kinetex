@@ -10,12 +10,21 @@ import {
   denoTcpConnector,
 } from "../src/mod.ts";
 import type { Socks5ProxyConfig, Socks5Tunnel, TcpConnector } from "../src/socks5.ts";
+import { httpbinBaseUrl } from "./httpbin-local.ts";
+
+// The tunnel targets are loopback: the embedded proxy does the dialling, so a
+// local httpbin exercises exactly the same CONNECT/handshake/data path as a
+// public host would, without this suite needing the internet. Pointing it at
+// the real httpbin.org meant the tunnel tests passed or failed on the network's
+// mood — one of them read a real HTTP response, so a sandboxed run failed it
+// while the same file passed in isolation.
+const LOCAL_TARGET = { host: "127.0.0.1", port: Number(new URL(await httpbinBaseUrl()).port) };
 
 let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
-async function test(name: string, fn: () => Promise<void>): Promise<void> {
+async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
     await fn();
     console.log(`  ✅  ${name}`);
@@ -258,7 +267,7 @@ function createMockServer(
     let buf = Buffer.alloc(0);
     let state: "greeting" | "auth" | "request" = "greeting";
 
-    socket.on("data", (chunk) => {
+    socket.on("data", (chunk: Buffer) => {
       buf = Buffer.concat([buf, chunk]);
 
       if (state === "greeting") {
@@ -595,7 +604,15 @@ await test("a refused proxy dial is retried, an unresolvable one is not", async 
       throw err;
     },
   );
-  await assert.rejects(() => counting("example.com", 80, 500));
+  await assert.rejects(
+    () => counting("example.com", 80, 500),
+    (e: unknown) => {
+      assert.ok(e instanceof Socks5Error, `expected Socks5Error, got ${String(e)}`);
+      assert.equal(e.code, "SOCKS5_CONNECT_FAILED");
+      assert.match(e.message, /127\.0\.0\.1:1/);
+      return true;
+    },
+  );
   assert.strictEqual(dials, 3, "one initial attempt plus maxRetries=2");
 
   let dials2 = 0;
@@ -628,7 +645,10 @@ await test("connection refused throws", async () => {
   const refused = await assertFailsWithCode(
     createSocks5Tunnel(
       { host: "127.0.0.1", port: 1, connectTimeoutMs: 3000, maxRetries: 0 },
-      { host: "httpbin.org", port: 80 },
+      // A target that is visibly not the proxy: the assertion below is that
+      // the message names the proxy and never the target, and pointing both at
+      // 127.0.0.1 would make that check unfalsifiable.
+      { host: "target-that-must-not-be-named.invalid", port: 80 },
       nodeTcpConnector,
     ),
     "SOCKS5_CONNECT_FAILED",
@@ -636,7 +656,7 @@ await test("connection refused throws", async () => {
     true,
   );
   assert.ok(
-    !refused.message.includes("httpbin.org"),
+    !refused.message.includes("target-that-must-not-be-named.invalid"),
     `the message names the PROXY, never the target: ${refused.message}`,
   );
 });
@@ -788,7 +808,7 @@ await test("a connect failure propagates the underlying error unchanged", async 
 
 await test("connect timeout raises a retriable SOCKS5_TIMEOUT", async () => {
   await withFakeDeno(
-    () => never<Promise<FakeDenoConn>>(),
+    () => never<FakeDenoConn>(),
     async () => {
       await assert.rejects(
         () => denoTcpConnector("h", 1, 20),
@@ -1044,8 +1064,8 @@ await test("only username without password does not trigger auth", async () => {
   let receivedMethods: number[] = [];
   const server = createServer((socket) => {
     socket.once("data", (data) => {
-      const nMethods = data[1];
-      receivedMethods = Array.from(data.slice(2, 2 + nMethods));
+      const nMethods = (data as Buffer)[1]!;
+      receivedMethods = Array.from((data as Buffer).subarray(2, 2 + nMethods));
       // Reply no-auth
       socket.write(Buffer.from([5, 0]));
       // Then reply success to CONNECT
@@ -1273,7 +1293,15 @@ await test("regression: socks5Connector honours the per-call timeout", async () 
     { host: "proxy.invalid", port: 1080, connectTimeoutMs: 99_000, maxRetries: 0 },
     spy,
   );
-  await assert.rejects(() => connector("target.example", 443, 5_000));
+  await assert.rejects(
+    () => connector("target.example", 443, 5_000),
+    (e: unknown) => {
+      assert.ok(e instanceof Socks5Error, `expected Socks5Error, got ${String(e)}`);
+      assert.equal(e.code, "SOCKS5_CONNECT_FAILED");
+      assert.match(e.message, /proxy\.invalid:1080/);
+      return true;
+    },
+  );
   assert.deepStrictEqual(
     seen,
     [5_000],
@@ -1423,7 +1451,7 @@ await test("a proxy demanding user/password with no credentials configured is re
   const server = createServer((socket) => {
     let buf = Buffer.alloc(0);
     socket.on("error", () => {});
-    socket.on("data", (chunk) => {
+    socket.on("data", (chunk: Buffer) => {
       buf = Buffer.concat([buf, chunk]);
       if (buf.length < 2) return;
       const n = buf[1];
@@ -1729,7 +1757,17 @@ await test("socks5Connector with a zero per-call timeout falls back to the confi
     { host: "proxy.invalid", port: 1080, connectTimeoutMs: 99_000, maxRetries: 0 },
     spy,
   );
-  await assert.rejects(() => connector("target.example", 443, 0));
+  await assert.rejects(
+    () => connector("target.example", 443, 0),
+    (e: unknown) => {
+      // A Socks5Error from the dial spy passes through untouched; the
+      // normalization only applies to a foreign error.
+      assert.ok(e instanceof Socks5Error, `expected Socks5Error, got ${String(e)}`);
+      assert.equal(e.code, "SOCKS5_EOF");
+      assert.equal(e.message, "stop here");
+      return true;
+    },
+  );
   assert.deepStrictEqual(
     seen,
     [99_000],
@@ -1747,7 +1785,17 @@ await test("socks5Connector with neither a per-call nor a configured timeout use
     throw new Socks5Error("stop here", "SOCKS5_EOF");
   };
   const connector = socks5Connector({ host: "proxy.invalid", port: 1080, maxRetries: 0 }, spy);
-  await assert.rejects(() => connector("target.example", 443, 0));
+  await assert.rejects(
+    () => connector("target.example", 443, 0),
+    (e: unknown) => {
+      // The spy throws its own Socks5Error, which passes through untouched;
+      // only a foreign error is normalized to SOCKS5_CONNECT_FAILED.
+      assert.ok(e instanceof Socks5Error, `expected Socks5Error, got ${String(e)}`);
+      assert.equal(e.code, "SOCKS5_EOF");
+      assert.equal(e.message, "stop here");
+      return true;
+    },
+  );
   assert.deepStrictEqual(seen, [10_000], "the documented default applies");
 });
 
@@ -1857,7 +1905,10 @@ await test("a read issued after the socket errored rejects with that same error"
       const conn = await nodeTcpConnector("127.0.0.1", port, 5000);
       // Provoke and absorb the first error so the socket is in its errored
       // state and `lastError` is latched.
-      await assert.rejects(() => conn.read(new Uint8Array(16)));
+      await assert.rejects(
+        () => conn.read(new Uint8Array(16)),
+        (e: unknown) => e instanceof Error,
+      );
       // Now a *second* read. It has no pending counterpart and no data; only
       // the latch can end it.
       await assert.rejects(
@@ -1939,7 +1990,7 @@ const validConfig: Socks5ProxyConfig = {
 await test("establishes tunnel with valid credentials", async () => {
   const tunnel = await createSocks5Tunnel(
     validConfig,
-    { host: "httpbin.org", port: 80 },
+    { host: LOCAL_TARGET.host, port: LOCAL_TARGET.port },
     nodeTcpConnector,
   );
   assertTunnel(tunnel, "establishes tunnel with valid credentials");
@@ -1949,12 +2000,12 @@ await test("establishes tunnel with valid credentials", async () => {
 await test("sends HTTP GET through tunnel and receives valid response", async () => {
   const tunnel = await createSocks5Tunnel(
     validConfig,
-    { host: "httpbin.org", port: 80 },
+    { host: LOCAL_TARGET.host, port: LOCAL_TARGET.port },
     nodeTcpConnector,
   );
 
   const request = new TextEncoder().encode(
-    "GET /get HTTP/1.1\r\nHost: httpbin.org\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+    `GET /get HTTP/1.1\r\nHost: ${LOCAL_TARGET.host}\r\nAccept: application/json\r\nConnection: close\r\n\r\n`,
   );
   await tunnel.conn.write(request);
 
@@ -1973,14 +2024,14 @@ await test("sends HTTP GET through tunnel and receives valid response", async ()
 await test("sends HTTP POST with body through tunnel", async () => {
   const tunnel = await createSocks5Tunnel(
     validConfig,
-    { host: "httpbin.org", port: 80 },
+    { host: LOCAL_TARGET.host, port: LOCAL_TARGET.port },
     nodeTcpConnector,
   );
 
   const body = JSON.stringify({ kinetex: "test", proxy: "socks5" });
   const request = new TextEncoder().encode(
     `POST /post HTTP/1.1\r\n` +
-      `Host: httpbin.org\r\n` +
+      `Host: ${LOCAL_TARGET.host}\r\n` +
       `Content-Type: application/json\r\n` +
       `Content-Length: ${body.length}\r\n` +
       `Accept: application/json\r\n` +
@@ -2032,14 +2083,14 @@ await test("tunnel to IPv4 target works", async () => {
 
 await test("socks5Connector wrapper tunnels HTTP through proxy", async () => {
   const connector = socks5Connector(validConfig, nodeTcpConnector);
-  const conn = await connector("httpbin.org", 80, 10_000);
+  const conn = await connector(LOCAL_TARGET.host, LOCAL_TARGET.port, 10_000);
   assert.ok(conn !== null && typeof conn === "object", "the wrapper resolves with a TcpConn");
   assert.strictEqual(typeof conn.read, "function", "read");
   assert.strictEqual(typeof conn.write, "function", "write");
   assert.strictEqual(typeof conn.close, "function", "close");
 
   const request = new TextEncoder().encode(
-    "GET /status/200 HTTP/1.1\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n",
+    `GET /status/200 HTTP/1.1\r\nHost: ${LOCAL_TARGET.host}\r\nConnection: close\r\n\r\n`,
   );
   await conn.write(request);
 
@@ -2059,7 +2110,7 @@ await test("fails with wrong password (auth failure)", async () => {
     async () => {
       await createSocks5Tunnel(
         { ...validConfig, password: "wrongpassword" },
-        { host: "httpbin.org", port: 80 },
+        { host: LOCAL_TARGET.host, port: LOCAL_TARGET.port },
         nodeTcpConnector,
       );
     },
@@ -2077,7 +2128,7 @@ await test("fails with wrong username (auth failure)", async () => {
     async () => {
       await createSocks5Tunnel(
         { ...validConfig, username: "wronguser" },
-        { host: "httpbin.org", port: 80 },
+        { host: LOCAL_TARGET.host, port: LOCAL_TARGET.port },
         nodeTcpConnector,
       );
     },
@@ -2101,7 +2152,7 @@ await test("fails with no credentials when proxy requires auth", async () => {
           connectTimeoutMs: 10_000,
           handshakeTimeoutMs: 10_000,
         },
-        { host: "httpbin.org", port: 80 },
+        { host: LOCAL_TARGET.host, port: LOCAL_TARGET.port },
         nodeTcpConnector,
       );
     },
@@ -2125,7 +2176,7 @@ await test("fails with no credentials when proxy requires auth", async () => {
 await test("tunnel close is idempotent", async () => {
   const tunnel = await createSocks5Tunnel(
     validConfig,
-    { host: "httpbin.org", port: 80 },
+    { host: LOCAL_TARGET.host, port: LOCAL_TARGET.port },
     nodeTcpConnector,
   );
   assert.doesNotThrow(() => tunnel.conn.close());
@@ -2136,7 +2187,11 @@ await test("tunnel close is idempotent", async () => {
 await test("multiple sequential tunnels succeed", async () => {
   const tunnels = await Promise.all(
     Array.from({ length: 3 }, async () =>
-      createSocks5Tunnel(validConfig, { host: "httpbin.org", port: 80 }, nodeTcpConnector),
+      createSocks5Tunnel(
+        validConfig,
+        { host: LOCAL_TARGET.host, port: LOCAL_TARGET.port },
+        nodeTcpConnector,
+      ),
     ),
   );
 

@@ -20,7 +20,7 @@
 
 // FIX (H6): remote WS payloads are untrusted — parsed JSON dispatched to
 // listeners is stripped of prototype-pollution keys (see sanitizeParsedJSON).
-import { sanitizeParsedJSON } from "./utils.ts";
+import { sanitizeParsedJSON, isValidHeaderName, isValidHeaderValue } from "./utils.ts";
 
 // ============================================================================
 // §1  TYPES
@@ -214,6 +214,37 @@ export interface WSSubscribedRoom {
 // ============================================================================
 
 /** WebSocket connection or protocol error. */
+/**
+ * Reject a handshake header that cannot be represented as one.
+ *
+ * `client.ws()` builds an `authorization` header straight from the configured
+ * bearer token or API key and hands it to a `WSClient`, and `WSClient` applies
+ * it through the runtime's `setHeader` — with no validation anywhere on that
+ * path. The HTTP pipeline does validate: `mergeHeaders` runs
+ * `isValidHeaderName` / `isValidHeaderValue` and refuses control characters. A
+ * WebSocket configured through `client.ws()` therefore skipped the one check
+ * that stops a token containing `\r\n` from splitting into a second header on
+ * the handshake.
+ *
+ * Checked in the constructor rather than at connect time so the error names the
+ * configuration that is wrong, and so it cannot be reached by adding a header
+ * later — `_headers` is assigned once and never mutated.
+ */
+function validateHandshakeHeaders(headers: Record<string, string> | undefined): void {
+  if (!headers) return;
+  for (const [name, value] of Object.entries(headers)) {
+    if (!isValidHeaderName(name)) {
+      throw new WSError(`Invalid WebSocket handshake header name: ${JSON.stringify(name)}`);
+    }
+    if (!isValidHeaderValue(value)) {
+      throw new WSError(
+        `Invalid value for WebSocket handshake header ${JSON.stringify(name)}: ` +
+          "must be a string of printable characters with no control characters",
+      );
+    }
+  }
+}
+
 export class WSError extends Error {
   /** Machine-readable error code for WebSocket errors. */
   readonly code = "EWSCONNECT";
@@ -404,6 +435,7 @@ export class WSClient {
     this._url = cfg.url;
     this._protocols = cfg.protocols;
     this._headers = cfg.headers;
+    validateHandshakeHeaders(cfg.headers);
     this._maxReconnects = cfg.maxReconnects ?? 10;
     this._reconnectBaseMs = cfg.reconnectBaseMs ?? 1_000;
     this._reconnectMaxMs = cfg.reconnectMaxMs ?? 30_000;
@@ -1254,7 +1286,22 @@ export class WSClient {
 
   /** Buffer an outgoing message and track bytes for backpressure. */
   private _bufferMessage(data: string | ArrayBuffer, byteLen: number): void {
-    if (this._bufferMessages && !this._aborted) {
+    if (!this._bufferMessages) {
+      // With buffering switched off, a send made while the socket is not OPEN
+      // had nowhere to go: the buffer branch was skipped and nothing was sent.
+      // `send()` returns void, so there was no return value to inspect either
+      // — the message vanished with no error and no callback, which is data
+      // loss the application cannot distinguish from a delivered message.
+      if (!this._aborted) {
+        this._cbError?.(
+          new WSError(
+            `WebSocket message dropped: the socket is not open and bufferMessages is disabled (${byteLen} bytes). Reconnect, or enable bufferMessages to queue sends made while reconnecting.`,
+          ),
+        );
+      }
+      return;
+    }
+    if (!this._aborted) {
       const evicted = this._buffer.length >= this._maxBufferSize ? this._buffer.shift() : undefined;
       if (evicted !== undefined) {
         this._bufferedBytes -=

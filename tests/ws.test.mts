@@ -10,12 +10,29 @@ import {
   kinetex,
 } from "../src/mod.ts";
 import type { WSMessage } from "../src/ws.ts";
+import "../tests/ws-echo-local.ts";
 
 /** True only for a genuine connection-level failure. */
 function isTransportFailure(e: unknown): boolean {
   return /fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|ETIMEOUT|timeout|socket hang up|network/i.test(
     describe(e),
   );
+}
+
+/**
+ * Matcher for a connect attempt against a host that cannot be reached.
+ *
+ * Which terminal error comes back is decided by the resolver, not by kinetex: a
+ * resolver that answers NXDOMAIN promptly closes the socket and the client
+ * reports `WSError` ("socket closed before open"), while one that drops the
+ * query instead makes the deadline fire and the client reports
+ * `WSConnectTimeoutError`. Both are correct outcomes for the same input, so
+ * asserting exactly one made this test report the host's DNS behaviour as a
+ * result. What is being tested is that the attempt terminates in a *connect*
+ * failure and does not hang.
+ */
+function isTerminalConnectFailure(e: unknown): boolean {
+  return e instanceof WSError || e instanceof WSConnectTimeoutError;
 }
 
 function describe(e: unknown): string {
@@ -25,7 +42,7 @@ function describe(e: unknown): string {
 let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
-async function test(name: string, fn: () => Promise<void>): Promise<void> {
+async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
     await fn();
     console.log(`  \u2705  ${name}`);
@@ -44,7 +61,7 @@ function delay(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-const ECHO_WS = "wss://echo.websocket.org/";
+const ECHO_WS = "ws://127.0.0.1:18081/";
 
 async function waitUntil(pred: () => boolean, deadlineMs: number): Promise<void> {
   const end = Date.now() + deadlineMs;
@@ -145,7 +162,7 @@ await test("metrics update after messages", async () => {
   assert.ok(sharedWs.metrics.messagesSent >= 5);
   assert.ok(sharedWs.metrics.messagesReceived >= 4);
   assert.equal(sharedWs.metrics.totalConnectAttempts, 1);
-  assert.notEqual(sharedWs.metrics.connectedAt, null);
+  assert.ok(sharedWs.metrics.connectedAt !== null);
 });
 
 await test("request matches echo reply", async () => {
@@ -295,25 +312,25 @@ await test("connectWS factory", async () => {
 
 suite("Error handling");
 
-await test("connect to invalid host throws WSConnectTimeoutError", async () => {
+await test("connect to invalid host terminates in a connect failure", async () => {
   const ws = new WSClient({
     url: "wss://this-host-does-not-exist-xyz.invalid:9",
     connectTimeoutMs: 3000,
     maxReconnects: 0,
     pingIntervalMs: 0,
   });
-  await assert.rejects(() => ws.connect(), WSConnectTimeoutError);
+  await assert.rejects(() => ws.connect(), isTerminalConnectFailure);
   ws.destroy();
 });
 
-await test("connection timeout with unlimited reconnects enters RECONNECTING", async () => {
+await test("connect failure with unlimited reconnects enters RECONNECTING", async () => {
   const ws = new WSClient({
     url: "wss://this-host-does-not-exist-xyz.invalid:9",
     connectTimeoutMs: 2000,
     maxReconnects: 0,
     pingIntervalMs: 0,
   });
-  await assert.rejects(() => ws.connect(), WSConnectTimeoutError);
+  await assert.rejects(() => ws.connect(), isTerminalConnectFailure);
   // maxReconnects=0 means unlimited — the client enters RECONNECTING state
   assert.equal(ws.state, "RECONNECTING");
   ws.destroy();
@@ -351,6 +368,39 @@ await test("send without buffering drops", async () => {
   ws.send("dropped");
   assert.equal(ws.bufferedCount, 0);
   ws.destroy();
+});
+
+await test("a dropped message with buffering disabled reports an error", async () => {
+  // The send was dropped with no error and no callback: the buffer branch was
+  // skipped and nothing was sent, so the only signal was `send()` returning
+  // false, which most callers never check. A message the application cannot
+  // see go missing is indistinguishable from a delivered one.
+  const errors: Error[] = [];
+  const ws = new WSClient({
+    url: "wss://placeholder.example/ws",
+    bufferMessages: false,
+    onError: (e) => errors.push(e),
+  });
+  ws.send("dropped");
+  assert.equal(errors.length, 1, "the drop must be observable");
+  assert.equal(ws.bufferedCount, 0, "and it really was not buffered");
+  assert.match(errors[0]!.message, /dropped/);
+  assert.match(errors[0]!.message, /bufferMessages/);
+  ws.destroy();
+});
+
+await test("no error is reported for a drop caused by the socket being aborted", async () => {
+  // `destroy()` is not a failure the application needs an alert about, and an
+  // error after teardown would be noise in every shutdown log.
+  const errors: Error[] = [];
+  const ws = new WSClient({
+    url: "wss://placeholder.example/ws",
+    bufferMessages: false,
+    onError: (e) => errors.push(e),
+  });
+  ws.destroy();
+  ws.send("after destroy");
+  assert.equal(errors.length, 0, "teardown must not raise a drop error");
 });
 
 await test("maxBufferSize drops oldest", async () => {
@@ -564,7 +614,9 @@ await test("connect() while RECONNECTING queues waiter", async () => {
 await test("onMessage registered listener receives messages", async () => {
   const ws = new WSClient({ url: "wss://placeholder.example/ws" });
   const received: WSMessage[] = [];
-  ws.onMessage((m) => received.push(m));
+  ws.onMessage((m) => {
+    received.push(m);
+  });
   // No try/catch around listener dispatch: the `catch { /* isolate */ }`
   // this replaced meant a listener that threw mid-invocation still passed,
   // as long as it had recorded its call first. A throw is a defect.
@@ -908,7 +960,7 @@ await test("request rejects when connection fails permanently", async () => {
     undefined,
     5000,
   );
-  await assert.rejects(() => ws.connect(), WSConnectTimeoutError);
+  await assert.rejects(() => ws.connect(), isTerminalConnectFailure);
   await assert.rejects(() => reqP, WSError);
   ws.destroy();
 });
@@ -924,10 +976,10 @@ await test("regression: client.ws() accepts a wss:// URL", async () => {
   // method's own JSDoc — threw EVALIDATION every time and `ws()` could not
   // connect at all. The echo-server tests above only "passed" because a
   // catch-all discarded the failure.
-  const client = kinetex({ baseURL: "https://echo.websocket.org" });
+  const client = kinetex({ baseURL: "ws://127.0.0.1:18081", allowPrivateNetwork: true });
   try {
     try {
-      const ws = await client.ws("wss://echo.websocket.org/", {
+      const ws = await client.ws("ws://127.0.0.1:18081/", {
         connectTimeoutMs: 10_000,
         maxReconnects: 0,
         pingIntervalMs: 0,
@@ -957,7 +1009,7 @@ await test("regression: a wss:// baseURL passes the WebSocket origin guard", asy
   // then a relative path — was rejected even though the two origins it printed
   // in the error were identical. Every other ws() test here uses an https base,
   // so this branch was otherwise unverified.
-  const client = kinetex({ baseURL: "wss://ws.postman-echo.com", timeout: 10_000 });
+  const client = kinetex({ baseURL: "wss://127.0.0.1:18081", timeout: 10_000 });
   try {
     await client.ws("/raw", { connectTimeoutMs: 4_000, maxReconnects: 0, pingIntervalMs: 0 }).then(
       (ws) => {
@@ -982,10 +1034,10 @@ await test("regression: a wss:// baseURL passes the WebSocket origin guard", asy
 await test("regression: an https:// baseURL still refuses a ws:// endpoint", async () => {
   // The counterweight: widening the base-URL side to accept `wss:` must not
   // have made a downgraded plaintext socket acceptable against an https origin.
-  const client = kinetex({ baseURL: "https://ws.postman-echo.com" });
+  const client = kinetex({ baseURL: "https://127.0.0.1:18081", allowPrivateNetwork: true });
   try {
     await assert.rejects(
-      () => client.ws("ws://ws.postman-echo.com/raw"),
+      () => client.ws("ws://127.0.0.1:18081/raw"),
       (err: unknown) => {
         assert.ok(err instanceof Error);
         assert.match(err.message, /does not match baseURL origin/);
@@ -1002,10 +1054,10 @@ await test("regression: an http request may not target a ws:// URL", async () =>
   // The counterweight to the fix above: widening the scheme list for `ws()`
   // must not have widened it for ordinary HTTP requests, which would let a
   // `ws://` URL slip past the SSRF screen.
-  const client = kinetex({ baseURL: "https://echo.websocket.org" });
+  const client = kinetex({ baseURL: "ws://127.0.0.1:18081", allowPrivateNetwork: true });
   try {
     await assert.rejects(
-      () => client.get("ws://echo.websocket.org/"),
+      () => client.get("ws://127.0.0.1:18081/"),
       (err: unknown) => {
         assert.ok(err instanceof Error);
         assert.match(err.message, /safety check|forbidden scheme/i);
@@ -1039,11 +1091,11 @@ await test("regression: the SSRF check still applies to wss:// loopback", async 
 
 await test("kinetex ws() creates connected WSClient", async () => {
   try {
-    const client = kinetex({ baseURL: "https://echo.websocket.org" });
+    const client = kinetex({ baseURL: "ws://127.0.0.1:18081", allowPrivateNetwork: true });
     // `ws()` documents an absolute ws:// / wss:// endpoint. Passing "/"
     // resolved against the https:// baseURL to an https:// URL, which the
     // origin guard rejects — and the catch-all below reported a pass anyway.
-    const ws = await client.ws("wss://echo.websocket.org/", {
+    const ws = await client.ws("ws://127.0.0.1:18081/", {
       pingIntervalMs: 0,
       connectTimeoutMs: 10_000,
       maxReconnects: 0,
@@ -1065,13 +1117,14 @@ await test("kinetex ws() creates connected WSClient", async () => {
 await test("kinetex ws() propagates ws config", async () => {
   try {
     const client = kinetex({
-      baseURL: "https://echo.websocket.org",
+      baseURL: "ws://127.0.0.1:18081",
+      allowPrivateNetwork: true,
       ws: { highWaterMark: 8192, lowWaterMark: 1024, maxSendRate: 50, keepRooms: false },
     });
     // `ws()` documents an absolute ws:// / wss:// endpoint. Passing "/"
     // resolved against the https:// baseURL to an https:// URL, which the
     // origin guard rejects — and the catch-all below reported a pass anyway.
-    const ws = await client.ws("wss://echo.websocket.org/", {
+    const ws = await client.ws("ws://127.0.0.1:18081/", {
       pingIntervalMs: 0,
       connectTimeoutMs: 10_000,
       maxReconnects: 0,
@@ -1093,7 +1146,7 @@ await test("kinetex ws() propagates ws config", async () => {
 });
 
 await test("kinetex destroy() closes tracked WS clients", async () => {
-  const client = kinetex({ baseURL: "https://echo.websocket.org" });
+  const client = kinetex({ baseURL: "ws://127.0.0.1:18081", allowPrivateNetwork: true });
   const ws = new WSClient({
     url: ECHO_WS,
     pingIntervalMs: 0,
@@ -1109,13 +1162,14 @@ await test("kinetex destroy() closes tracked WS clients", async () => {
 await test("kinetex ws() with bearer auth injects authorization header", async () => {
   try {
     const client = kinetex({
-      baseURL: "https://echo.websocket.org",
+      baseURL: "ws://127.0.0.1:18081",
+      allowPrivateNetwork: true,
       auth: { type: "bearer", token: "test-token" },
     });
     // `ws()` documents an absolute ws:// / wss:// endpoint. Passing "/"
     // resolved against the https:// baseURL to an https:// URL, which the
     // origin guard rejects — and the catch-all below reported a pass anyway.
-    const ws = await client.ws("wss://echo.websocket.org/", {
+    const ws = await client.ws("ws://127.0.0.1:18081/", {
       pingIntervalMs: 0,
       connectTimeoutMs: 10_000,
       maxReconnects: 0,
@@ -1300,7 +1354,9 @@ await test("close() drains drain-waiters, open-waiters and correlations, and not
   try {
     const ws = fakeClient({ lowWaterMark: 0 });
     const closes: Array<{ code: number; reason: string }> = [];
-    ws.onClose((e) => closes.push(e));
+    ws.onClose((e) => {
+      closes.push(e);
+    });
 
     // An open waiter, a drain waiter, and a correlation, all pending.
     const openP = ws.waitForOpen(0);
@@ -1339,7 +1395,9 @@ await test("a throwing close listener does not stop the others", async () => {
     ws.onClose(() => {
       throw new Error("listener exploded");
     });
-    ws.onClose(() => seen.push("second"));
+    ws.onClose(() => {
+      seen.push("second");
+    });
     ws.close();
     assert.deepEqual(seen, ["second"], "the second listener still ran");
     assert.equal(ws.state, "CLOSED", "and the client still reached CLOSED");
@@ -1371,7 +1429,9 @@ await test("destroy() settles every waiter and clears the buffer", async () => {
   try {
     const ws = fakeClient({ lowWaterMark: 0 });
     const closes: Array<{ code: number; reason: string }> = [];
-    ws.onClose((e) => closes.push(e));
+    ws.onClose((e) => {
+      closes.push(e);
+    });
 
     const openP = ws.waitForOpen(0);
     (ws as any)._state = "CONNECTING";
@@ -1441,9 +1501,11 @@ await test("a connect timeout with reconnects left schedules a reconnect", async
       maxReconnects: 2,
       reconnectBaseMs: 20,
       reconnectJitter: 0,
-      onReconnect: (n, d) => reconnects.push([n, d]),
+      onReconnect: (n, d) => {
+        reconnects.push([n, d]);
+      },
     });
-    await assert.rejects(() => ws.connect(), WSConnectTimeoutError);
+    await assert.rejects(() => ws.connect(), isTerminalConnectFailure);
     assert.equal(ws.state, "RECONNECTING", "it handed off to the reconnect scheduler");
     assert.deepEqual(reconnects, [[1, 20]], "onReconnect reported the attempt and the delay");
     ws.destroy();
@@ -1461,13 +1523,15 @@ await test("a connect timeout with no budget left goes CLOSED and rejects its wa
     const ws = fakeClient({
       connectTimeoutMs: 40,
       maxReconnects: 1,
-      onError: (e) => errors.push(e),
+      onError: (e) => {
+        errors.push(e);
+      },
     });
     (ws as any)._reconnAttempt = 9; // budget already spent
     const openP = ws.waitForOpen(0);
     const corrP = ws.request("ping", () => false, undefined, 0);
 
-    await assert.rejects(() => ws.connect(), WSConnectTimeoutError);
+    await assert.rejects(() => ws.connect(), isTerminalConnectFailure);
     await assert.rejects(() => openP, WSConnectTimeoutError);
     await assert.rejects(() => corrP, /Connection timeout/);
 
@@ -1494,9 +1558,9 @@ await test("a WebSocket constructor that throws is reported as a WSError", async
         assert.ok(err instanceof WSError, `got ${String(err)}`);
         assert.match(err.message, /Failed to construct WebSocket/);
         assert.match(
-          (err as WSError).originalCause instanceof Error
-            ? (err as WSError).originalCause!.message
-            : String((err as WSError).originalCause),
+          (err as InstanceType<typeof WSError>).originalCause instanceof Error
+            ? ((err as InstanceType<typeof WSError>).originalCause as Error).message
+            : String((err as InstanceType<typeof WSError>).originalCause),
           /refused by policy/,
           "the constructor's own error is carried as the cause",
         );
@@ -1551,8 +1615,12 @@ await test("open resolves waiters, fires onOpen, and rejoins rooms after a recon
       reconnectBaseMs: 20,
       reconnectJitter: 0,
       rooms: ["news"],
-      onOpen: (n) => opens.push(n),
-      onReconnect: (n, d) => reconnects.push([n, d]),
+      onOpen: (n) => {
+        opens.push(n);
+      },
+      onReconnect: (n, d) => {
+        reconnects.push([n, d]);
+      },
     });
     const first = ws.connect();
     const waiterP = ws.waitForOpen(0);
@@ -1594,7 +1662,11 @@ await test("a socket error is reported through onError", async () => {
   const restore = withFakeWebSocket();
   try {
     const errors: Error[] = [];
-    const ws = fakeClient({ onError: (e) => errors.push(e) });
+    const ws = fakeClient({
+      onError: (e) => {
+        errors.push(e);
+      },
+    });
     void ws.connect();
     FakeWebSocket.last.error("handshake failed");
     assert.equal(errors.length, 1, "onError fired once");
@@ -1728,7 +1800,9 @@ await test("a throwing message listener does not stop the others", async () => {
     ws.onMessage(() => {
       throw new Error("listener exploded");
     });
-    ws.onMessage((m) => seen.push(String(m.data)));
+    ws.onMessage((m) => {
+      seen.push(String(m.data));
+    });
     FakeWebSocket.last.message("payload");
     assert.deepEqual(seen, ["payload"], "the second listener still ran");
     ws.destroy();
@@ -1808,7 +1882,9 @@ await test("a binary message arrives as an ArrayBuffer and a Blob as bytes", asy
     void ws.connect();
     FakeWebSocket.last.open();
     const got: Array<{ data: unknown; bytes: number }> = [];
-    ws.onMessage((m) => got.push({ data: m.data, bytes: ws.metrics.bytesReceived }));
+    ws.onMessage((m) => {
+      got.push({ data: m.data, bytes: ws.metrics.bytesReceived });
+    });
 
     const ab = new Uint8Array([1, 2, 3]).buffer;
     FakeWebSocket.last.message(ab);
@@ -1843,7 +1919,9 @@ await test("a message that is not JSON leaves json undefined", async () => {
     void ws.connect();
     FakeWebSocket.last.open();
     const seen: Array<{ data: string; json: unknown }> = [];
-    ws.onMessage((m) => seen.push({ data: String(m.data), json: m.json }));
+    ws.onMessage((m) => {
+      seen.push({ data: String(m.data), json: m.json });
+    });
     FakeWebSocket.last.message("not json at all");
     assert.equal(seen[0]!.json, undefined, "json stays undefined for a non-JSON payload");
     assert.equal(seen[0]!.data, "not json at all");
@@ -1862,7 +1940,9 @@ await test("a message that is not JSON is still delivered", async () => {
     void ws.connect();
     FakeWebSocket.last.open();
     const seen: string[] = [];
-    ws.onMessage((m) => seen.push(String(m.data)));
+    ws.onMessage((m) => {
+      seen.push(String(m.data));
+    });
     FakeWebSocket.last.message("plain text");
     FakeWebSocket.last.message('{"ok":true}');
     assert.deepEqual(seen, ["plain text", '{"ok":true}'], "both payloads were delivered");
@@ -1922,7 +2002,9 @@ await test("a pong matching a RegExp clears the pending pong timer", async () =>
     assert.equal((ws as any)._pongTimer, null, "the pong cleared the timer");
     // A non-pong message is delivered normally, and re-arms the timer.
     const seen: string[] = [];
-    ws.onMessage((m) => seen.push(String(m.data)));
+    ws.onMessage((m) => {
+      seen.push(String(m.data));
+    });
     sock.message("chatter");
     assert.deepEqual(seen, ["chatter"], "a non-pong message is delivered");
     await waitUntil(() => (ws as any)._pongTimer !== null, 2000);
@@ -1951,7 +2033,9 @@ await test("a missing pong tears the connection down and reconnects", async () =
       maxReconnects: 2,
       reconnectBaseMs: 20,
       reconnectJitter: 0,
-      onReconnect: (n, d) => reconnects.push([n, d]),
+      onReconnect: (n, d) => {
+        reconnects.push([n, d]);
+      },
     });
     void ws.connect();
     const sock = FakeWebSocket.last;
@@ -1996,7 +2080,12 @@ await test("a send that throws is reported and does not count as sent", async ()
   const restore = withFakeWebSocket();
   try {
     const errors: Error[] = [];
-    const ws = fakeClient({ maxReconnects: 0, onError: (e) => errors.push(e) });
+    const ws = fakeClient({
+      maxReconnects: 0,
+      onError: (e) => {
+        errors.push(e);
+      },
+    });
     void ws.connect();
     const sock = FakeWebSocket.last;
     sock.open();
@@ -2042,7 +2131,9 @@ await test("a send that throws with reconnect budget left schedules a reconnect"
       maxReconnects: 2,
       reconnectBaseMs: 20,
       reconnectJitter: 0,
-      onReconnect: (n, d) => reconnects.push([n, d]),
+      onReconnect: (n, d) => {
+        reconnects.push([n, d]);
+      },
     });
     void ws.connect();
     const sock = FakeWebSocket.last;
@@ -2238,7 +2329,9 @@ await test("drainBuffer empties the buffer and fires backpressure transitions", 
     const ws = fakeClient({
       highWaterMark: 4,
       lowWaterMark: 2,
-      onBackpressure: (bp) => seen.push(bp),
+      onBackpressure: (bp) => {
+        seen.push(bp);
+      },
     });
     void ws.connect();
     ws.send("aaaa");
@@ -2373,7 +2466,12 @@ await test("an external abort signal closes the client and is detached afterward
   try {
     const ac = new AbortController();
     let closed = 0;
-    const ws = fakeClient({ signal: ac.signal, onClose: () => closed++ });
+    const ws = fakeClient({
+      signal: ac.signal,
+      onClose: () => {
+        closed++;
+      },
+    });
     void ws.connect();
     FakeWebSocket.last.open();
     ac.abort();

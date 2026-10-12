@@ -1,44 +1,24 @@
-# Gitleaks configuration for kinetex
-# See: https://github.com/gitleaks/gitleaks
-
-title = "kinetex gitleaks config"
-
+# Why this file exists: the gitleaks job had been failing to download its own
+# binary since gitleaks renamed its release assets from `linux_amd64` to
+# `linux_x64`, so the scan never ran. Fixing that (see ci.yml) turned up three
+# findings, all of them placeholders rather than credentials. A gate that has
+# never run is worse than one that runs and fails, because it reads as coverage.
+#
+# Two allowlist entries, both narrow. Every other rule in the default config
+# still applies, to every other file — including this directory and including
+# the test suites that hold other token-shaped strings.
 [extend]
 useDefault = true
 
 [allowlist]
-  description = "Known safe/test values — not real secrets"
+description = "Test-only placeholder — see tests/fixtures/README.md"
 
-  paths = [
-    '''tests/''',
-  ]
-
-  regexes = [
-    # AWS official example credentials from AWS documentation
-    # https://docs.aws.amazon.com/IAM/latest/UserGuide/security-creds.html
-    '''AKIAIOSFODNN7EXAMPLE''',
-    '''wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY''',
-    '''IQoJb3JpZ2luX2VjEHwaC2V1LXdlc3QtMSJHMEUC''',
-
-    # Test/dummy bearer tokens
-    '''test-token''',
-    '''config-token''',
-    '''static-config-token''',
-    '''parent-token''',
-    '''child-token''',
-    '''should-be-ignored''',
-    '''config-token-123''',
-    '''wrongpassword''',
-
-    # Digest auth RFC test vectors
-    '''939e7578ed9cc5f2.*dcd98b7102''',
-    '''dcd98b7102dd2f0d8c11''',
-    '''5ccc069c403ebaf9f017''',
-    '''6629fae49393a0539745''',
-
-    # SHA256("") — known cryptographic constant
-    '''e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855''',
-
-    # Base64 alphabet — not a secret
-    '''ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\+/=''',
-  ]
+# `localhost-key.pem` is a private key, so the `private-key` rule flags it —
+# correctly, on a file that is one. Allowlisted by path rather than by
+# fingerprint, because a fingerprint embeds the commit SHA and goes stale the
+# moment the file changes. It is a throwaway self-signed localhost key with no
+# CA and no name outside 127.0.0.1; see tests/fixtures/README.md.
+#
+# Historic findings are handled in .gitleaksignore instead — that file is the
+# one that takes fingerprints.
+paths = ['''tests/fixtures/localhost-key\.pem''']

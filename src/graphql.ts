@@ -31,6 +31,8 @@ import { KinetexError as _KinetexError, ValidationError } from "./types.ts";
 // FIX (H6): untrusted GraphQL responses are parsed with raw JSON.parse below —
 // sanitize prototype-pollution keys before they reach user code or merges.
 import { sanitizeParsedJSON } from "./utils.ts";
+import { sleep } from "./utils.ts";
+import { sha256Hex } from "./utils.ts";
 
 // ============================================================================
 // §1  TYPES
@@ -255,9 +257,6 @@ export type GraphQLLinkNext = (op: GraphQLOperation) => Promise<GraphQLResponse>
 export type GraphQLLink = (op: GraphQLOperation, next: GraphQLLinkNext) => Promise<GraphQLResponse>;
 
 // Utility function (B-10 fix - moved before usage)
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function buildLinkChain(links: GraphQLLink[], terminal: GraphQLLinkNext): GraphQLLinkNext {
   return links.reduceRight(
@@ -300,18 +299,6 @@ export function extractOperationName(query: string): string | null {
 // ============================================================================
 // §5  AUTOMATIC PERSISTED QUERIES (APQ)
 // ============================================================================
-
-async function sha256Hex(str: string): Promise<string> {
-  const encoded = new TextEncoder().encode(str);
-  const buf: ArrayBuffer = encoded.buffer.slice(
-    encoded.byteOffset,
-    encoded.byteOffset + encoded.byteLength,
-  ) as ArrayBuffer;
-  const hash = await crypto.subtle.digest("SHA-256", buf);
-  return Array.from(new Uint8Array(hash))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
 
 /** Maximum APQ cache entries to prevent memory leaks */
 const MAX_APQ_CACHE_ENTRIES = 1000;

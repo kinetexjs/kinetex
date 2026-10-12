@@ -1,13 +1,13 @@
 {
-  "exclude": [
-    "dist/**",
-    "tests/**",
-    "scripts/**",
-    "node_modules/**"
-  ],
+  "exclude": ["dist/**", "tests/**", "scripts/**", "node_modules/**"],
   "include": ["src/**/*.ts"],
   "reporter": ["text-summary", "text", "lcov"],
   "report-dir": "coverage",
-  "all": false,
-  "skip-full": false
+  "all": true,
+  "skip-full": false,
+  "check-coverage": true,
+  "lines": 95,
+  "statements": 95,
+  "functions": 97,
+  "branches": 88
 }

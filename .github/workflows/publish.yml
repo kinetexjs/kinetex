@@ -33,9 +33,10 @@ jobs:
       - name: Lint
         run: deno lint
 
+      # Was `continue-on-error: true`, so a green JSR release could ship with a
+      # red Deno suite — publishing on the strength of a type check alone.
       - name: Run tests
         run: deno task test
-        continue-on-error: true
 
       - name: Clear generated lockfile
         run: rm -f deno.lock

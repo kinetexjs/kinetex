@@ -60,17 +60,12 @@ export interface ParsedURL {
   searchParams: URLSearchParams;
 }
 
-/**
- * Options for URL parsing and builder construction.
- */
-export interface URLBuilderOptions {
-  /** Base URL to resolve relative paths against */
-  base?: string;
-  /** If true, sort query params (good for cache keys) */
-  sortParams?: boolean;
-  /** Default protocol if scheme is omitted (default: "https") */
-  defaultProtocol?: string;
-}
+// `URLBuilderOptions` was published here and accepted by nothing. No constructor,
+// static factory or method took it, so `defaultProtocol` in particular read as a
+// supported knob while being unreachable — the same "declared, therefore
+// working" assumption that hid several real defects during this work. It is
+// removed rather than wired up: there is no call site it would belong to, since
+// `from()` takes a base URL directly and `sortParams` is a real method.
 
 /** A single query parameter value — string, number, boolean, or null/undefined to omit. */
 export type QueryValue = string | number | boolean | null | undefined;

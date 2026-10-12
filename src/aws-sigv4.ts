@@ -23,6 +23,14 @@
 
 // Node.js globals accessed via globalThis for cross-runtime compatibility
 import { KinetexError as _KinetexError, TimeoutError, NetworkError } from "./types.ts";
+import { sha256Hex } from "./utils.ts";
+
+/** Convert a Uint8Array to a lowercase hex string. */
+function toHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 // ============================================================================
 // #1  TYPES
@@ -500,24 +508,6 @@ async function hmacSHA256(key: Uint8Array | string, data: string): Promise<Uint8
 /**
  * SHA-256 hash of a string or bytes. Returns lowercase hex.
  */
-async function sha256Hex(data: string | Uint8Array): Promise<string> {
-  const enc = new TextEncoder();
-  const raw = typeof data === "string" ? enc.encode(data) : data;
-  // Cast to ArrayBuffer for WebCrypto digest overload
-  const buf: ArrayBuffer = raw.buffer.slice(
-    raw.byteOffset,
-    raw.byteOffset + raw.byteLength,
-  ) as ArrayBuffer;
-  const hashBuf = await crypto.subtle.digest("SHA-256", buf);
-  return toHex(new Uint8Array(hashBuf));
-}
-
-/** Convert a Uint8Array to a lowercase hex string. */
-function toHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
 
 // ============================================================================
 // #5  CANONICAL REQUEST

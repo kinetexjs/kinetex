@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 import { kinetex } from "../src/mod.ts";
 import {
   CircuitBreaker,
@@ -12,13 +13,13 @@ let passed = 0;
 let failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
-async function test(name: string, fn: () => Promise<void>) {
+async function test(name: string, fn: () => Promise<void> | void) {
   try {
     await fn();
     console.log(`  ✅  ${name}`);
     passed++;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = err instanceof Error ? (err as Error).message : String(err);
     console.error(`  ❌  ${name}: ${msg}`);
     failures.push({ name, err });
     failed++;
@@ -30,7 +31,7 @@ function suite(name: string) {
 }
 
 const T = 30_000;
-const httpbin = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+const httpbin = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
 
 function netErr(): Error {
   return Object.assign(new Error("network"), { code: "ENETWORK" });
@@ -40,7 +41,39 @@ function timedOutErr(): Error {
   return Object.assign(new Error("timeout"), { code: "ETIMEOUT" });
 }
 
-/** A call that always succeeds. Several tests used a live httpbin request
+/**
+ * Matchers for the failure each call is expected to surface.
+ *
+ * A bare `assert.rejects(fn)` is satisfied by *any* rejection, including a
+ * `TypeError` thrown by a typo in the code under test — the exact defect these
+ * tests exist to catch. Each matcher pins the code and the message.
+ */
+function isNetworkFailure(e: unknown): boolean {
+  assert.ok(e instanceof Error, `expected an Error, got ${String(e)}`);
+  assert.equal((e as { code?: string }).code, "ENETWORK");
+  assert.equal(e.message, "network");
+  return true;
+}
+
+function isTimeoutFailure(e: unknown): boolean {
+  assert.ok(e instanceof Error, `expected an Error, got ${String(e)}`);
+  assert.equal((e as { code?: string }).code, "ETIMEOUT");
+  assert.equal(e.message, "timeout");
+  return true;
+}
+
+/** The caller's own HTTP-status error must pass through the breaker intact. */
+function isStatusFailure(status: number) {
+  return (e: unknown): boolean => {
+    assert.ok(e instanceof Error, `expected an Error, got ${String(e)}`);
+    assert.equal((e as { status?: number }).status, status);
+    assert.equal(e.message, String(status));
+    return true;
+  };
+  return Object.assign(new Error("timeout"), { code: "ETIMEOUT" });
+}
+
+/** A call that always succeeds. Several tests used a real request
  *  purely to obtain a success, which made them slow and network-flaky while
  *  adding nothing the breaker could observe. */
 const succeed =
@@ -57,7 +90,9 @@ async function withWarnings<T>(
 ): Promise<{ result: T; warnings: string[] }> {
   const warnings: string[] = [];
   const original = console.warn;
-  console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.join(" "));
+  };
   try {
     return { result: await fn(), warnings };
   } finally {
@@ -99,11 +134,11 @@ await test("sliding window: 3 failures with threshold 3 opens circuit", async ()
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "CLOSED"); // 2 < 3
   assert.equal(cb.snapshot.failureCount, 2, "both failures must be in the window");
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "OPEN"); // 3 >= 3
   const s = cb.snapshot;
   assert.equal(s.failureCount, 3);
@@ -124,17 +159,17 @@ await test("OPEN state rejects all requests with CircuitOpenError", async () => 
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   const err = await cb.execute(() => Promise.resolve(42)).catch((e) => e);
   assert.ok(err instanceof CircuitOpenError, `got ${err?.constructor?.name}`);
   assert.ok(err instanceof Error);
-  assert.equal(err.name, "CircuitOpenError");
-  assert.equal(err.code, "ECIRCUITOPEN");
-  assert.equal(err.message, 'Circuit breaker OPEN for "s2" — request rejected');
+  assert.equal((err as Error).name, "CircuitOpenError");
+  assert.equal((err as { code?: string }).code, "ECIRCUITOPEN");
+  assert.equal((err as Error).message, 'Circuit breaker OPEN for "s2" — request rejected');
   // The key must appear: with one breaker per origin, the message is often the
   // only place the operator learns which dependency is down.
-  assert.ok(err.message.includes('"s2"'), "the message must name the breaker key");
-  assert.equal(err.state.state, "OPEN");
+  assert.ok((err as Error).message.includes('"s2"'), "the message must name the breaker key");
+  assert.equal((err as { state: { state: string } }).state.state, "OPEN");
   assert.equal(err.state.totalRejected, 1);
   assert.equal(err.state.totalRequests, 1, "a rejection is not a request attempt");
   // The snapshot is a copy, not a live view.
@@ -150,7 +185,7 @@ await test("OPEN → HALF_OPEN after resetTimeoutMs elapses, then closes on succ
     successThreshold: 1,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "OPEN");
   await wait(500);
 
@@ -171,7 +206,7 @@ await test("OPEN → HALF_OPEN after resetTimeoutMs elapses, then closes on succ
   assert.equal(sawProbeSlot, true, "the probe must have held the single probe slot");
   assert.ok(halfOpenAt !== null, "Half-open timestamp should be set");
   assert.ok(
-    halfOpenAt >= cb.snapshot.openedAt,
+    halfOpenAt >= (cb.snapshot.openedAt ?? 0),
     "halfOpenAt must not precede the moment the circuit opened",
   );
   assert.equal(cb.state, "CLOSED", "successThreshold 1 closes on the first success");
@@ -188,9 +223,9 @@ await test("OPEN → HALF_OPEN → failed probe re-opens circuit immediately", a
     resetTimeoutMs: 400,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   await new Promise((r) => setTimeout(r, 500));
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "OPEN");
 });
 
@@ -202,7 +237,7 @@ await test("HALF_OPEN concurrency limit rejects additional probes", async () => 
     halfOpenConcurrency: 1,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   await wait(500);
   // Start slow probe in HALF_OPEN
   const slowProbe = cb.execute(async () => {
@@ -219,7 +254,7 @@ await test("HALF_OPEN concurrency limit rejects additional probes", async () => 
   // branch looked the same.
   assert.equal(err.state.state, "HALF_OPEN", "rejected for the slot, not because OPEN");
   assert.equal(
-    err.message,
+    (err as Error).message,
     'Circuit breaker HALF_OPEN for "s5" — request rejected',
     "the message must not claim OPEN while the circuit is half-open",
   );
@@ -250,9 +285,9 @@ await test("windowSize=0: 2 consecutive failures open circuit", async () => {
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "CLOSED"); // 1 < 2
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "OPEN"); // 2 >= 2
 });
 
@@ -263,7 +298,7 @@ await test("windowSize=0: success resets failure counter", async () => {
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.snapshot.failureCount, 1);
   await cb.execute(succeed()); // success resets
   assert.equal(
@@ -271,7 +306,7 @@ await test("windowSize=0: success resets failure counter", async () => {
     0,
     "in consecutive mode a single success must clear the run",
   );
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "CLOSED"); // counter was reset, only 1 consecutive now
   assert.equal(cb.snapshot.failureCount, 1);
   assert.equal(cb.snapshot.totalFailures, 2, "lifetime failures are not reset");
@@ -285,9 +320,9 @@ await test("snapshot failureCount uses consecutive count when windowSize=0", asy
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.snapshot.failureCount, 1);
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.snapshot.failureCount, 2);
 });
 
@@ -309,8 +344,8 @@ await test("window shift on success: old entries shift out when window fills", a
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.snapshot.failureCount, 2, "two failures resident");
   await cb.execute(succeed());
   assert.equal(
@@ -341,7 +376,8 @@ await test("window shift on failure: old failures shift out when window fills", 
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
   });
-  const F = () => assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  const F = () =>
+    assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   const S = () => cb.execute(succeed());
   await F();
   await F();
@@ -384,7 +420,7 @@ await test("window shift on failure: old failures shift out when window fills", 
     failures: { networkErrors: true },
   });
   for (let i = 0; i < 2; i++)
-    await assert.rejects(() => cb2.execute(() => Promise.reject(netErr())));
+    await assert.rejects(() => cb2.execute(() => Promise.reject(netErr())), isNetworkFailure);
   for (let i = 0; i < 3; i++) await cb2.execute(succeed());
   assert.equal(cb2.snapshot.failureCount, 0, "three successes evict all three slots");
   assert.equal(cb2.state, "CLOSED");
@@ -399,8 +435,8 @@ await test("snapshot failureCount uses window filter when windowSize > 0", async
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.snapshot.failureCount, 2);
 });
 
@@ -417,7 +453,7 @@ await test("ENETWORK counted when networkErrors is true", async () => {
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "OPEN");
 });
 
@@ -428,7 +464,7 @@ await test("ETIMEOUT counted when timeouts is true", async () => {
     resetTimeoutMs: 60000,
     failures: { timeouts: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(timedOutErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(timedOutErr())), isTimeoutFailure);
   assert.equal(cb.state, "OPEN");
 });
 
@@ -439,8 +475,9 @@ await test("HTTP 500 counted when serverErrors is true", async () => {
     resetTimeoutMs: 60000,
     failures: { serverErrors: true },
   });
-  await assert.rejects(() =>
+  await assert.rejects(
     cb.execute(() => Promise.reject(Object.assign(new Error("500"), { status: 500 }))),
+    isStatusFailure(500),
   );
   assert.equal(cb.state, "OPEN");
 
@@ -453,8 +490,9 @@ await test("HTTP 500 counted when serverErrors is true", async () => {
       resetTimeoutMs: 60000,
       failures: { serverErrors: true },
     });
-    await assert.rejects(() =>
+    await assert.rejects(
       c.execute(() => Promise.reject(Object.assign(new Error(String(status)), { status }))),
+      isStatusFailure(status),
     );
     assert.equal(c.state, "CLOSED", `${status} is not a server error`);
     assert.equal(c.snapshot.totalFailures, 0);
@@ -467,8 +505,9 @@ await test("HTTP 500 counted when serverErrors is true", async () => {
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() =>
+  await assert.rejects(
     off.execute(() => Promise.reject(Object.assign(new Error("500"), { status: 500 }))),
+    isStatusFailure(500),
   );
   assert.equal(off.state, "CLOSED", "serverErrors defaults to false");
 });
@@ -480,8 +519,9 @@ await test("custom status code 429 counted when in statusCodes list", async () =
     resetTimeoutMs: 60000,
     failures: { statusCodes: [429] },
   });
-  await assert.rejects(() =>
+  await assert.rejects(
     cb.execute(() => Promise.reject(Object.assign(new Error("429"), { status: 429 }))),
+    isStatusFailure(429),
   );
   assert.equal(cb.state, "OPEN");
 
@@ -493,8 +533,9 @@ await test("custom status code 429 counted when in statusCodes list", async () =
       resetTimeoutMs: 60000,
       failures: { statusCodes: [429] },
     });
-    await assert.rejects(() =>
+    await assert.rejects(
       c.execute(() => Promise.reject(Object.assign(new Error(String(status)), { status }))),
+      isStatusFailure(status),
     );
     assert.equal(c.state, "CLOSED", `${status} is not in the list`);
   }
@@ -506,12 +547,14 @@ await test("custom status code 429 counted when in statusCodes list", async () =
     resetTimeoutMs: 60000,
     failures: { statusCodes: [429, 503], serverErrors: true },
   });
-  await assert.rejects(() =>
+  await assert.rejects(
     multi.execute(() => Promise.reject(Object.assign(new Error("429"), { status: 429 }))),
+    isStatusFailure(429),
   );
   assert.equal(multi.state, "CLOSED", "one of two");
-  await assert.rejects(() =>
+  await assert.rejects(
     multi.execute(() => Promise.reject(Object.assign(new Error("503"), { status: 503 }))),
+    isStatusFailure(503),
   );
   assert.equal(multi.state, "OPEN", "and the second opens it");
 });
@@ -527,8 +570,12 @@ await test("plain Error without code is NOT countable", async () => {
   // that the caller's own error comes back, not one the breaker substituted.
   const err = await cb.execute(() => Promise.reject(new Error("plain"))).catch((e) => e);
   assert.ok(err instanceof Error);
-  assert.equal(err.message, "plain", "the original error must propagate unchanged");
-  assert.equal(err.code, undefined, "and must not be tagged as a network failure");
+  assert.equal((err as Error).message, "plain", "the original error must propagate unchanged");
+  assert.equal(
+    (err as { code?: string }).code,
+    undefined,
+    "and must not be tagged as a network failure",
+  );
   assert.equal(cb.state, "CLOSED");
   assert.equal(cb.snapshot.failureCount, 0, "an app-level error is not an outage");
   assert.equal(cb.snapshot.totalFailures, 0);
@@ -556,7 +603,13 @@ await test("thrown non-Error values (string, null, undefined) are NOT countable"
     // The bare object carries the matching code but is not an Error, so
     // `instanceof Error` rejects it. A caller that throws a plain object was
     // never counted as an outage.
-    await assert.rejects(() => cb.execute(() => Promise.reject(thrown)));
+    await assert.rejects(
+      () => cb.execute(() => Promise.reject(thrown)),
+      (e: unknown) => {
+        assert.ok(Object.is(e, thrown), `expected the thrown value, got ${String(e)}`);
+        return true;
+      },
+    );
     assert.equal(cb.state, "CLOSED", `${JSON.stringify(thrown) ?? "undefined"} must not count`);
     assert.equal(cb.snapshot.totalFailures, 0);
     assert.equal(cb.snapshot.totalRequests, 1);
@@ -570,7 +623,7 @@ await test("ENETWORK not counted when networkErrors is false", async () => {
     resetTimeoutMs: 60000,
     failures: { networkErrors: false },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "CLOSED");
 });
 
@@ -582,10 +635,10 @@ await test("multiple failure filters compose: only matching codes count", async 
     failures: { networkErrors: false, timeouts: true },
   });
   // ENETWORK doesn't count
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "CLOSED");
   // ETIMEOUT does count
-  await assert.rejects(() => cb.execute(() => Promise.reject(timedOutErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(timedOutErr())), isTimeoutFailure);
   assert.equal(cb.state, "OPEN");
 });
 
@@ -602,11 +655,13 @@ await test("onOpen fires on failure threshold reached (sliding window)", async (
     failureThreshold: 2,
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
-    onOpen: () => count++,
+    onOpen: () => {
+      count++;
+    },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(count, 0); // not yet open
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(count, 1); // open now
 });
 
@@ -642,11 +697,13 @@ await test("onOpen fires on consecutive mode threshold reached", async () => {
     failureThreshold: 2,
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
-    onOpen: () => count++,
+    onOpen: () => {
+      count++;
+    },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(count, 0);
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(count, 1);
 });
 
@@ -657,12 +714,14 @@ await test("onOpen fires again when HALF_OPEN probe fails (re-opens)", async () 
     failureThreshold: 1,
     resetTimeoutMs: 400,
     failures: { networkErrors: true },
-    onOpen: () => count++,
+    onOpen: () => {
+      count++;
+    },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(count, 1);
   await new Promise((r) => setTimeout(r, 500));
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(count, 2);
 });
 
@@ -696,9 +755,11 @@ await test("onClose fires when HALF_OPEN probe succeeds (circuit closes)", async
     resetTimeoutMs: 400,
     successThreshold: 1,
     failures: { networkErrors: true },
-    onClose: () => closeCount++,
+    onClose: () => {
+      closeCount++;
+    },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   await new Promise((r) => setTimeout(r, 500));
   await cb.execute(async () => (await httpbin.get("/get")).status);
   assert.equal(closeCount, 1);
@@ -716,7 +777,7 @@ await test("onHalfOpen fires when OPEN transitions to HALF_OPEN", async () => {
       fired = true;
     },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   await new Promise((r) => setTimeout(r, 500));
   await cb.execute(async () => (await httpbin.get("/get")).status);
   assert.equal(fired, true);
@@ -735,11 +796,25 @@ await test("onRejected fires once per rejection in OPEN state", async () => {
       seen.push(state.state);
     },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(calls, 0, "the failure that opened it is not a rejection");
-  await assert.rejects(() => cb.execute(() => Promise.resolve(42)));
+  await assert.rejects(
+    () => cb.execute(() => Promise.resolve(42)),
+    (e: unknown) => {
+      assert.ok(e instanceof CircuitOpenError, `expected CircuitOpenError, got ${String(e)}`);
+      assert.equal(e.code, "ECIRCUITOPEN");
+      return true;
+    },
+  );
   assert.equal(calls, 1);
-  await assert.rejects(() => cb.execute(() => Promise.resolve(43)));
+  await assert.rejects(
+    () => cb.execute(() => Promise.resolve(43)),
+    (e: unknown) => {
+      assert.ok(e instanceof CircuitOpenError, `expected CircuitOpenError, got ${String(e)}`);
+      assert.equal(e.code, "ECIRCUITOPEN");
+      return true;
+    },
+  );
   assert.equal(calls, 2, "every rejected caller is counted");
   assert.deepEqual(seen, ["OPEN", "OPEN"]);
   assert.equal(cb.snapshot.totalRejected, 2);
@@ -756,16 +831,25 @@ await test("onRejected fires when probe rejected in HALF_OPEN (concurrency limit
     resetTimeoutMs: 400,
     halfOpenConcurrency: 1,
     failures: { networkErrors: true },
-    onRejected: () => rejectCount++,
+    onRejected: () => {
+      rejectCount++;
+    },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   await new Promise((r) => setTimeout(r, 500));
   const slowProbe = cb.execute(async () => {
     await new Promise((r) => setTimeout(r, 800));
     return 42;
   });
   await new Promise((r) => setTimeout(r, 50));
-  await assert.rejects(() => cb.execute(() => Promise.resolve(1)));
+  await assert.rejects(
+    () => cb.execute(() => Promise.resolve(1)),
+    (e: unknown) => {
+      assert.ok(e instanceof CircuitOpenError, `expected CircuitOpenError, got ${String(e)}`);
+      assert.equal(e.code, "ECIRCUITOPEN");
+      return true;
+    },
+  );
   assert.equal(rejectCount, 1);
   await slowProbe;
 });
@@ -781,7 +865,7 @@ await test("trip() transitions CLOSED → OPEN", async () => {
   assert.equal(cb.state, "CLOSED");
   cb.trip();
   assert.equal(cb.state, "OPEN");
-  assert.ok(cb.snapshot.openedAt !== null);
+  assert.ok((cb.snapshot.openedAt ?? 0) !== null);
 });
 
 await test("trip() on already OPEN is a no-op", async () => {
@@ -802,7 +886,7 @@ await test("reset() transitions any state → CLOSED and clears the window state
     failures: { networkErrors: true },
   });
   for (let i = 0; i < 3; i++)
-    await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+    await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "OPEN");
   const before = cb.snapshot;
   assert.equal(before.failureCount, 3);
@@ -824,11 +908,11 @@ await test("reset() transitions any state → CLOSED and clears the window state
   assert.equal(after.totalRejected, before.totalRejected);
   // And the cleared window really is empty: three more failures must be
   // needed to re-open, not zero.
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "CLOSED", "the old failures must not still be in the window");
   assert.equal(cb.snapshot.failureCount, 2);
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "OPEN");
 });
 
@@ -845,7 +929,7 @@ await test("trip() during HALF_OPEN holds the circuit open past the probe", asyn
     successThreshold: 5,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   await wait(400);
   assert.equal(cb.state, "HALF_OPEN", "the reset window has elapsed");
   const probe = cb.execute(async () => {
@@ -876,16 +960,16 @@ suite("CircuitBreakerRegistry");
 
 await test("get creates breaker on first call, returns cached on second", async () => {
   const r = new CircuitBreakerRegistry();
-  const a = r.get("https://httpbin.org");
+  const a = r.get(`${HTTPBIN_LOCAL_ORIGIN}`);
   assert.ok(a instanceof CircuitBreaker);
-  const b = r.get("https://httpbin.org");
+  const b = r.get(`${HTTPBIN_LOCAL_ORIGIN}`);
   assert.equal(a, b);
 });
 
 await test("registry.execute makes real HTTP call via breaker", async () => {
   const r = new CircuitBreakerRegistry();
   const result = await r.execute(
-    "https://httpbin.org",
+    `${HTTPBIN_LOCAL_ORIGIN}`,
     async () => (await httpbin.get("/get")).status,
   );
   assert.equal(result, 200);
@@ -898,19 +982,22 @@ await test("registry.execute rejects with CircuitOpenError when breaker is open"
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => r.execute("https://httpbin.org", () => Promise.reject(netErr())));
   await assert.rejects(
-    () => r.execute("https://httpbin.org", async () => (await httpbin.get("/get")).status),
+    () => r.execute(`${HTTPBIN_LOCAL_ORIGIN}`, () => Promise.reject(netErr())),
+    isNetworkFailure,
+  );
+  await assert.rejects(
+    () => r.execute(`${HTTPBIN_LOCAL_ORIGIN}`, async () => (await httpbin.get("/get")).status),
     CircuitOpenError,
   );
 });
 
 await test("registry.trip and registry.reset control breaker state", async () => {
   const r = new CircuitBreakerRegistry();
-  r.trip("https://httpbin.org");
-  assert.equal(r.get("https://httpbin.org").state, "OPEN");
-  r.reset("https://httpbin.org");
-  assert.equal(r.get("https://httpbin.org").state, "CLOSED");
+  r.trip(`${HTTPBIN_LOCAL_ORIGIN}`);
+  assert.equal(r.get(`${HTTPBIN_LOCAL_ORIGIN}`).state, "OPEN");
+  r.reset(`${HTTPBIN_LOCAL_ORIGIN}`);
+  assert.equal(r.get(`${HTTPBIN_LOCAL_ORIGIN}`).state, "CLOSED");
 });
 
 await test("registry.snapshots returns state for all registered breakers", async () => {
@@ -954,7 +1041,7 @@ await test("registry isolates breakers per key", async () => {
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => r.execute("dead", () => Promise.reject(netErr())));
+  await assert.rejects(() => r.execute("dead", () => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(r.get("dead").state, "OPEN");
   assert.equal(r.get("healthy").state, "CLOSED", "a different origin is unaffected");
   const result = await r.execute("healthy", succeed("still here"));
@@ -974,7 +1061,7 @@ await test("registry.get applies overrides only when the breaker is created", as
   const first = r.get("k");
   const second = r.get("k", { failureThreshold: 1 });
   assert.equal(first, second, "the same instance is returned");
-  await assert.rejects(() => second.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => second.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(
     second.state,
     "CLOSED",
@@ -982,7 +1069,7 @@ await test("registry.get applies overrides only when the breaker is created", as
   );
   // A fresh key does get its override.
   const fresh = r.get("fresh", { failureThreshold: 1 });
-  await assert.rejects(() => fresh.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => fresh.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(fresh.state, "OPEN", "overrides do apply at creation");
 });
 
@@ -993,7 +1080,7 @@ await test("registry.delete drops the breaker and its state", async () => {
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => r.execute("k", () => Promise.reject(netErr())));
+  await assert.rejects(() => r.execute("k", () => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(r.get("k").state, "OPEN");
   r.delete("k");
   assert.equal(r.size, 0);
@@ -1037,10 +1124,10 @@ await test("createCircuitBreaker returns a configured CircuitBreaker", async () 
   assert.equal(cb.snapshot.state, "CLOSED");
   // `instanceof` is satisfied by a breaker that dropped the config entirely.
   for (let i = 0; i < 2; i++)
-    await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+    await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "OPEN", "the factory must apply the configuration it was given");
   const err = await cb.execute(succeed()).catch((e) => e);
-  assert.ok(err.message.includes('"factory"'), "the key must survive the factory");
+  assert.ok((err as Error).message.includes('"factory"'), "the key must survive the factory");
 });
 
 await test("createCircuitBreakerRegistry applies its default config", async () => {
@@ -1053,12 +1140,12 @@ await test("createCircuitBreakerRegistry applies its default config", async () =
   assert.equal(r instanceof CircuitBreakerRegistry, true);
   // A breaker that ignored the inherited defaults would never open.
   for (let i = 0; i < 3; i++) {
-    await assert.rejects(() => r.execute("k", () => Promise.reject(netErr())));
+    await assert.rejects(() => r.execute("k", () => Promise.reject(netErr())), isNetworkFailure);
   }
   assert.equal(r.get("k").state, "OPEN", "registry defaults must reach the breakers");
   // And a per-key override still applies at creation.
   const lenient = r.get("other", { failureThreshold: 99 });
-  await assert.rejects(() => lenient.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => lenient.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(lenient.state, "CLOSED");
 });
 
@@ -1085,7 +1172,7 @@ await test("healthy endpoint keeps circuit CLOSED over many requests", async () 
 });
 
 await test("real HTTP call with circuit breaker via kinetex client", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   client.enableCircuitBreaker({ windowSize: 5, failureThreshold: 5, resetTimeoutMs: 30000 });
   const r = await client.get("/get");
   assert.equal(r.status, 200);
@@ -1094,8 +1181,8 @@ await test("real HTTP call with circuit breaker via kinetex client", async () =>
   // anywhere, and the `any` hid the fact that the key was never checked.
   const keys = Object.keys(snaps);
   assert.equal(keys.length, 1, `expected exactly one breaker, got ${keys.join(", ")}`);
-  assert.equal(keys[0], "https://httpbin.org", "breakers are keyed by origin");
-  const snap = snaps["https://httpbin.org"];
+  assert.equal(keys[0], `${HTTPBIN_LOCAL_ORIGIN}`, "breakers are keyed by origin");
+  const snap = snaps[`${HTTPBIN_LOCAL_ORIGIN}`];
   assert.equal(snap.state, "CLOSED");
   assert.equal(snap.totalSuccesses, 1);
   assert.equal(snap.totalRequests, 1);
@@ -1107,32 +1194,32 @@ await test("real HTTP call with circuit breaker via kinetex client", async () =>
 await test("client circuit breaker is per-origin and isolated", async () => {
   // `circuitSnapshots` is keyed by origin, so one failing host must not take
   // the others down. Nothing checked that the keying was real.
-  const client = kinetex({ baseURL: "https://httpbin.org", timeout: T });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
   client.enableCircuitBreaker({ windowSize: 5, failureThreshold: 5, resetTimeoutMs: 30000 });
   const r = await client.get("/get");
   assert.equal(r.status, 200);
   const snaps = client.circuitSnapshots;
   const keys = Object.keys(snaps);
   assert.ok(
-    keys.every((k) => k.startsWith("https://")),
+    keys.every((k) => k === HTTPBIN_LOCAL_ORIGIN),
     `keys must be origins: ${keys.join(", ")}`,
   );
-  assert.ok(keys.includes("https://httpbin.org"));
+  assert.ok(keys.includes(`${HTTPBIN_LOCAL_ORIGIN}`));
   // A breaker for an unrelated origin starts fresh when first used.
   client.tripCircuit("https://other.example.com");
   assert.equal(client.circuitSnapshots["https://other.example.com"].state, "OPEN");
   assert.equal(
-    client.circuitSnapshots["https://httpbin.org"].state,
+    client.circuitSnapshots[`${HTTPBIN_LOCAL_ORIGIN}`].state,
     "CLOSED",
     "tripping one origin must not affect another",
   );
 });
 
 await test("tripCircuit and resetCircuit through kinetex client", async () => {
-  const client = kinetex({ baseURL: "https://httpbin.org" });
+  const client = kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, allowPrivateNetwork: true });
   client.enableCircuitBreaker();
-  client.tripCircuit("https://httpbin.org");
-  const before = client.circuitSnapshots["https://httpbin.org"];
+  client.tripCircuit(`${HTTPBIN_LOCAL_ORIGIN}`);
+  const before = client.circuitSnapshots[`${HTTPBIN_LOCAL_ORIGIN}`];
   // `before?.state` silently passed when the key was absent, turning a
   // missing breaker into a successful-looking assertion.
   assert.ok(before !== undefined, "tripping must create the breaker");
@@ -1141,19 +1228,22 @@ await test("tripCircuit and resetCircuit through kinetex client", async () => {
   // While OPEN the client must not reach the network.
   const err = await client.get("/get").catch((e) => e);
   assert.ok(err instanceof CircuitOpenError, "an open circuit must reject the request");
-  assert.equal(err.code, "ECIRCUITOPEN");
-  assert.equal(err.message, 'Circuit breaker OPEN for "https://httpbin.org" — request rejected');
-  assert.equal(client.circuitSnapshots["https://httpbin.org"].totalRejected, 1);
+  assert.equal((err as { code?: string }).code, "ECIRCUITOPEN");
+  assert.equal(
+    (err as Error).message,
+    `Circuit breaker OPEN for "${HTTPBIN_LOCAL_ORIGIN}" — request rejected`,
+  );
+  assert.equal(client.circuitSnapshots[`${HTTPBIN_LOCAL_ORIGIN}`].totalRejected, 1);
 
-  client.resetCircuit("https://httpbin.org");
-  const after = client.circuitSnapshots["https://httpbin.org"];
+  client.resetCircuit(`${HTTPBIN_LOCAL_ORIGIN}`);
+  const after = client.circuitSnapshots[`${HTTPBIN_LOCAL_ORIGIN}`];
   assert.ok(after !== undefined);
   assert.equal(after.state, "CLOSED");
   assert.equal(after.openedAt, null, "reset must clear openedAt");
   // And the client works again.
   const recovered = await client.get("/get");
   assert.equal(recovered.status, 200, "a reset circuit must serve traffic again");
-  assert.equal(client.circuitSnapshots["https://httpbin.org"].state, "CLOSED");
+  assert.equal(client.circuitSnapshots[`${HTTPBIN_LOCAL_ORIGIN}`].state, "CLOSED");
 });
 
 // ============================================================================
@@ -1186,7 +1276,7 @@ await test("regression: a single failed probe re-opens via the half-open branch 
   await wait(150);
   assert.equal(cb.state, "HALF_OPEN", "the reset window has elapsed");
 
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(
     cb.state,
     "OPEN",
@@ -1194,13 +1284,13 @@ await test("regression: a single failed probe re-opens via the half-open branch 
   );
   // A full resetTimeoutMs must pass again before it probes once more, i.e. it
   // really re-entered OPEN rather than lingering in HALF_OPEN.
-  assert.ok(cb.snapshot.openedAt !== null, "openedAt must be restamped on the re-open");
-  const reopenedAt = cb.snapshot.openedAt;
+  assert.ok((cb.snapshot.openedAt ?? 0) !== null, "openedAt must be restamped on the re-open");
+  const reopenedAt = cb.snapshot.openedAt ?? 0;
   await wait(150);
   assert.equal(cb.state, "HALF_OPEN", "and the reset window restarts from the re-open");
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "OPEN");
-  assert.ok(cb.snapshot.openedAt >= reopenedAt, "openedAt advances on each re-open");
+  assert.ok((cb.snapshot.openedAt ?? 0) >= reopenedAt, "openedAt advances on each re-open");
 });
 
 suite("regression: window smaller than the threshold");
@@ -1228,13 +1318,35 @@ await test("regression: a window smaller than the threshold is widened, not igno
   assert.match(warnings[0], /failureThreshold/);
   assert.match(warnings[0], /never (be reached|open)/);
 
-  for (let i = 0; i < 50; i++)
-    await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  // The first `failureThreshold` calls really do fail, and the breaker opens on
+  // the fifth. Only then do the remaining calls stop running the caller at all
+  // and get refused outright — so the two halves are asserted separately. A bare
+  // `assert.rejects` accepted either outcome for all fifty iterations, which
+  // meant this loop never actually established that the breaker opens.
+  for (let i = 0; i < 5; i++) {
+    await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
+  }
   assert.equal(
     cb.state,
     "OPEN",
-    "fifty consecutive failures must open the circuit, whatever the window size",
+    "five consecutive failures must open the circuit, whatever the window size",
   );
+  let ranAfterOpen = 0;
+  for (let i = 0; i < 45; i++) {
+    await assert.rejects(
+      () =>
+        cb.execute(() => {
+          ranAfterOpen++;
+          return Promise.reject(netErr());
+        }),
+      (e: unknown) => {
+        assert.ok(e instanceof CircuitOpenError, `expected CircuitOpenError, got ${String(e)}`);
+        assert.equal(e.code, "ECIRCUITOPEN");
+        return true;
+      },
+    );
+  }
+  assert.equal(ranAfterOpen, 0, "an OPEN breaker must not run the caller's function");
   assert.equal(cb.snapshot.failureCount, 5, "the window now holds the threshold");
 });
 
@@ -1249,13 +1361,13 @@ await test("regression: the widened window still slides", async () => {
       }),
   );
   for (let i = 0; i < 4; i++)
-    await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+    await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "OPEN");
   cb.reset();
   // After the widening, the window is 4 — a single success must not erase the
   // run, and the eviction must still be one-result-at-a-time.
   // The window is now 4, so the single failure survives two results.
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.snapshot.failureCount, 1, "window is [F]");
   await cb.execute(succeed());
   assert.equal(cb.snapshot.failureCount, 1, "window is [F, S] — the failure survives");
@@ -1286,16 +1398,16 @@ await test("regression: windowSize 0 consecutive mode is left alone", async () =
       }),
   );
   assert.equal(warnings.length, 0, "consecutive mode is a valid configuration, not a mistake");
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.snapshot.failureCount, 2);
   // A success clears the whole run in consecutive mode.
   await cb.execute(succeed());
   assert.equal(cb.snapshot.failureCount, 0);
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "CLOSED", "two is below three again");
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "OPEN");
 });
 
@@ -1312,7 +1424,7 @@ await test("regression: `state` reflects the elapsed reset window without traffi
     resetTimeoutMs: 100,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   assert.equal(cb.state, "OPEN", "immediately after opening");
   assert.equal(cb.snapshot.state, "OPEN");
   await wait(150);
@@ -1330,9 +1442,11 @@ await test("regression: `state` reflects the elapsed reset window without traffi
     failureThreshold: 1,
     resetTimeoutMs: 100,
     failures: { networkErrors: true },
-    onHalfOpen: () => halfOpenFired++,
+    onHalfOpen: () => {
+      halfOpenFired++;
+    },
   });
-  await assert.rejects(() => observed.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => observed.execute(() => Promise.reject(netErr())), isNetworkFailure);
   await wait(150);
   for (let i = 0; i < 5; i++) {
     // Polled like a dashboard would. Each read is checked rather than merely
@@ -1356,7 +1470,7 @@ await test("regression: a request after the window is admitted, and probes", asy
     successThreshold: 1,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   await wait(150);
   // Must NOT be rejected: the elapsed window makes the circuit probeable.
   const result = await cb.execute(succeed("probed"));
@@ -1379,7 +1493,7 @@ await test("regression: a half-open rejection does not claim the circuit is OPEN
     halfOpenConcurrency: 1,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   await wait(150);
   const probe = cb.execute(async () => {
     await wait(120);
@@ -1391,12 +1505,12 @@ await test("regression: a half-open rejection does not claim the circuit is OPEN
   assert.ok(err instanceof CircuitOpenError);
   assert.equal(err.state.state, "HALF_OPEN", "the snapshot says HALF_OPEN");
   assert.equal(
-    err.message,
+    (err as Error).message,
     `Circuit breaker HALF_OPEN for "r7" — request rejected`,
     "so the message must say HALF_OPEN too",
   );
   assert.ok(
-    err.message.startsWith("Circuit breaker HALF_OPEN "),
+    (err as Error).message.startsWith("Circuit breaker HALF_OPEN "),
     "the state in the message must be the state in the snapshot",
   );
   await probe;
@@ -1410,12 +1524,12 @@ await test("regression: a genuinely open circuit still says OPEN", async () => {
     resetTimeoutMs: 60000,
     failures: { networkErrors: true },
   });
-  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())));
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
   const err = await cb.execute(succeed()).catch((e) => e);
-  assert.equal(err.state.state, "OPEN");
-  assert.equal(err.message, `Circuit breaker OPEN for "r8" — request rejected`);
-  assert.equal(err.name, "CircuitOpenError");
-  assert.equal(err.code, "ECIRCUITOPEN");
+  assert.equal((err as { state: { state: string } }).state.state, "OPEN");
+  assert.equal((err as Error).message, `Circuit breaker OPEN for "r8" — request rejected`);
+  assert.equal((err as Error).name, "CircuitOpenError");
+  assert.equal((err as { code?: string }).code, "ECIRCUITOPEN");
   assert.ok(err instanceof Error, "must remain a real Error for `catch (e) { e.message }`");
 });
 
@@ -1429,7 +1543,7 @@ if (failures.length > 0) {
   console.log("\nFailures:");
   for (const { name, err } of failures) {
     console.log(`  ✗ ${name}`);
-    if (err instanceof Error) console.log(`    ${err.message}`);
+    if (err instanceof Error) console.log(`    ${(err as Error).message}`);
   }
   process.exit(1);
 }

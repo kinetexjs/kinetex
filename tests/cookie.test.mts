@@ -22,7 +22,7 @@ let passed = 0;
 let failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
 
-async function test(name: string, fn: () => Promise<void>): Promise<void> {
+async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
     await fn();
     console.log(`  ✅  ${name}`);
@@ -46,7 +46,7 @@ function suite(name: string): void {
 suite("Cookie Date Parsing");
 
 await test("parseCookieDate parses real RFC 6265 date", async () => {
-  // Was `assert.notEqual(date, null)` + `assert.ok(date > 0)`, which any
+  // Was `assert.ok(date !== null)` + `assert.ok(date > 0)`, which any
   // non-zero timestamp satisfies — a parser returning the epoch, or the wrong
   // day entirely, passed. Pin the exact instant.
   assert.equal(parseCookieDate("Wed, 21 Oct 2015 07:28:00 GMT"), Date.UTC(2015, 9, 21, 7, 28, 0));
@@ -255,7 +255,7 @@ await test("parseSetCookieHeader parses cookie with attributes", async () => {
 
 await test("parseSetCookieHeader parses cookie with expires", async () => {
   const cookie = parseSetCookieHeader("name=value; Expires=Wed, 21 Oct 2015 07:28:00 GMT");
-  assert.notEqual(cookie, null);
+  assert.ok(cookie !== null);
   // Was `assert.ok(cookie.expires)` — any truthy value passed, including a
   // Date for the wrong day. Pin the exact instant.
   // parseSetCookieHeader yields epoch milliseconds (CookieJar's own Cookie.expires
@@ -323,7 +323,7 @@ await test("parseSetCookieHeader parses cookie with SameSite", async () => {
 suite("Set-Cookie Header Splitting");
 
 await test("splitSetCookieHeaders splits multiple cookies", async () => {
-  // Was `assert.notEqual(headers, null)` — always true for an array — plus a
+  // Was `assert.ok(headers !== null)` — always true for an array — plus a
   // length. Two mangled fragments still have length 2, so assert the values.
   assert.deepEqual(splitSetCookieHeaders("name1=value1; Path=/, name2=value2; Path=/"), [
     "name1=value1; Path=/",

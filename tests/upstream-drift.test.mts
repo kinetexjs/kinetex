@@ -1,8 +1,9 @@
 /**
  * The upstream-drift guard, tested.
  *
- * `tests/upstream.ts` decides when a failed assertion against live httpbin is
- * somebody else's outage rather than a defect in this client. That decision is
+ * `tests/upstream.ts` decides when a failed assertion against a third-party
+ * origin is somebody else's outage rather than a defect in this client. That
+ * decision is
  * the one place in the test suite where a failure can be made to disappear, so
  * it is pinned here rather than trusted: the tests below are the answer to
  * "what stops this from quietly turning red into green?"
@@ -143,6 +144,7 @@ suite("upstream drift — guard accounting");
 
 await check("a drifted status does not throw and is not a failure", () => {
   const { assert: guarded, report } = createDriftGuard(assert);
+  const guardedAssert: typeof assert = guarded;
   assert.doesNotThrow(() => guarded.equal(502, 200));
   assert.equal(report.failures, 0);
   assert.equal(report.drift, 1);
@@ -150,6 +152,7 @@ await check("a drifted status does not throw and is not a failure", () => {
 
 await check("a genuine mismatch still throws and is counted", () => {
   const { assert: guarded, report } = createDriftGuard(assert);
+  const guardedAssert: typeof assert = guarded;
   assert.throws(() => guarded.equal(500, 200), /AssertionError/);
   assert.equal(report.failures, 1, "a real failure must be counted");
   assert.equal(report.drift, 0, "and must not be filed as drift");
@@ -159,7 +162,8 @@ await check("a drifted status does not mask a later real failure", () => {
   // The escape hatch must not leak: excusing one assertion cannot disarm the
   // guard for the rest of the run.
   const { assert: guarded, report } = createDriftGuard(assert);
-  guarded.equal(503, 200);
+  const guardedAssert: typeof assert = guarded;
+  guardedAssert.equal(503, 200);
   assert.throws(() => guarded.equal(200, 404), /AssertionError/);
   assert.equal(report.failures, 1);
   assert.equal(report.drift, 1);
@@ -167,17 +171,19 @@ await check("a drifted status does not mask a later real failure", () => {
 
 await check("non-status assertions pass straight through", () => {
   const { assert: guarded, report } = createDriftGuard(assert);
+  const guardedAssert: typeof assert = guarded;
   assert.doesNotThrow(() => guarded.equal("abc", "abc"));
   assert.doesNotThrow(() => guarded.ok(true));
   assert.equal(report.failures, 0);
   assert.equal(report.drift, 0);
-  assert.throws(() => guarded.equal("a", "b"));
+  assert.throws(() => guarded.equal("a", "b"), assert.AssertionError);
   assert.equal(report.failures, 1);
 });
 
 await check("a pass through the guard is still a pass", () => {
   const { assert: guarded, report } = createDriftGuard(assert);
-  guarded.equal(200, 200);
+  const guardedAssert: typeof assert = guarded;
+  guardedAssert.equal(200, 200);
   assert.equal(report.failures, 0);
   assert.equal(report.drift, 0);
 });
@@ -191,8 +197,9 @@ await check("non-function properties survive the proxy", () => {
 
 await check("every excused assertion is named in the report", () => {
   const { assert: guarded, report } = createDriftGuard(assert);
-  guarded.equal(502, 200);
-  guarded.equal(429, 201);
+  const guardedAssert: typeof assert = guarded;
+  guardedAssert.equal(502, 200);
+  guardedAssert.equal(429, 201);
   const text = report.text();
   assert.ok(text.includes("2 assertion(s) were INCONCLUSIVE"), "the count is stated");
   assert.ok(text.includes("expected 200"), "the first expectation is named");
@@ -202,12 +209,14 @@ await check("every excused assertion is named in the report", () => {
 
 await check("a clean run prints no drift report at all", () => {
   const { assert: guarded, report } = createDriftGuard(assert);
-  guarded.equal(200, 200);
+  const guardedAssert: typeof assert = guarded;
+  guardedAssert.equal(200, 200);
   assert.equal(report.text(), "", "silence is the correct output when nothing drifted");
 });
 
 await check("an excused assertion is attributed to a real call site", () => {
   const { assert: guarded, report } = createDriftGuard(assert);
+  const guardedAssert: typeof assert = guarded;
   const mark = () => guarded.equal(503, 200);
   mark();
   assert.equal(report.sites.length, 1);
@@ -294,32 +303,40 @@ await check("does not excuse a size-limit error", () => {
 suite("upstream drift — suites cannot bypass the guard");
 
 /** Live-network suites, and how each is expected to reach the guard. */
-const LIVE_SUITES: Array<{ file: string; needs: RegExp[] }> = [
-  {
-    // This is the suite the drift guard was written for: it has bare
-    // `assert.strictEqual(res.status, N)` calls against live httpbin, so every
-    // one of them must go through the proxy rather than node:test's assert.
-    file: "mod.test.mts",
-    needs: [
-      /createDriftGuard/,
-      /from "\.\/upstream\.ts"/,
-      /driftReport\.failures/,
-      /driftReport\.drift/,
-    ],
-  },
-  { file: "core.test.mts", needs: [/isUpstreamStatusDrift/, /isUpstreamFlake/] },
-  { file: "client.test.mts", needs: [/isUpstreamStatusDrift/, /isUpstreamFlake/] },
-];
+/**
+ * No suite reaches a third-party origin any more: every request goes to the
+ * local fixture in tests/httpbin-local.ts (see tests/live-network.test.mts, which
+ * fails the build if that stops being true).
+ *
+ * So there is no upstream status drift to excuse. The guard stayed in place —
+ * dropping it would be a bigger change than the migration warranted — but it is
+ * now deliberately unused, and this list is empty on purpose rather than by
+ * omission. A suite that reintroduces a live origin has to add itself here *and*
+ * wire the guard, and the check below is what would notice.
+ */
+const LIVE_SUITES: Array<{ file: string; needs: RegExp[] }> = [];
 
-await check("every live-network suite reaches the shared guard", () => {
+await check("a suite is live only if it both dials out and uses the guard", () => {
   for (const { file, needs } of LIVE_SUITES) {
     const text = source(file);
     for (const pattern of needs) {
       assert.ok(
         pattern.test(text),
-        `${file} no longer references ${pattern} — it has lost its upstream-drift guard`,
+        `${file} is listed as live but no longer references ${pattern} — drop it here, or restore the guard`,
       );
     }
+  }
+});
+
+await check("the suite that used to need the guard no longer does", () => {
+  // This is the check that would have caught the migration being declared done
+  // while `client.test.mts` still carried guard calls against a local server,
+  // where a "drift" can never occur and the guard would only mask a failure.
+  for (const file of ["core.test.mts", "client.test.mts"]) {
+    assert.ok(
+      !/skipOnUpstreamDrift/.test(source(file)),
+      `${file} still calls skipOnUpstreamDrift, but it is served by the local fixture`,
+    );
   }
 });
 

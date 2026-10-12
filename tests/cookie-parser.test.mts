@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 import { kinetex } from "../src/mod.ts";
 
-const client = kinetex({ timeout: 30000 });
+const client = kinetex({ timeout: 30000, allowPrivateNetwork: true });
 
 let passed = 0;
 let failed = 0;
@@ -87,7 +88,7 @@ await test("2-digit year mapping pivots exactly at 69/70", () => {
   // "some year in the right century".
   const yearOf = (s: string) => {
     const ts = parseCookieDate(s);
-    assert.notEqual(ts, null, `${s} must parse`);
+    assert.ok(ts !== null, `${s} must parse`);
     return new Date(ts).getUTCFullYear();
   };
   assert.equal(yearOf("01 Jan 68 00:00:00 GMT"), 2068);
@@ -946,7 +947,7 @@ await test("parseSetCookieHeader - no equals sign (value-only)", () => {
 suite("Real HTTP Calls");
 
 await test("httpbin /cookies returns current cookies object", async () => {
-  const res = await client.get("https://httpbin.org/cookies");
+  const res = await client.get<{ cookies: unknown }>(`${HTTPBIN_LOCAL_ORIGIN}/cookies`);
   assert.equal(res.status, 200);
   // /cookies returns {"cookies": {...}} even when empty
   assert.ok(typeof res.data === "object");
@@ -955,8 +956,8 @@ await test("httpbin /cookies returns current cookies object", async () => {
 });
 
 await test("httpbin /cookies/set with redirect manual", async () => {
-  const res = await client.get("https://httpbin.org/cookies/set?testcookie=realvalue", {
-    redirect: "manual",
+  const res = await client.get(`${HTTPBIN_LOCAL_ORIGIN}/cookies/set?testcookie=realvalue`, {
+    followRedirects: false,
   });
   // httpbin should redirect with Set-Cookie
   const setCookies = extractSetCookieHeaders(res.headers);
@@ -976,7 +977,7 @@ await test("httpbin /cookies/set with redirect manual", async () => {
 });
 
 await test("httpbin /response-headers echoes Set-Cookie from params", async () => {
-  const res = await client.get("https://httpbin.org/response-headers?Set-Cookie=fake=cookie");
+  const res = await client.get(`${HTTPBIN_LOCAL_ORIGIN}/response-headers?Set-Cookie=fake=cookie`);
   const setCookies = extractSetCookieHeaders(res.headers);
   assert.equal(setCookies.length, 1);
   assert.equal(setCookies[0], "fake=cookie");
@@ -984,7 +985,12 @@ await test("httpbin /response-headers echoes Set-Cookie from params", async () =
 
 await test("kinetex cookie jar captures real Set-Cookie and re-sends on next request", async () => {
   // Use kinetex with cookie jar enabled to test end-to-end cookie handling
-  const jarClient = kinetex({ baseURL: "https://httpbin.org", timeout: 30000, cookieJar: true });
+  const jarClient = kinetex({
+    baseURL: HTTPBIN_LOCAL_ORIGIN,
+    timeout: 30000,
+    cookieJar: true,
+    allowPrivateNetwork: true,
+  });
 
   // httpbin /cookies/set?name=value sets a cookie and redirects
   // The cookie jar should capture the Set-Cookie from the redirect
@@ -1005,9 +1011,9 @@ await test("kinetex cookie jar captures real Set-Cookie and re-sends on next req
 });
 
 await test("extractSetCookieHeaders + parseSetCookieHeader with real httpbin Set-Cookie", async () => {
-  // httpbin /cookies/set with redirect:manual returns Set-Cookie headers in the redirect response
-  const res = await client.get("https://httpbin.org/cookies/set?realtest=realvalue", {
-    redirect: "manual",
+  // httpbin /cookies/set with followRedirects:manual returns Set-Cookie headers in the redirect response
+  const res = await client.get(`${HTTPBIN_LOCAL_ORIGIN}/cookies/set?realtest=realvalue`, {
+    followRedirects: false,
   });
   const rawSetCookie = extractSetCookieHeaders(res.headers);
 
@@ -1021,7 +1027,12 @@ await test("extractSetCookieHeaders + parseSetCookieHeader with real httpbin Set
   } else {
     // httpbin may return the cookie in body instead of Set-Cookie header
     // Verify via the /cookies endpoint
-    const jarClient = kinetex({ baseURL: "https://httpbin.org", timeout: 30000, cookieJar: true });
+    const jarClient = kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: 30000,
+      cookieJar: true,
+      allowPrivateNetwork: true,
+    });
     await jarClient.get("/cookies/set", { params: { realtest: "bodyvalue" }, throwOnError: false });
     const check = await jarClient.get<{ cookies: Record<string, string> }>("/cookies");
     assert.equal(check.data.cookies["realtest"], "bodyvalue");
@@ -1044,7 +1055,7 @@ await test("extractSetCookieHeaders from array of Set-Cookie values", () => {
 await test("kinetex cookie jar with multiple Set-Cookie headers", async () => {
   // Use response-headers to echo back multiple Set-Cookie values
   const res = await client.get(
-    "https://httpbin.org/response-headers?Set-Cookie=a=1&Set-Cookie=b=2",
+    `${HTTPBIN_LOCAL_ORIGIN}/response-headers?Set-Cookie=a=1&Set-Cookie=b=2`,
   );
   const raw = extractSetCookieHeaders(res.headers);
   assert.equal(raw.length, 2);

@@ -21,6 +21,7 @@ import {
   isAbortError,
   safeJSONParse,
   isSafeURL,
+  isBlockedAddress,
   randomBytes,
 } from "./utils.ts";
 import { isValidHeaderName, isValidHeaderValue } from "./headers.ts";
@@ -207,6 +208,25 @@ export interface FetchTransportOptions {
    */
   fetchFn?: typeof globalThis.fetch;
   /**
+   * Permit connections to hosts that resolve into private, loopback or
+   * link-local space. Default: false.
+   *
+   * @see {@link import("./types.ts").KinetexOptions.allowPrivateNetwork}
+   */
+  allowPrivateNetwork?: boolean;
+  /**
+   * Per-request timeout in milliseconds.
+   *
+   * `fetch()` has no timeout of its own, so without this a hung request waits
+   * forever. `NodeHTTP2Transport` set its own `requestTimeoutMs`, but the
+   * HTTP/1.1 fallback it delegates to did not pass anything down — so
+   * `new NodeHTTP2Transport({ requestTimeoutMs: 500 })` against a slow host
+   * waited the full response time while the HTTP/2 path gave up at 500 ms.
+   *
+   * Omit for no timeout (the previous behaviour on this path).
+   */
+  requestTimeoutMs?: number;
+  /**
    * When `true`, invalid headers cause a `KinetexError` instead of being
    * silently dropped. Recommended for strict/production environments where
    * silent data loss is unacceptable.
@@ -255,6 +275,13 @@ export class FetchTransport implements Transport {
   private readonly strict: boolean;
   private readonly onDroppedHeader: ((name: string, value: string) => void) | undefined;
   private readonly dispatcher: unknown;
+  /** Per-request timeout; omitted means no timeout. */
+  private readonly requestTimeoutMs: number | undefined;
+  /**
+   * Permit connections to hosts resolving into private/loopback space.
+   * Default: false.
+   */
+  private readonly _allowPrivateNetwork: boolean;
 
   /**
    * @param fetchFnOrOptions - Custom fetch function or options object
@@ -267,12 +294,74 @@ export class FetchTransport implements Transport {
       this.strict = false;
       this.onDroppedHeader = undefined;
       this.dispatcher = undefined;
+      this.requestTimeoutMs = undefined;
+      this._allowPrivateNetwork = false;
     } else {
       this.fetchFn = fetchFnOrOptions.fetchFn ?? globalThis.fetch;
       this.strict = fetchFnOrOptions.strict ?? false;
       this.onDroppedHeader = fetchFnOrOptions.onDroppedHeader;
       this.dispatcher = fetchFnOrOptions.dispatcher;
+      this.requestTimeoutMs = fetchFnOrOptions.requestTimeoutMs;
+      this._allowPrivateNetwork = fetchFnOrOptions.allowPrivateNetwork ?? false;
     }
+  }
+
+  /**
+   * Refuse a host that resolves into blocked address space.
+   *
+   * The Node transports close DNS rebinding properly: they resolve once and
+   * pin the checked address to the socket (`createPinnedLookup`). `fetch` has no
+   * resolver hook — undici owns the connection and exposes no way to install
+   * one — so the only place to intervene is before the call.
+   *
+   * That closes the case that matters in practice: a name resolving to loopback
+   * or the cloud metadata address is refused outright, which is the vector
+   * behind the classic SSRF-through-DNS attacks. What it cannot close is a
+   * resolver that answers public on this lookup and private on the connect a
+   * moment later. Closing *that* needs a resolver hook `fetch` does not offer,
+   * and claiming otherwise would be worse than saying so.
+   *
+   * The host has already passed the lexical screen by this point, so this is a
+   * second line of defence rather than the first.
+   */
+  private async assertReachableHost(url: string): Promise<void> {
+    if (this._allowPrivateNetwork) return;
+    // A caller-supplied `fetch` owns its own name resolution — its dispatcher,
+    // agent or resolver may answer something the system resolver never would,
+    // and vice versa. Screening the *system* answer for a name this transport
+    // will not resolve is theatre: it cannot observe the connection that
+    // actually happens, so it neither protects the caller nor describes the
+    // risk honestly. The lexical screen still applies to every URL, including
+    // redirects; the resolution half of the defence is the transport's job, and
+    // a custom one is the caller's.
+    if (this.fetchFn !== globalThis.fetch) return;
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return; // Malformed URLs fail later, with a better message.
+    }
+    if (!parsed.hostname || isIP(parsed.hostname)) return;
+
+    let addresses: Array<{ address: string; family: number }>;
+    try {
+      // `all: true` so every candidate is inspected, matching what the socket
+      // would have been able to reach.
+      addresses = await new Promise<Array<{ address: string; family: number }>>(
+        (resolve, reject) => {
+          dnsLookup(parsed.hostname, { all: true }, (err, res) =>
+            err ? reject(err) : resolve(res as Array<{ address: string; family: number }>),
+          );
+        },
+      );
+    } catch {
+      // Resolution failed; let the request itself report it rather than
+      // inventing a different failure.
+      return;
+    }
+    const safe = filterSafeAddresses(addresses);
+    if (safe.length > 0) return;
+    throw blockedHostError(url, addresses);
   }
 
   /**
@@ -286,6 +375,8 @@ export class FetchTransport implements Transport {
    * @returns Raw response from the server
    */
   async send(req: KinetexRequest): Promise<RawResponse> {
+    await this.assertReachableHost(req.url);
+
     // Validate and sanitize headers to prevent injection attacks
     const sanitizedHeaders: Record<string, string> = {};
     for (const [name, value] of Object.entries(req.headers ?? {})) {
@@ -369,10 +460,41 @@ export class FetchTransport implements Transport {
       (init as unknown as { dispatcher?: unknown }).dispatcher = this.dispatcher;
     }
 
+    // fetch() has no timeout of its own, so one is enforced here with an
+    // AbortController. Composed with the caller's signal rather than replacing
+    // it, so cancelling the caller still cancels the request.
+    const timeoutMs = this.requestTimeoutMs;
+    const timeoutCtl = timeoutMs === undefined ? undefined : new AbortController();
+    let timedOut = false;
+    const onCallerAbort = () => timeoutCtl?.abort();
+    if (timeoutCtl && req.signal) {
+      if (req.signal.aborted) timeoutCtl.abort();
+      else req.signal.addEventListener("abort", onCallerAbort, { once: true });
+    }
+    const timer =
+      timeoutCtl && timeoutMs !== undefined
+        ? setTimeout(() => {
+            timedOut = true;
+            timeoutCtl.abort();
+          }, timeoutMs)
+        : undefined;
+    const initWithSignal: RequestInit =
+      timeoutCtl && !init.signal ? { ...init, signal: timeoutCtl.signal } : init;
+
     let response: Response;
     try {
-      response = await this.fetchFn(req.url, init);
+      response = await this.fetchFn(req.url, initWithSignal);
     } catch (err) {
+      // Clear the timer on every exit path, and drop the listener we added.
+      if (timer !== undefined) clearTimeout(timer);
+      if (timeoutCtl && req.signal) req.signal.removeEventListener("abort", onCallerAbort);
+      if (timedOut) {
+        throw new KinetexError(
+          `HTTP/1.1 request to ${req.url} timed out after ${timeoutMs}ms`,
+          "ETIMEOUT",
+          { request: req, cause: err },
+        );
+      }
       if (isAbortError(err)) {
         throw new KinetexError("Request was aborted", "EABORT", { request: req, cause: err });
       }
@@ -382,6 +504,8 @@ export class FetchTransport implements Transport {
         { request: req, cause: err },
       );
     }
+    if (timer !== undefined) clearTimeout(timer);
+    if (timeoutCtl && req.signal) req.signal.removeEventListener("abort", onCallerAbort);
 
     const headers = normalizeHeaders(response.headers);
     const httpVersion = detectHTTPVersion(response, headers);
@@ -464,6 +588,8 @@ export class NodeHTTP2Transport implements Transport {
    * sockets, which is a lot to hold open for a legacy fallback), and gives
    * callers a way to opt out.
    */
+  /** Whether to permit connections into private/loopback address space. */
+  private readonly _allowPrivateNetwork: boolean;
   private readonly _http1KeepAlive: boolean;
   private readonly _http1MaxSockets: number;
   private _http1Agent: import("node:https").Agent | null = null;
@@ -495,11 +621,29 @@ export class NodeHTTP2Transport implements Transport {
        * Node.js only.
        */
       proxy?: import("./types.ts").ProxyConfig;
+      /**
+       * Permit connections to hosts that resolve into private, loopback or
+       * link-local address space. Default: `false`.
+       *
+       * A hostname is screened as written, but the socket is dialled at whatever
+       * that name *resolves to*, and nothing between the two re-checked the
+       * answer. Without this, a name that answered with `127.0.0.1` reached a
+       * loopback service and one that answered with `169.254.169.254` reached a
+       * cloud metadata endpoint — DNS rebinding, needing only control of the
+       * domain being requested.
+       *
+       * Set this to reach a service on `localhost`, a private network, or a
+       * container network — which is most local development, and every test
+       * that stands up a local server. Leave it unset for anything processing
+       * untrusted URLs.
+       */
+      allowPrivateNetwork?: boolean;
     } = {},
   ) {
     this.sessionTTLMs = options.sessionTTLMs ?? 5 * 60_000;
     this.pingIntervalMs = options.pingIntervalMs ?? 30_000;
     this.maxSessions = options.maxSessions ?? 100;
+    this._allowPrivateNetwork = options.allowPrivateNetwork ?? false;
     this._http1KeepAlive = options.http1KeepAlive ?? true;
     this._http1MaxSockets = options.http1MaxSockets ?? 16;
     this._proxy = options.proxy;
@@ -595,6 +739,9 @@ export class NodeHTTP2Transport implements Transport {
       (resolve, reject) => {
         const s = http2.connect(origin, {
           rejectUnauthorized: true,
+          // Resolve-and-check, so a hostname that points at a private address is
+          // refused before anything is dialled. See `createPinnedLookup`.
+          ...(this._allowPrivateNetwork ? {} : { lookup: PINNED_LOOKUP }),
           ...(this._ca !== undefined ? { ca: this._ca } : {}),
           // Already connected (and already TLS-wrapped for an https origin),
           // so node:http2 must use it as-is rather than negotiating again.
@@ -1071,6 +1218,10 @@ export class NodeHTTP2Transport implements Transport {
         const opts: FetchTransportOptions = {
           fetchFn: globalThis.fetch,
           strict: this._strict,
+          // The h2 path enforces `_requestTimeoutMs` itself; without passing it
+          // down, `new NodeHTTP2Transport({ requestTimeoutMs: 500 })` hung for
+          // the full response time on any non-https URL or HTTP/1.1 request.
+          requestTimeoutMs: this._requestTimeoutMs,
         };
         if (this._onDroppedHeader !== undefined) opts.onDroppedHeader = this._onDroppedHeader;
         this._http1Fallback = new FetchTransport(opts);
@@ -1116,6 +1267,8 @@ export class NodeHTTP2Transport implements Transport {
       // private or self-signed peer could not be reached without disabling
       // verification process-wide.
       ...(this._ca !== undefined ? { ca: this._ca } : {}),
+      // Same reason as the HTTP/2 path above.
+      ...(this._allowPrivateNetwork ? {} : { lookup: PINNED_LOOKUP }),
     };
 
     return new Promise<RawResponse>((resolve, reject) => {
@@ -1312,6 +1465,8 @@ export function createTransport(
     ca?: string | string[];
     /** HTTP(S) CONNECT proxy (Node.js only). */
     proxy?: import("./types.ts").ProxyConfig;
+    /** Permit connections to hosts resolving into private/loopback space. Default: false. */
+    allowPrivateNetwork?: boolean;
   },
 ): Transport {
   // FIX (M7-class silent no-op): a custom `fetch` config was silently ignored on
@@ -1365,6 +1520,9 @@ export function createTransport(
         ? { requestTimeoutMs: sessionOptions.requestTimeoutMs }
         : {}),
       ...(transportOptions?.strict !== undefined ? { strict: transportOptions.strict } : {}),
+      ...(transportOptions?.allowPrivateNetwork !== undefined
+        ? { allowPrivateNetwork: transportOptions.allowPrivateNetwork }
+        : {}),
       ...(transportOptions?.onDroppedHeader !== undefined
         ? { onDroppedHeader: transportOptions.onDroppedHeader }
         : {}),
@@ -1380,6 +1538,12 @@ export function createTransport(
       : {}),
     ...(transportOptions?.dispatcher !== undefined
       ? { dispatcher: transportOptions.dispatcher }
+      : {}),
+    // Reaches the pre-flight DNS screen in FetchTransport. It was accepted by
+    // createTransport and then dropped, so every fetch-based runtime silently
+    // had the screen off.
+    ...(transportOptions?.allowPrivateNetwork !== undefined
+      ? { allowPrivateNetwork: transportOptions.allowPrivateNetwork }
       : {}),
   });
 }
@@ -1504,11 +1668,18 @@ export async function readRawBody(
 
       if (done) break;
 
+      // Same policy as the readers in response.ts, reached through the same
+      // helper. The error class stays this entry point's own: `SizeLimitError`
+      // is a `KinetexError` carrying code `ESIZELIMIT`, where the response
+      // readers raise `ResponseSizeLimitError`, which is a bare `Error` with the
+      // same code. Both are public and documented, and merging them would be a
+      // breaking change, so the factory is passed in rather than shared.
       if (maxBytes > 0) {
-        const newTotal = total + value.byteLength;
-        if (newTotal > maxBytes) {
+        try {
+          limitAction(value, total, { maxBytes }, "throw", (n, max) => new SizeLimitError(n, max));
+        } catch (err) {
           await reader.cancel("size limit exceeded");
-          throw new SizeLimitError(newTotal, maxBytes);
+          throw err;
         }
       }
 
@@ -1622,7 +1793,115 @@ export function parseBody<T>(
 // ============================================================================
 
 // FIX 12: normalizeHeaders centralised in utils.ts.
+import { lookup as dnsLookup } from "node:dns";
+import { isIP } from "node:net";
+/** One instance, shared: it holds no per-request state. */
+const PINNED_LOOKUP = createPinnedLookup();
+
+/**
+ * A `lookup` for node:http and node:http2 that closes the DNS-rebinding gap.
+ *
+ * `isSafeURL` reads the hostname the caller wrote. The socket, however, is
+ * dialled at whatever that hostname *resolves to*, and nothing between the two
+ * points re-checked the answer — so a name that resolves to a public address on
+ * the first lookup and to `127.0.0.1` on the second reached a private service.
+ * That is DNS rebinding, and it needs an attacker-controlled resolver, which is
+ * an ordinary capability for whoever controls the domain being requested.
+ *
+ * Resolving here and pinning the result closes it for the connection that
+ * follows: every address the resolver returns is checked against the same
+ * blocklist `isSafeURL` applies to a literal, and only a checked address is
+ * handed back for the dial. A name that resolves solely to private space fails
+ * instead of connecting.
+ *
+ * The alternative — checking the hostname again after connecting — is too late:
+ * the request is already on the wire.
+ *
+ * `dns.lookup` (not `resolve`) is used deliberately: it honours `/etc/hosts`,
+ * the resolver search list and `dns.setDefaultResultOrder`, so a host pinned in
+ * the system file resolves the way it would have without this, and the address
+ * handed back is the one the socket would have reached anyway.
+ */
+/**
+ * Drop every resolved address that falls in a blocked range.
+ *
+ * Exported separately from `createPinnedLookup` so the decision can be tested
+ * against addresses a resolver would have to be trusted to produce: a name
+ * that answers with a public address and a private one is the rebinding case,
+ * and it cannot be arranged offline through a real resolver.
+ */
+export function filterSafeAddresses<T extends { address: string; family?: number }>(
+  addresses: readonly T[],
+): T[] {
+  return addresses.filter((a) => a.family !== 0 && !isBlockedAddress(a.address));
+}
+
+/**
+ * The refusal a host whose every resolved address is blocked earns.
+ *
+ * Split out from {@link FetchTransport} so the message and code can be
+ * asserted without arranging a resolver that answers with a blocked address.
+ */
+export function blockedHostError(
+  url: string,
+  addresses: ReadonlyArray<{ address: string }>,
+): KinetexError {
+  return new KinetexError(
+    `URL "${url}" resolved only to blocked addresses (${
+      addresses.map((a) => a.address).join(", ") || "none"
+    })`,
+    "EBLOCKEDHOST",
+  );
+}
+
+export function createPinnedLookup(): import("node:net").LookupFunction {
+  return (hostname, options, callback) => {
+    // Node's declared callback takes an address even on failure, and it ignores
+    // it — callers branch on `err` first. Node's own resolvers call back with
+    // the error alone, so this matches them rather than inventing a bogus
+    // address.
+    const fail = (err: NodeJS.ErrnoException): void => {
+      (callback as (e: NodeJS.ErrnoException | null) => void)(err);
+    };
+
+    // `all: true` so every candidate is inspected. Node sets it when
+    // `autoSelectFamily` is on (the default since Node 20), in which case the
+    // callback expects an array; when it is not, a single address is expected.
+    const wantsAll = options.all === true;
+    // Typed as `LookupAllOptions` so TypeScript selects the overload that
+    // yields `LookupAddress[]`. Left as a plain object literal it picks the
+    // single-address overload, and `.filter` below does not exist on a string.
+    const resolved: import("node:dns").LookupAllOptions = { ...options, all: true };
+    dnsLookup(hostname, resolved, (err, addresses) => {
+      if (err) {
+        fail(err);
+        return;
+      }
+      const safe = filterSafeAddresses(addresses ?? []);
+      if (safe.length === 0) {
+        // Report it as a name-resolution failure rather than a connection
+        // error: nothing was dialled, and the distinction matters to a caller
+        // deciding whether to retry or to fail over.
+        const blocked = (addresses ?? []).map((a) => a.address).join(", ") || "no addresses";
+        const e: NodeJS.ErrnoException = new Error(
+          `Refusing to connect to ${hostname}: it resolves only to a blocked address (${blocked})`,
+        );
+        e.code = "EBLOCKEDHOST";
+        fail(e);
+        return;
+      }
+      if (wantsAll) {
+        callback(null, safe);
+        return;
+      }
+      const first = safe[0]!;
+      callback(null, first.address, first.family);
+    });
+  };
+}
+
 import { normalizeHeaders as _normalizeHeaders } from "./utils.ts";
+import { limitAction } from "./response.ts";
 /**
  * Normalize a Headers object to a plain record.
  *

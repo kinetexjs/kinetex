@@ -12,6 +12,7 @@
  */
 
 import assert from "node:assert/strict";
+import { isAbortRejection } from "./assert-helpers.ts";
 import { getEventListeners } from "node:events";
 import { ConcurrencyLimiter, ConcurrencyLimitError } from "../src/interceptors.ts";
 import { Kinetex } from "../src/client.ts";
@@ -63,7 +64,7 @@ const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 suite("ConcurrencyLimiter — strict");
 
 await test("never exceeds maxConcurrent", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 3 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 3, queue: true, maxQueue: 100 });
   let active = 0;
   let peak = 0;
   await Promise.all(
@@ -81,7 +82,7 @@ await test("never exceeds maxConcurrent", async () => {
 });
 
 await test("acquire resolves immediately when a permit is free", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 2 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 2, queue: true, maxQueue: 100 });
   await limiter.acquire();
   await limiter.acquire();
   assert.equal(limiter.inFlight, 2);
@@ -89,7 +90,7 @@ await test("acquire resolves immediately when a permit is free", async () => {
 });
 
 await test("a saturated limiter queues rather than rejecting by default", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 100 });
   await limiter.acquire();
   let released = false;
   const queued = limiter.acquire().then(() => {
@@ -118,7 +119,7 @@ await test("rejects when queueing is disabled", async () => {
 });
 
 await test("rejects when the queue is full", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, maxQueue: 2 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 2 });
   await limiter.acquire();
   const a = limiter.acquire();
   const b = limiter.acquire();
@@ -148,6 +149,9 @@ await test("defaults match the documented values", async () => {
   let eleventhRan = false;
   const eleventh = limiter.acquire().then(() => {
     eleventhRan = true;
+    // The callback returns the array the `then` chain produced; the limiter
+    // wants a void callback, and an async arrow's array return is what tripped it.
+    return undefined;
   });
   await tick();
   // The original test stopped here, so a default of 11 — or of 1 — both passed:
@@ -161,7 +165,9 @@ await test("defaults match the documented values", async () => {
   for (let i = 0; i < 10; i++) limiter.release();
   assert.equal(limiter.inFlight, 0, "every permit is returned");
   assert.equal(limiter.highWaterMark, 10, "the peak is the documented default, exactly");
-  return Promise.all(ten);
+  // The ten permits must all be settled; returning the array leaked it out of a
+  // void-returning callback.
+  await Promise.all(ten);
 });
 
 await test("rejects a non-positive or non-finite maxConcurrent", () => {
@@ -189,7 +195,7 @@ await test("rejects a non-positive or non-finite maxConcurrent", () => {
 });
 
 await test("drain rejects everyone still queued", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 100 });
   await limiter.acquire();
   const a = limiter.acquire();
   const b = limiter.acquire();
@@ -211,7 +217,7 @@ await test("drain rejects everyone still queued", async () => {
 // branch, and an abort became indistinguishable from a queue overflow.
 
 await test("regression: aborting while queued rejects with code EABORT", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, maxQueue: 3 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 3 });
   const held = limiter.acquire();
   const ac = new AbortController();
   const queued = limiter.acquire(ac.signal);
@@ -236,14 +242,14 @@ await test("regression: aborting while queued rejects with code EABORT", async (
   // the single held permit is still the only one outstanding.
   assert.equal(limiter.waiting, 0, "the aborted waiter must be removed from the queue");
   await held;
-  assert.equal(limiter.active, 1, "the aborted waiter must not have taken a permit");
+  assert.equal(limiter.inFlight, 1, "the aborted waiter must not have taken a permit");
   limiter.release();
-  assert.equal(limiter.active, 0, "releasing the held permit must return to idle");
+  assert.equal(limiter.inFlight, 0, "releasing the held permit must return to idle");
   assert.equal(limiter.highWaterMark, 1, "the aborted acquire must not raise the peak");
 });
 
 await test("regression: an already-aborted signal rejects with code EABORT", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, maxQueue: 3 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 3 });
   const held = limiter.acquire();
   const ac = new AbortController();
   ac.abort();
@@ -265,7 +271,7 @@ await test("regression: an already-aborted signal rejects with code EABORT", asy
 await test("regression: an abort is distinguishable from a queue overflow", async () => {
   // The two failures must be told apart by code: a caller that retries on
   // EABORT must not also retry on a saturated queue.
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, maxQueue: 1 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 1 });
   const held = limiter.acquire();
   // Fill the single queue slot, so the next acquire overflows.
   const queued = limiter.acquire();
@@ -293,7 +299,7 @@ await test("regression: an abort is distinguishable from a queue overflow", asyn
 });
 
 await test("drain accepts a custom reason", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 100 });
   await limiter.acquire();
   const a = limiter.acquire();
   await tick();
@@ -315,7 +321,7 @@ suite("ConcurrencyLimiter — regression");
 await test("regression: release hands the permit over without overshooting", async () => {
   // The naive implementation decrements `active` and then promotes a waiter,
   // which momentarily reports active === 0 and lets a newcomer jump the queue.
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 2 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 2, queue: true, maxQueue: 100 });
   await limiter.acquire();
   await limiter.acquire();
   const queued = limiter.acquire();
@@ -340,14 +346,14 @@ await test("regression: release hands the permit over without overshooting", asy
 await test("regression: aborting while queued consumes no permit", async () => {
   // A waiter that aborts must remove itself; if it instead resolved later it
   // would take a permit nobody releases, permanently shrinking the pool.
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 100 });
   await limiter.acquire();
   const ac = new AbortController();
   const queued = limiter.acquire(ac.signal);
   await tick();
   assert.equal(limiter.waiting, 1);
   ac.abort();
-  await assert.rejects(() => queued);
+  await assert.rejects(() => queued, isAbortRejection);
   assert.equal(limiter.waiting, 0, "aborted waiter must leave the queue");
 
   limiter.release();
@@ -358,11 +364,11 @@ await test("regression: aborting while queued consumes no permit", async () => {
 });
 
 await test("regression: an already-aborted signal never enqueues", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 100 });
   await limiter.acquire();
   const ac = new AbortController();
   ac.abort();
-  await assert.rejects(() => limiter.acquire(ac.signal));
+  await assert.rejects(() => limiter.acquire(ac.signal), isAbortRejection);
   assert.equal(limiter.waiting, 0);
   assert.equal(limiter.inFlight, 1, "must not have consumed a permit");
 });
@@ -370,7 +376,7 @@ await test("regression: an already-aborted signal never enqueues", async () => {
 await test("regression: release with nothing held is a no-op", async () => {
   // Without this guard, a double-release drives `active` negative and the
   // limiter silently admits more than maxConcurrent forever after.
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 100 });
   limiter.release();
   limiter.release();
   assert.equal(limiter.inFlight, 0);
@@ -382,7 +388,7 @@ await test("regression: release with nothing held is a no-op", async () => {
 });
 
 await test("regression: an aborted waiter does not fire after promotion", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 100 });
   await limiter.acquire();
   const ac = new AbortController();
   const queued = limiter.acquire(ac.signal);
@@ -401,7 +407,7 @@ await test("regression: an aborted waiter does not fire after promotion", async 
 suite("ConcurrencyLimiter — edge cases");
 
 await test("edge: maxConcurrent of 1 serialises completely", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 100 });
   const order: number[] = [];
   await Promise.all(
     [0, 1, 2].map(async (i) => {
@@ -415,7 +421,7 @@ await test("edge: maxConcurrent of 1 serialises completely", async () => {
 });
 
 await test("edge: a large burst drains completely", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 4, maxQueue: 500 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 4, queue: true, maxQueue: 500 });
   let done = 0;
   await Promise.all(
     Array.from({ length: 200 }, async () => {
@@ -434,7 +440,7 @@ await test("edge: a large burst drains completely", async () => {
 });
 
 await test("edge: maxQueue of 0 rejects the first overflow", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, maxQueue: 0 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 0 });
   await limiter.acquire();
   await assert.rejects(() => limiter.acquire(), ConcurrencyLimitError);
 });
@@ -447,7 +453,7 @@ await test("edge: numeric-string maxConcurrent is rejected, not coerced", async 
 });
 
 await test("edge: highWaterMark tracks the true peak across bursts", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 5 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 5, queue: true, maxQueue: 100 });
   for (let i = 0; i < 5; i++) await limiter.acquire();
   for (let i = 0; i < 5; i++) limiter.release();
   await limiter.acquire();
@@ -465,7 +471,7 @@ await test("edge: highWaterMark tracks the true peak across bursts", async () =>
 suite("ConcurrencyLimiter — abort listener detachment");
 
 await test("strict: release() detaches the queued waiter's abort listener", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, maxQueue: 4 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 4 });
   const ac = new AbortController();
   assert.equal(getEventListeners(ac.signal, "abort").length, 0, "clean signal");
 
@@ -486,7 +492,7 @@ await test("strict: release() detaches the queued waiter's abort listener", asyn
 });
 
 await test("strict: drain() detaches the abort listener of every waiter", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, maxQueue: 8 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 8 });
   const signals = Array.from({ length: 5 }, () => new AbortController());
 
   await limiter.acquire(); // saturate
@@ -516,7 +522,7 @@ await test("regression: a post-grant abort leaves the granted permit intact", as
   // memory. This pins the behaviour that matters: aborting *after* the permit
   // was transferred must not turn a granted acquire into a failure, and must
   // not leave the permit double-counted.
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, maxQueue: 4 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 4 });
   const ac = new AbortController();
 
   await limiter.acquire();
@@ -532,7 +538,7 @@ await test("regression: a post-grant abort leaves the granted permit intact", as
 });
 
 await test("edge: a signal reused across many queued requests accumulates nothing", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, maxQueue: 50 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 50 });
   const ac = new AbortController();
 
   for (let i = 0; i < 20; i++) {
@@ -550,7 +556,7 @@ await test("edge: a signal reused across many queued requests accumulates nothin
 });
 
 await test("edge: a waiter aborted while queued detaches itself too", async () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, maxQueue: 4 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 4 });
   const ac = new AbortController();
 
   await limiter.acquire();
@@ -572,7 +578,7 @@ await test("edge: a waiter aborted while queued detaches itself too", async () =
 });
 
 await test("edge: drain() on an empty queue is a no-op", () => {
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 100 });
   limiter.drain();
   assert.equal(limiter.waiting, 0);
   assert.equal(limiter.inFlight, 0);
@@ -624,7 +630,7 @@ await test("client caps real in-flight requests at maxConcurrent", async () => {
   const client = new Kinetex({
     baseURL: "https://example.invalid",
     fetch: makeFetch(probe, 30),
-    concurrencyLimit: { maxConcurrent: 3, maxQueue: 50 },
+    concurrencyLimit: { maxConcurrent: 3, queue: true, maxQueue: 50 },
   });
   try {
     await Promise.all(Array.from({ length: 12 }, () => client.get("/x", { retry: false })));
@@ -643,7 +649,7 @@ await test("client releases the permit when a request fails", async () => {
   const client = new Kinetex({
     baseURL: "https://example.invalid",
     fetch: makeFetch(probe, 0),
-    concurrencyLimit: { maxConcurrent: 1 },
+    concurrencyLimit: { maxConcurrent: 1, queue: true, maxQueue: 100 },
   });
   try {
     probe.failNext = true;
@@ -676,7 +682,7 @@ await test("client releases the permit across a retry storm", async () => {
   const client = new Kinetex({
     baseURL: "https://example.invalid",
     fetch: makeFetch(probe, 0),
-    concurrencyLimit: { maxConcurrent: 2 },
+    concurrencyLimit: { maxConcurrent: 2, queue: true, maxQueue: 100 },
     retry: { maxRetries: 2, baseDelayMs: 1, statuses: [503], methods: ["GET"] },
   });
   try {
@@ -714,7 +720,7 @@ await test("client.destroy() drains waiters so shutdown cannot hang", async () =
   const client = new Kinetex({
     baseURL: "https://example.invalid",
     fetch: makeFetch(probe, 400),
-    concurrencyLimit: { maxConcurrent: 1, maxQueue: 20 },
+    concurrencyLimit: { maxConcurrent: 1, queue: true, maxQueue: 20 },
   });
   try {
     const inflight = Array.from({ length: 10 }, () => client.get("/x").catch(() => "err"));
@@ -755,7 +761,7 @@ await test("regression: an already-aborted signal is refused on an idle limiter"
   // Every other already-aborted test in this file saturates the limiter first,
   // so they all take the enqueue path — the fast path, which is the one a real
   // request almost always takes, was untested.
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 4 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 4, queue: true, maxQueue: 100 });
   const ac = new AbortController();
   ac.abort();
 
@@ -786,11 +792,11 @@ await test("regression: the same call gives the same answer on every path", asyn
   const cases: Array<{ label: string; build: () => ConcurrencyLimiter }> = [
     {
       label: "idle pool",
-      build: () => new ConcurrencyLimiter({ maxConcurrent: 4 }),
+      build: () => new ConcurrencyLimiter({ maxConcurrent: 4, queue: true, maxQueue: 100 }),
     },
     {
       label: "saturated, queueing on",
-      build: () => new ConcurrencyLimiter({ maxConcurrent: 1, maxQueue: 4 }),
+      build: () => new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 4 }),
     },
     {
       label: "saturated, queueing off",
@@ -798,7 +804,7 @@ await test("regression: the same call gives the same answer on every path", asyn
     },
     {
       label: "saturated, queue full",
-      build: () => new ConcurrencyLimiter({ maxConcurrent: 1, maxQueue: 0 }),
+      build: () => new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 0 }),
     },
   ];
 
@@ -870,7 +876,7 @@ await test("regression: a refused maxQueue never leaves a waiter behind", async 
   // The construction-time check is the one that matters, but a limiter built
   // with a valid cap and then overflowed must still be exactly as empty as it
   // was — a rejection that enqueued first would leak a permit on release.
-  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, maxQueue: 2 });
+  const limiter = new ConcurrencyLimiter({ maxConcurrent: 1, queue: true, maxQueue: 2 });
   await limiter.acquire();
   const a = limiter.acquire();
   const b = limiter.acquire();

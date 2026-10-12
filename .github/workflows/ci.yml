@@ -49,12 +49,14 @@ jobs:
       - name: TSC strict check
         run: npm run typecheck
 
+      - name: Test suite type ratchet
+        # tsconfig.check.json only covers src/, so a type error in the ~61k
+        # lines under tests/ used to be invisible. This fails when the count
+        # rises above the committed baseline; the backlog only shrinks.
+        run: npm run typecheck:tests
+
       - name: Type coverage
         run: npx type-coverage --strict -p tsconfig.check.json
-
-      - name: Dead code detection
-        run: npx ts-prune -p tsconfig.check.json || true
-        continue-on-error: true
 
   # ── JOB 2 — Lint ──────────────────────────────────────────────
 
@@ -70,8 +72,26 @@ jobs:
 
       - run: deno lint
 
+      # prettier, not `deno fmt`. The two disagree — `deno fmt --check src/`
+      # wanted to rewrite 26 of 27 files — and this repository is formatted with
+      # prettier (`.prettierrc`, and the lint-staged hook). Running two
+      # formatters where one does not apply is how the check became decorative.
+      # This is repo-wide; lint-staged only ever saw staged files.
+      #
+      # `npm ci` first, or `npx` resolves prettier from the registry and checks
+      # the tree against whatever is newest — it installed 3.9.10 against the
+      # pinned 3.9.6 and failed the job on formatting the pinned version is
+      # happy with. The gate was reporting a formatter upgrade, not a defect,
+      # and it would do so on every commit including main.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
       - name: Check formatting
-        run: deno fmt --check src/ || echo "Formatting issues found (non-blocking)"
+        run: npx prettier --check "**/*.{ts,mts,json,md,yml,yaml}"
 
   # ── JOB 3 — Security Audit ────────────────────────────────────
 
@@ -90,16 +110,35 @@ jobs:
 
       - run: npm ci
 
-      - name: npm audit
-        run: npm audit --audit-level=high || true
-        continue-on-error: true
+      # Blocking, and scoped to `--omit=dev` on purpose. This package has no
+      # runtime dependencies at all, so `--omit=dev` audits exactly the code a
+      # consumer installs — currently zero third-party packages, and any future
+      # one added by mistake. That is the audit that can be held to a hard
+      # gate, because it can pass.
+      #
+      # The full audit below it includes devDependencies and cannot be blocking:
+      # `type-coverage` reaches `braces` through `fast-glob`, and GHSA-vfj7-8cjw
+      # affects every published version of `braces`, so there is no fix to
+      # upgrade to. A ReDoS in a file-globbing linter that only runs in CI is
+      # not a vulnerability in the published library, but it must stay visible
+      # so a *new* dev advisory is noticed.
+      - name: npm audit (shipped dependencies)
+        run: npm audit --omit=dev --audit-level=low
+
+      - name: npm audit (full, informational)
+        run: npm audit || echo "::warning::devDependency advisories present; see the comment above on braces/type-coverage"
 
       - name: Gitleaks secret scan
         run: |
-          curl -sL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_amd64.tar.gz | tar xz
+          # gitleaks renamed its release assets from `linux_amd64` to
+          # `linux_x64`. The old URL 404s, `tar` fails on the empty body, and
+          # the job exits 2 — which is a red check, but the secret scan never
+          # ran. A security gate that cannot start is worse than no gate,
+          # because it reads as covered. Verified against the v8.24.3 release
+          # asset list before pinning.
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar xz
           sudo mv gitleaks /usr/local/bin/
           gitleaks detect --source . --redact -v --report-format sarif --report-path gitleaks-report.sarif
-        continue-on-error: true
 
   # ── JOB 4 — Tests (Node.js — Matrix: Node versions × OS) ─────
 
@@ -110,7 +149,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ["22"]
+        # Only supported lines. Node 18 (EOL Apr 2025) and 20 (EOL Apr 2026)
+        # receive no upstream security patches, so testing them would imply a
+        # support promise for runtimes that cannot be patched — the opposite of
+        # what this library is for. `engines` in package.json enforces the same
+        # floor at install time.
+        node: ["22", "24", "26"]
         os: [ubuntu-latest]
 
     steps:

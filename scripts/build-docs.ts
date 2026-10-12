@@ -6,7 +6,10 @@ const ROOT = process.cwd();
 const DOCS = join(ROOT, "docs");
 
 // 1. Generate markdown via typedoc-plugin-markdown
-execSync("npx typedoc --tsconfig tsconfig.check.json --entryPoints src/mod.ts --out docs --plugin typedoc-plugin-markdown --outputFileStrategy Modules --flattenOutputFiles --hideGenerator --hidePageHeader", { stdio: "inherit", cwd: ROOT });
+execSync(
+  "npx typedoc --tsconfig tsconfig.check.json --entryPoints src/mod.ts --out docs --plugin typedoc-plugin-markdown --outputFileStrategy Modules --flattenOutputFiles --hideGenerator --hidePageHeader",
+  { stdio: "inherit", cwd: ROOT },
+);
 
 // 2. Concatenate all .md files into single README.md
 let combined = "";
@@ -41,7 +44,11 @@ for (const f of files) {
 // 3. Remove all subfiles
 for (const f of files) {
   if (f !== join(DOCS, "README.md")) {
-    try { rmSync(f); } catch { /* ignore */ }
+    try {
+      rmSync(f);
+    } catch {
+      /* ignore */
+    }
   }
 }
 

@@ -1,4 +1,5 @@
 import process from "node:process";
+import { HTTPBIN_LOCAL_ORIGIN } from "./httpbin-local.ts";
 import assert from "node:assert/strict";
 import type { ResponseParseOptions, SizeLimitConfig } from "../src/response.ts";
 import {
@@ -34,7 +35,7 @@ import {
 let passed = 0,
   failed = 0;
 const failures: Array<{ name: string; err: unknown }> = [];
-async function test(name: string, fn: () => Promise<void>): Promise<void> {
+async function test(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
     await fn();
     console.log(`  \u2705  ${name}`);
@@ -96,8 +97,8 @@ function eq<T>(a: T, b: T, note?: string) {
     throw new Error(`Expected ${String(b)} got ${String(a)}${suffix}`);
   }
 }
-function ok(v: unknown) {
-  if (!v) throw new Error(`Expected truthy`);
+function ok(v: unknown, note?: string) {
+  if (!v) throw new Error(`Expected truthy${note ? ` (${note})` : ""}`);
 }
 function delay(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
@@ -105,7 +106,9 @@ function delay(ms: number) {
 
 async function main() {
   const { kinetex } = await import("../src/mod.ts");
-  const ktx = kinetex({});
+  // The local httpbin server, so this file's one live call stops depending on a
+  // third party. `allowPrivateNetwork` is the documented opt-in for loopback.
+  const ktx = kinetex({ allowPrivateNetwork: true });
 
   suite("parseContentType");
   testSync("basic", () => {
@@ -402,7 +405,11 @@ async function main() {
   await test("onObject callback", async () => {
     const res = new Response(new TextEncoder().encode('{"x":1}'));
     const called: any[] = [];
-    for await (const _o of readJSONStream(res, { onObject: (o) => called.push(o) })) {
+    for await (const _o of readJSONStream(res, {
+      onObject: (o) => {
+        called.push(o);
+      },
+    })) {
     }
     eq(called.length, 1, "onObject fired once");
   });
@@ -410,7 +417,11 @@ async function main() {
     const res = new Response(new TextEncoder().encode('{"a":1}{bad}{"a":2}'));
     const errors: any[] = [];
     const objs: any[] = [];
-    for await (const o of readJSONStream(res, { onParseError: (e, s) => errors.push(s) }))
+    for await (const o of readJSONStream(res, {
+      onParseError: (e, s) => {
+        errors.push(s);
+      },
+    }))
       objs.push(o);
     eq(objs.length, 2, "the two good objects still parsed");
     eq(errors.length, 1, "and the bad one was reported");
@@ -433,7 +444,11 @@ async function main() {
     const res = new Response(new TextEncoder().encode('{"a":1}\nbad\n{"a":2}'));
     const errors: any[] = [];
     const lines: any[] = [];
-    for await (const l of readNDJSON(res, { onParseError: (e, s) => errors.push(s) }))
+    for await (const l of readNDJSON(res, {
+      onParseError: (e, s) => {
+        errors.push(s);
+      },
+    }))
       lines.push(l);
     eq(lines.length, 2, "the two good lines still parsed");
     eq(errors.length, 1, "and the bad one was reported");
@@ -566,7 +581,7 @@ async function main() {
   suite("assertOk / assertOkJSON");
   await test("responseAssertOk returns on 2xx", async () => {
     const r = await responseAssertOk(new Response("ok", { status: 200 }));
-    assert.notEqual(r, null);
+    assert.ok(r !== null);
     assert.equal(r.status, 200);
   });
   await test("responseAssertOk throws on 4xx", async () => {
@@ -585,8 +600,14 @@ async function main() {
     );
     // And the predicate must still reject what it does classify as an error —
     // otherwise a predicate that always returned false would also pass.
-    await assert.rejects(() =>
-      responseAssertOk(new Response("", { status: 500 }), { isError: (s: number) => s >= 500 }),
+    await assert.rejects(
+      () =>
+        responseAssertOk(new Response("", { status: 500 }), { isError: (s: number) => s >= 500 }),
+      (e: unknown) => {
+        assert.ok(e instanceof HTTPResponseError, `expected HTTPResponseError, got ${String(e)}`);
+        assert.equal(e.status, 500);
+        return true;
+      },
     );
   });
   await test("assertOkJSON returns on success", async () => {
@@ -688,7 +709,9 @@ async function main() {
       const objs: unknown[] = [];
       const errs: string[] = [];
       for await (const o of readJSONStream(new Response(body), {
-        onParseError: (_e, partial) => errs.push(partial),
+        onParseError: (_e, partial) => {
+          errs.push(partial);
+        },
       })) {
         objs.push(o);
       }
@@ -808,7 +831,7 @@ async function main() {
     );
     eq(
       changed.headersChanged,
-      { constructor: ["one", "two"] },
+      { constructor: ["one", "two"] as [string, string] },
       "a real change is still a two-string tuple",
     );
   });
@@ -967,7 +990,7 @@ async function main() {
 
   suite("Real HTTP via kinetex");
   await test("GET readText", async () => {
-    const res = await ktx.get("https://jsonplaceholder.typicode.com/posts/1");
+    const res = await ktx.get(`${HTTPBIN_LOCAL_ORIGIN}/posts/1`);
     const text = await readText(
       new Response(res.rawBody as any, { headers: { "content-type": "application/json" } }),
     );
@@ -978,13 +1001,13 @@ async function main() {
     assert.ok(parsed.title.length > 0);
   });
   await test("GET readBytes", async () => {
-    const res = await ktx.get("https://jsonplaceholder.typicode.com/posts/1");
+    const res = await ktx.get(`${HTTPBIN_LOCAL_ORIGIN}/posts/1`);
     const b = await readBytes(new Response(res.rawBody as any));
     assert.ok(b instanceof Uint8Array);
     assert.equal(b.byteLength, 292);
   });
   await test("sizeLimit throw", async () => {
-    const res = await ktx.get("https://jsonplaceholder.typicode.com/posts");
+    const res = await ktx.get(`${HTTPBIN_LOCAL_ORIGIN}/posts`);
     await assert.rejects(
       readText(new Response(res.rawBody as any), {
         sizeLimit: { maxBytes: 10, onExceed: "throw" },
@@ -993,7 +1016,7 @@ async function main() {
     );
   });
   await test("sizeLimit truncate", async () => {
-    const res = await ktx.get("https://jsonplaceholder.typicode.com/posts");
+    const res = await ktx.get(`${HTTPBIN_LOCAL_ORIGIN}/posts`);
     const t = await readText(new Response(res.rawBody as any), {
       sizeLimit: { maxBytes: 50, onExceed: "truncate" },
     });
@@ -1001,7 +1024,7 @@ async function main() {
     assert.equal(typeof t, "string");
   });
   await test("sizeLimit abort", async () => {
-    const res = await ktx.get("https://jsonplaceholder.typicode.com/posts");
+    const res = await ktx.get(`${HTTPBIN_LOCAL_ORIGIN}/posts`);
     const body = res.rawBody as any;
 
     // The three onExceed modes are genuinely different. A bare `length <= 5`
@@ -1045,7 +1068,7 @@ async function main() {
     });
   });
   await test("httpbin NDJSON", async () => {
-    const res = await ktx.get("https://httpbin.org/stream/3");
+    const res = await ktx.get(`${HTTPBIN_LOCAL_ORIGIN}/stream/3`);
     let count = 0;
     for await (const _l of readNDJSON(new Response(res.rawBody as any))) {
       count++;

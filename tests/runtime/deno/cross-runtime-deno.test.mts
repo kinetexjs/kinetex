@@ -1,4 +1,5 @@
 import { assertEquals, assert, assertStrictEquals } from "jsr:@std/assert";
+import { HTTPBIN_LOCAL_ORIGIN } from "../../httpbin-local.ts";
 import { Kinetex, KinetexError, TimeoutError, HTTPStatusError } from "../../../src/mod.ts";
 import {
   RUNTIME,
@@ -33,7 +34,7 @@ function suite(name: string) {
 }
 
 const T = 30_000;
-const bin = new Kinetex({ baseURL: "https://httpbin.org", timeout: T });
+const bin = new Kinetex({ baseURL: HTTPBIN_LOCAL_ORIGIN, timeout: T, allowPrivateNetwork: true });
 
 async function main() {
   suite("Runtime detection");
@@ -177,7 +178,11 @@ async function main() {
   });
 
   await test("Timeout throws error", async () => {
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: 500 });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: 500,
+      allowPrivateNetwork: true,
+    });
     let caught: unknown;
     try {
       await client.get("/delay/10");
@@ -190,7 +195,11 @@ async function main() {
 
   await test("Request interceptor fires", async () => {
     let fired = false;
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: T });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: T,
+      allowPrivateNetwork: true,
+    });
     client.useRequest(() => {
       fired = true;
     });
@@ -200,7 +209,11 @@ async function main() {
 
   await test("Response interceptor fires", async () => {
     let fired = false;
-    const client = new Kinetex({ baseURL: "https://httpbin.org", timeout: T });
+    const client = new Kinetex({
+      baseURL: HTTPBIN_LOCAL_ORIGIN,
+      timeout: T,
+      allowPrivateNetwork: true,
+    });
     client.useResponse(() => {
       fired = true;
     });
@@ -211,11 +224,11 @@ async function main() {
   suite("Error classes");
 
   await test("KinetexError properties", () => {
-    const e = new KinetexError("test", "ECUSTOM");
+    const e = new KinetexError("test", "ECIRCUITOPEN" as never);
     assert(e instanceof Error);
     assertEquals(e.name, "KinetexError");
     assertEquals(e.message, "test");
-    assertEquals(e.code, "ECUSTOM");
+    assertEquals(e.code, "ECIRCUITOPEN" as never);
   });
 
   await test("TimeoutError properties", () => {
@@ -246,7 +259,10 @@ async function main() {
       ok: false,
       redirected: false,
     };
-    const e = new HTTPStatusError(res, req);
+    const e = new HTTPStatusError(
+      res as unknown as import("../../../src/types.ts").KinetexResponse<unknown>,
+      req as unknown as import("../../../src/types.ts").KinetexRequest,
+    );
     assert(e instanceof KinetexError);
     assert(e.isClientError);
     assert(!e.isServerError);

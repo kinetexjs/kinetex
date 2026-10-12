@@ -135,7 +135,7 @@ async function main() {
   await test("8KB URL does not throw on safeParseURL", () => {
     const long = "https://example.com/" + "a".repeat(8100);
     const parsed = safeParseURL(long);
-    assert.notEqual(parsed, null);
+    assert.ok(parsed !== null);
   });
 
   await test("sanitizeURL rejects URL exceeding 2048 chars", () => {
@@ -481,7 +481,7 @@ async function main() {
 
   await test("parseContentType with malformed params", () => {
     const r = parseContentType("text/html; charset=; ;;");
-    assert.notEqual(r, null);
+    assert.ok(r !== null);
     if (r) {
       assert.equal(r.mediaType, "text/html");
       assert.equal(r.charset, "");
@@ -642,7 +642,7 @@ async function main() {
 
   await test("parseHSTS with typical value", () => {
     const r = parseHSTS("max-age=31536000; includeSubDomains; preload");
-    assert.notEqual(r, null);
+    assert.ok(r !== null);
     if (r) {
       assert.equal(r.maxAge, 31536000);
       assert.equal(r.includeSubDomains, true);
@@ -660,7 +660,7 @@ async function main() {
 
   await test("parseHSTS with zero max-age", () => {
     const r = parseHSTS("max-age=0");
-    assert.notEqual(r, null);
+    assert.ok(r !== null);
     if (r) assert.equal(r.maxAge, 0);
   });
 
@@ -704,7 +704,7 @@ async function main() {
 
   await test("parseSetCookieHeader with name-only (no value)", () => {
     const r = parseSetCookieHeader("sessionid");
-    assert.notEqual(r, null);
+    assert.ok(r !== null);
     if (r) {
       assert.equal(r.name, "");
       assert.equal(r.value, "sessionid");
@@ -713,7 +713,7 @@ async function main() {
 
   await test("parseSetCookieHeader with empty value", () => {
     const r = parseSetCookieHeader("sessionid=");
-    assert.notEqual(r, null);
+    assert.ok(r !== null);
     if (r) {
       assert.equal(r.name, "sessionid");
       assert.equal(r.value, "");
@@ -724,7 +724,7 @@ async function main() {
     const r = parseSetCookieHeader(
       "session=abc123; Path=/; Domain=.example.com; Secure; HttpOnly; SameSite=Lax; Max-Age=3600; Priority=High; Partitioned",
     );
-    assert.notEqual(r, null);
+    assert.ok(r !== null);
     if (r) {
       assert.equal(r.name, "session");
       assert.equal(r.value, "abc123");
@@ -741,13 +741,13 @@ async function main() {
 
   await test("parseSetCookieHeader with quoted value", () => {
     const r = parseSetCookieHeader('session="abc123"');
-    assert.notEqual(r, null);
+    assert.ok(r !== null);
     if (r) assert.equal(r.value, "abc123");
   });
 
   await test("parseSetCookieHeader with special chars in value", () => {
     const r = parseSetCookieHeader("data=hello world foo bar");
-    assert.notEqual(r, null);
+    assert.ok(r !== null);
     if (r) assert.equal(r.value, "hello world foo bar");
   });
 
@@ -755,7 +755,7 @@ async function main() {
     const r = parseSetCookieHeader(
       "a=b; Path=/; Domain=.c.com; Secure; HttpOnly; SameSite=Strict; Max-Age=86400; Priority=Low; SameParty",
     );
-    assert.notEqual(r, null);
+    assert.ok(r !== null);
     if (r) {
       assert.equal(r.secure, true);
       assert.equal(r.httpOnly, true);
@@ -766,7 +766,7 @@ async function main() {
 
   await test("parseSetCookieHeader — first-attribute-wins for duplicate attrs", () => {
     const r = parseSetCookieHeader("a=b; Max-Age=100; Max-Age=200");
-    assert.notEqual(r, null);
+    assert.ok(r !== null);
     if (r) assert.equal(r.maxAge, 100);
   });
 
@@ -788,7 +788,7 @@ async function main() {
       partitioned: false,
     });
     const reparsed = parseSetCookieHeader(serialized);
-    assert.notEqual(reparsed, null);
+    assert.ok(reparsed !== null);
     if (reparsed) {
       assert.equal(reparsed.name, "test");
       assert.equal(reparsed.value, "value");

@@ -28,7 +28,12 @@
 
 // FIX (H6): logged bodies are untrusted — parsed JSON is stripped of
 // prototype-pollution keys before redaction writes (see sanitizeParsedJSON).
-import { sanitizeParsedJSON } from "./utils.ts";
+import {
+  sanitizeParsedJSON,
+  perfNow,
+  redactHeaders,
+  safeStringify as stringifySafely,
+} from "./utils.ts";
 
 // Cross-runtime: safely detect Node.js process.env
 const getNodeEnv = (): string | undefined => {
@@ -718,11 +723,7 @@ export class Redactor {
 
   /** Redact sensitive header values, replacing them with "***". */
   redactHeaders(headers: Record<string, string>): Record<string, string> {
-    const out: Record<string, string> = {};
-    for (const [k, v] of Object.entries(headers)) {
-      out[k] = this.headerSet.has(k.toLowerCase()) ? "***" : v;
-    }
-    return out;
+    return redactHeaders(headers, this.headerSet, "***");
   }
 
   /**
@@ -770,9 +771,11 @@ export class Redactor {
         /* keep the raw name if it is not valid percent-encoding */
       }
       if (!this.paramSet.has(decoded.toLowerCase())) return pair;
-      // A valueless parameter (`?token`) is redacted to `token=***` so the
-      // redaction is visible rather than leaving the bare name behind.
-      return eq === -1 ? `${name}=***` : `${name}=***`;
+      // A valueless parameter (`?token`) is redacted to `token=***` rather than
+      // left as the bare name, so the redaction stays visible. The value, when
+      // there is one, is discarded either way — which is why this used to be
+      // written as a ternary whose two arms were the same string.
+      return `${name}=***`;
     });
 
     return `${base}?${params.join("&")}${fragment}`;
@@ -1283,22 +1286,11 @@ function serializeError(err: unknown): SerializedError {
 }
 
 /** `JSON.stringify` that never throws — falls back for circular values. */
-function safeStringify(value: unknown): string {
-  try {
-    const seen = new WeakSet<object>();
-    return (
-      JSON.stringify(value, (_k, v) => {
-        if (v !== null && typeof v === "object") {
-          if (seen.has(v as object)) return "[circular]";
-          seen.add(v as object);
-        }
-        return v;
-      }) ?? String(value)
-    );
-  } catch {
-    return String(value);
-  }
-}
+// The marker is lowercase here and capitalised in the shared helper. Both are
+// asserted by tests and both appear in log output, so this converges on one
+// implementation without converging on one string.
+const CIRCULAR_MARKER = "[circular]";
+const safeStringify = (value: unknown): string => stringifySafely(value, CIRCULAR_MARKER);
 
 /**
  * Truncate a string to at most `maxBytes` UTF-8 bytes, never splitting a
@@ -1317,11 +1309,6 @@ function truncateToBytes(str: string, maxBytes: number): { text: string; removed
     end += ch.length;
   }
   return { text: str.slice(0, end), removed: total - used };
-}
-
-/** Cross-runtime high-resolution timer. Falls back to Date.now() when performance.now() is unavailable. */
-function perfNow(): number {
-  return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
 
 // ============================================================================

@@ -1081,7 +1081,20 @@ export function parseContentDisposition(value: string): ContentDispositionValue 
  * @param cd - Parsed disposition value
  * @returns Formatted `Content-Disposition` header value
  */
-export function formatContentDisposition(cd: ContentDispositionValue): string {
+/**
+ * Render a `Content-Disposition` header value.
+ *
+ * Takes the fields it actually reads rather than a whole
+ * `ContentDispositionValue`: `params` is never consulted, and `name` /
+ * `filename` are already optional in the sense that matters — a null or absent
+ * one is simply not emitted. Requiring callers to write `name: null,
+ * params: new Map()` to format `{ type: "inline" }` made the signature
+ * describe a parse result rather than what formatting needs.
+ */
+export function formatContentDisposition(
+  cd: Pick<ContentDispositionValue, "type"> &
+    Partial<Pick<ContentDispositionValue, "name" | "filename">>,
+): string {
   let out = cd.type;
   if (cd.name) out += `; name=${quoteParam(cd.name)}`;
   if (cd.filename) {
@@ -1359,7 +1372,11 @@ export function parseAuthorization(value: string): AuthCredentials | null {
         if (eq === -1) continue;
         const k = t.slice(0, eq).trim().toLowerCase();
         let v = t.slice(eq + 1).trim();
-        if (v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+        // `length >= 2` so a lone `"` is left alone instead of becoming the
+        // empty string: `'"'.slice(1, -1)` is `""`, so without the guard a
+        // one-character value silently lost its only character. The identical
+        // strip further down (stripIPPortAndBrackets) already had this guard.
+        if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
         params.set(k, v);
       }
     } else {
@@ -1702,7 +1719,18 @@ export function parseLinkHeader(value: string): LinkValue[] {
  * @param links - Parsed Link entries
  * @returns Formatted `Link` header value
  */
-export function formatLinkHeader(links: LinkValue[]): string {
+/**
+ * Render an array of links as a `Link` header value.
+ *
+ * Only `uri` is required. `LinkValue` is the shape `parseLinkHeader` *returns*
+ * — every parameter present, null when absent — and a caller building a header
+ * by hand should not have to write `rel: null, type: null, hreflang: null,
+ * title: null, media: null` to say `{ uri, rel }`. The body already guards
+ * every one of them, so the parameter type now says what formatting needs.
+ */
+export function formatLinkHeader(
+  links: Array<Pick<LinkValue, "uri"> & Partial<Omit<LinkValue, "uri">>>,
+): string {
   return links
     .map((l) => {
       let s = `<${l.uri}>`;
@@ -2421,7 +2449,12 @@ export class RichHeaders extends HttpHeaders {
     return v ? parseContentType(v) : null;
   }
   /** Set the Content-Type header from a string or parsed value. */
-  set contentType(v: string | ContentTypeValue | null) {
+  set contentType(
+    v:
+      | string
+      | (Pick<ContentTypeValue, "mediaType"> & Partial<Omit<ContentTypeValue, "mediaType">>)
+      | null,
+  ) {
     if (v === null) {
       this.delete(HeaderName.ContentType);
       return;
@@ -2457,7 +2490,12 @@ export class RichHeaders extends HttpHeaders {
     return v ? parseContentDisposition(v) : null;
   }
   /** Set the Content-Disposition header from a string or parsed value. */
-  set contentDisposition(v: string | ContentDispositionValue | null) {
+  set contentDisposition(
+    v:
+      | string
+      | (Pick<ContentDispositionValue, "type"> & Partial<Omit<ContentDispositionValue, "type">>)
+      | null,
+  ) {
     if (v === null) {
       this.delete(HeaderName.ContentDisposition);
       return;
