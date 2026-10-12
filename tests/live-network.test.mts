@@ -137,7 +137,15 @@ function balancedObjects(body: string, open: RegExp): string[] {
  * asserting on the URL. Only a config that would be dialled counts.
  */
 function isLive(body: string): boolean {
-  const withoutFixtures = code(body).replace(new RegExp(FIXTURE_HOST.source, "gi"), "");
+  // Strip the same non-routable names here as in `directText` below. The SSRF
+  // tests dial deliberately hostile hosts such as `1.2.3.4.5.evil.example`,
+  // and an RFC 2606 reserved name can never resolve to anything — so a
+  // `.example` URL is not a live call, and treating it as one makes the gate
+  // report the very suite that proves the screen works as a leak.
+  const withoutFixtures = code(body)
+    .replace(new RegExp(FIXTURE_HOST.source, "gi"), "")
+    .replace(new RegExp(NON_ROUTABLE.source, "gi"), "")
+    .replace(new RegExp(RESERVED_TLD.source, "gi"), "");
   // A raw transport dialled from inside a test body is checked first, against
   // text that still has the bodies. This cannot be folded into the checks
   // below: they all run on `code()`, which has already removed the body.
@@ -146,12 +154,14 @@ function isLive(body: string): boolean {
     .replace(new RegExp(NON_ROUTABLE.source, "gi"), "")
     .replace(new RegExp(RESERVED_TLD.source, "gi"), "");
   if (DIRECT_DIAL.test(directText)) return true;
-  if (!LIVE_HOST.test(withoutFixtures) || !LIVE_BASE.test(withoutFixtures)) return false;
+  // `baseURL` must NOT gate this block. A file can dial with `client.send(url)`
+  // or `gql(url)` and configure no client at all — which is what
+  // `negative.test.mts` and both runtime suites did while this gate reported
+  // them clean, because the whole check sat behind "the file mentions a
+  // `baseURL:`". Deciding on `baseURL` is the config loop's job, further down.
+  if (!LIVE_HOST.test(withoutFixtures)) return false;
 
-  // A `url:` field inside an object that is not a client or a request is a
-  // fixture — awssigv4 hashes one as a signing target and never sends it. The
-  // only shapes that dial are a client `baseURL`, a method call with an
-  // absolute URL, or `new GraphQLClient({ url })`; anything else is prose.
+  // What makes a public host live is the shape that issues a request.
   const dials =
     /\.(?:get|post|put|patch|delete|head|send|fetch)\(\s*["'`]https?:\/\/(?!127\.0\.0\.1|localhost)/.test(
       withoutFixtures,
@@ -164,10 +174,24 @@ function isLive(body: string): boolean {
     /\.(?:send|raw|request)\(\s*\{[^}]*\burl:\s*["'`]https?:\/\/(?!127\.0\.0\.1|localhost)/.test(
       withoutFixtures,
     ) ||
+    // A paginator takes its URL in a config object, not from a client, so it
+    // has no `baseURL` anywhere for the check above to hang off.
+    /createPagePaginator(?:<[^>]*>)?\(\s*\{[^}]*\burl:\s*["'`]https?:\/\/(?!127\.0\.0\.1|localhost)/.test(
+      withoutFixtures,
+    ) ||
+    // `gql(url, query)` is a standalone helper — it constructs its own client,
+    // so again there is no `baseURL` in the file to find.
+    /\bgql(?:<[^>]*>)?\(\s*["'`]https?:\/\/(?!127\.0\.0\.1|localhost)/.test(withoutFixtures) ||
+    /new SSEClient\(\s*\{[^}]*\burl:\s*["'`]https?:\/\/(?!127\.0\.0\.1|localhost)/.test(
+      withoutFixtures,
+    ) ||
     /new GraphQLClient\(/.test(withoutFixtures);
-  // `baseURL` is decided by the config loop below, which knows whether the
-  // config injects a `fetch` — judging it here would double-count fixtures.
-  if (!dials && !/baseURL:\s*["'`]https?:\/\/(?!127\.0\.0\.1|localhost)/.test(withoutFixtures)) {
+  if (dials) return true;
+  // A `url:` field inside an object that is not a client or a request is a
+  // fixture — awssigv4 hashes one as a signing target and never sends it, and
+  // `RemoteTransport` is handed a stubbed `fetch`. Both are handled by shape
+  // below rather than by requiring a `baseURL` to be present somewhere.
+  if (!/baseURL:\s*["'`]https?:\/\/(?!127\.0\.0\.1|localhost)/.test(withoutFixtures)) {
     return false;
   }
 
