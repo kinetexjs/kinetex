@@ -1012,12 +1012,12 @@ await test("Set-Cookie header captured and Cookie header sent on next request", 
 });
 
 // ============================================================================
-// §15  REST CRUD — real HTTP method verification via httpbin.org
+// §15  REST CRUD — real HTTP method verification via the local fixture
 //       (Originally used jsonplaceholder.typicode.com; replaced with httpbin
 //        which provides reliable, deterministic echo responses for all methods.)
 // ============================================================================
 
-suite("REST CRUD (httpbin.org HTTP method verification)");
+suite("REST CRUD (local fixture: HTTP method verification)");
 
 await test("GET collection — array of correct length", async () => {
   // httpbin /json returns a fixed slideshow JSON with a slides array —
@@ -1141,7 +1141,7 @@ await test("SSEClient parses events from a streaming endpoint", async () => {
   // We'll use our own local SSE server if external isn't available
   // For the real-world test, verify SSEClient is instantiatable and connects
   const client = new SSEClient({
-    url: "https://httpbin.org/get", // Not SSE but tests connection
+    url: `${HTTPBIN_LOCAL_ORIGIN}/get`,
     reconnect: false,
   });
 
@@ -1197,7 +1197,7 @@ await test("client.graphql() returns a GraphQLClient that can query", async () =
 await test("gql() standalone shorthand works", async () => {
   const { gql } = await import("../../../src/graphql.ts");
   const result = await gql<{ country: { name: string } }>(
-    "https://countries.trevorblades.com/",
+    `${HTTPBIN_LOCAL_ORIGIN}/graphql`,
     `query { country(code: "DE") { name } }`,
   );
   assertEquals(result.country.name, "Germany");
@@ -1246,7 +1246,7 @@ await test("createPagePaginator() fetches correct items per page", async () => {
   // Same httpbin echo trick — each page gets items whose IDs are derived from
   // the page number echoed back by /anything, so consecutive pages differ.
   const gen = createPagePaginator<{ id: number; title: string }>({
-    url: "https://httpbin.org/anything",
+    url: `${HTTPBIN_LOCAL_ORIGIN}/anything`,
     perPage: 5,
     paramNames: { page: "_page", perPage: "_limit" },
     getItems: (data) => {
@@ -4323,29 +4323,37 @@ suite("HTTP/2 protocol verification");
 // Deno/Bun fetch() does not expose httpVersion on Response.
 // HTTP/2 is only reported when Alt-Svc headers provide evidence.
 // Servers with Alt-Svc (pokeapi.co) → HTTP/2.
-// Servers without (httpbin.org) → HTTP/1.1 (safe default).
+// Servers without Alt-Svc (the plain-HTTP fixture) → HTTP/1.1 (safe default).
 
-await test("HTTPS to httpbin.org defaults to HTTP/1.1 (no Alt-Svc)", async () => {
+await test("HTTPS to the local fixture defaults to HTTP/1.1 (no Alt-Svc)", async () => {
   const client = new Kinetex({
     baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     allowPrivateNetwork: true,
   });
   const r = await client.get<{ origin: unknown }>("/get");
-  assertEquals(r.httpVersion, "HTTP/1.1", "httpbin has no Alt-Svc h2, must report HTTP/1.1");
+  assertEquals(
+    r.httpVersion,
+    "HTTP/1.1",
+    "the plain-HTTP fixture has no Alt-Svc h2, must report HTTP/1.1",
+  );
   assertEquals(r.status, 200);
   assert(r.data);
   assert(r.data.origin);
 });
 
-await test("HTTPS to httpbin.org /uuid defaults to HTTP/1.1 (no Alt-Svc)", async () => {
+await test("HTTPS to the local fixture /uuid defaults to HTTP/1.1 (no Alt-Svc)", async () => {
   const client = new Kinetex({
     baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     allowPrivateNetwork: true,
   });
   const r = await client.get<{ uuid: string }>("/uuid");
-  assertEquals(r.httpVersion, "HTTP/1.1", "httpbin has no Alt-Svc h2, must report HTTP/1.1");
+  assertEquals(
+    r.httpVersion,
+    "HTTP/1.1",
+    "the plain-HTTP fixture has no Alt-Svc h2, must report HTTP/1.1",
+  );
   assertEquals(r.status, 200);
   assert(r.data.uuid.match(/^[0-9a-f-]{36}$/), "Should receive a valid UUID response");
 });
@@ -4369,7 +4377,7 @@ await test("an Alt-Svc h2 advertisement reports HTTP/2", async () => {
 suite("HTTP/1.1 fallback");
 
 // http:// does not support HTTP/2 (requires TLS), forcing HTTP/1.1 fallback
-await test("HTTP (non-TLS) to httpbin.org uses HTTP/1.1", async () => {
+await test("HTTP (non-TLS) to the local fixture uses HTTP/1.1", async () => {
   const client = new Kinetex({
     baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,

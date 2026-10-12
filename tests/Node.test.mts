@@ -1445,7 +1445,7 @@ await test("client.graphql() returns a GraphQLClient that can query", async () =
 await test("gql() standalone shorthand works", async () => {
   const { gql } = await import("../src/graphql.ts");
   const result = await gql<{ country: { name: string } }>(
-    "https://countries.trevorblades.com/",
+    `${HTTPBIN_LOCAL_ORIGIN}/graphql`,
     `query { country(code: "DE") { name } }`,
   );
   assert.equal(result.country.name, "Germany");

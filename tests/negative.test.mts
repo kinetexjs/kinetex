@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { isErrorWithCode } from "./assert-helpers.ts";
+import { httpbinBaseUrl } from "./httpbin-local.ts";
 import { Kinetex, BatchQueue } from "../src/client.ts";
 import { kinetex } from "../src/mod.ts";
+
+const NEG_BASE = await httpbinBaseUrl();
 import {
   KinetexError,
   HTTPStatusError,
@@ -272,9 +275,9 @@ async function main() {
   await test("AbortSignal that is already aborted before request", async () => {
     const controller = new AbortController();
     controller.abort();
-    const client = kinetex();
+    const client = kinetex({ allowPrivateNetwork: true });
     try {
-      await client.send("https://httpbin.org/get", "GET", { signal: controller.signal });
+      await client.send(`${NEG_BASE}/get`, "GET", { signal: controller.signal });
       assert.fail("Expected error");
     } catch (err) {
       assert.ok(err instanceof Error, `Expected Error, got ${typeof err}`);
@@ -299,21 +302,21 @@ async function main() {
   });
 
   await test("Timeout of 0 treated as no timeout (should succeed)", async () => {
-    const client = kinetex({ timeout: 0 });
-    const res = await client.send("https://httpbin.org/get", "GET");
+    const client = kinetex({ timeout: 0, allowPrivateNetwork: true });
+    const res = await client.send(`${NEG_BASE}/get`, "GET");
     assert.equal(res.status, 200);
   });
 
   await test("Timeout of -1 treated as no timeout (should succeed)", async () => {
-    const client = kinetex({ timeout: -1 });
-    const res = await client.send("https://httpbin.org/get", "GET");
+    const client = kinetex({ timeout: -1, allowPrivateNetwork: true });
+    const res = await client.send(`${NEG_BASE}/get`, "GET");
     assert.equal(res.status, 200);
   });
 
   await test("Concurrent abort and timeout — abort wins", async () => {
     const controller = new AbortController();
-    const client = kinetex();
-    const promise = client.send("https://httpbin.org/delay/10", "GET", {
+    const client = kinetex({ allowPrivateNetwork: true });
+    const promise = client.send(`${NEG_BASE}/delay/10`, "GET", {
       signal: controller.signal,
       timeout: 5000,
     });
@@ -440,9 +443,9 @@ async function main() {
   suite("10. Error class tests");
 
   await test("HTTPStatusError has correct name, code, and extends KinetexError", async () => {
-    const client = kinetex({ throwOnError: true });
+    const client = kinetex({ throwOnError: true, allowPrivateNetwork: true });
     try {
-      await client.send("https://httpbin.org/status/404", "GET");
+      await client.send(`${NEG_BASE}/status/404`, "GET");
       assert.fail("Expected error");
     } catch (err) {
       assert.ok(err instanceof HTTPStatusError);
@@ -456,9 +459,9 @@ async function main() {
   });
 
   await test("HTTPStatusError 500 is server error", async () => {
-    const client = kinetex({ throwOnError: true });
+    const client = kinetex({ throwOnError: true, allowPrivateNetwork: true });
     try {
-      await client.send("https://httpbin.org/status/500", "GET");
+      await client.send(`${NEG_BASE}/status/500`, "GET");
       assert.fail("Expected error");
     } catch (err) {
       assert.ok(err instanceof HTTPStatusError);
