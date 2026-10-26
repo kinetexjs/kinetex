@@ -46,11 +46,14 @@
   "types": "./dist/types/mod.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/types/mod.d.ts",
+      "types": {
+        "import": "./dist/types/mod.d.ts",
+        "require": "./dist/cjs/mod.d.ts"
+      },
       "workerd": "./dist/esm/mod.js",
       "worker": "./dist/esm/mod.js",
       "browser": "./dist/browser/kinetex.esm.js",
-      "deno": "./src/mod.ts",
+      "deno": "./dist/esm/mod.js",
       "bun": "./dist/esm/mod.js",
       "import": "./dist/esm/mod.js",
       "require": "./dist/cjs/mod.js"
@@ -65,109 +68,171 @@
       "script": "./dist/browser/kinetex.min.js"
     },
     "./cache": {
-      "types": "./dist/types/cache.d.ts",
+      "types": {
+        "import": "./dist/types/cache.d.ts",
+        "require": "./dist/cjs/cache.d.ts"
+      },
       "import": "./dist/esm/cache.js",
       "require": "./dist/cjs/cache.js"
     },
     "./sse": {
-      "types": "./dist/types/sse.d.ts",
+      "types": {
+        "import": "./dist/types/sse.d.ts",
+        "require": "./dist/cjs/sse.d.ts"
+      },
       "import": "./dist/esm/sse.js",
       "require": "./dist/cjs/sse.js"
     },
     "./graphql": {
-      "types": "./dist/types/graphql.d.ts",
+      "types": {
+        "import": "./dist/types/graphql.d.ts",
+        "require": "./dist/cjs/graphql.d.ts"
+      },
       "import": "./dist/esm/graphql.js",
       "require": "./dist/cjs/graphql.js"
     },
     "./pagination": {
-      "types": "./dist/types/pagination.d.ts",
+      "types": {
+        "import": "./dist/types/pagination.d.ts",
+        "require": "./dist/cjs/pagination.d.ts"
+      },
       "import": "./dist/esm/pagination.js",
       "require": "./dist/cjs/pagination.js"
     },
     "./progress": {
-      "types": "./dist/types/progress.d.ts",
+      "types": {
+        "import": "./dist/types/progress.d.ts",
+        "require": "./dist/cjs/progress.d.ts"
+      },
       "import": "./dist/esm/progress.js",
       "require": "./dist/cjs/progress.js"
     },
     "./logging": {
-      "types": "./dist/types/logging.d.ts",
+      "types": {
+        "import": "./dist/types/logging.d.ts",
+        "require": "./dist/cjs/logging.d.ts"
+      },
       "import": "./dist/esm/logging.js",
       "require": "./dist/cjs/logging.js"
     },
     "./response": {
-      "types": "./dist/types/response.d.ts",
+      "types": {
+        "import": "./dist/types/response.d.ts",
+        "require": "./dist/cjs/response.d.ts"
+      },
       "import": "./dist/esm/response.js",
       "require": "./dist/cjs/response.js"
     },
     "./headers": {
-      "types": "./dist/types/headers.d.ts",
+      "types": {
+        "import": "./dist/types/headers.d.ts",
+        "require": "./dist/cjs/headers.d.ts"
+      },
       "import": "./dist/esm/headers.js",
       "require": "./dist/cjs/headers.js"
     },
     "./url": {
-      "types": "./dist/types/url.d.ts",
+      "types": {
+        "import": "./dist/types/url.d.ts",
+        "require": "./dist/cjs/url.d.ts"
+      },
       "import": "./dist/esm/url.js",
       "require": "./dist/cjs/url.js"
     },
     "./aws-sigv4": {
-      "types": "./dist/types/aws-sigv4.d.ts",
+      "types": {
+        "import": "./dist/types/aws-sigv4.d.ts",
+        "require": "./dist/cjs/aws-sigv4.d.ts"
+      },
       "import": "./dist/esm/aws-sigv4.js",
       "require": "./dist/cjs/aws-sigv4.js"
     },
     "./socks5": {
-      "types": "./dist/types/socks5.d.ts",
+      "types": {
+        "import": "./dist/types/socks5.d.ts",
+        "require": "./dist/cjs/socks5.d.ts"
+      },
       "import": "./dist/esm/socks5.js",
       "require": "./dist/cjs/socks5.js"
     },
     "./cookiejar": {
-      "types": "./dist/types/cookiejar.d.ts",
+      "types": {
+        "import": "./dist/types/cookiejar.d.ts",
+        "require": "./dist/cjs/cookiejar.d.ts"
+      },
       "import": "./dist/esm/cookiejar.js",
       "require": "./dist/cjs/cookiejar.js"
     },
     "./circuit-breaker": {
-      "types": "./dist/types/circuit-breaker.d.ts",
+      "types": {
+        "import": "./dist/types/circuit-breaker.d.ts",
+        "require": "./dist/cjs/circuit-breaker.d.ts"
+      },
       "import": "./dist/esm/circuit-breaker.js",
       "require": "./dist/cjs/circuit-breaker.js"
     },
     "./dedup": {
-      "types": "./dist/types/dedup.d.ts",
+      "types": {
+        "import": "./dist/types/dedup.d.ts",
+        "require": "./dist/cjs/dedup.d.ts"
+      },
       "import": "./dist/esm/dedup.js",
       "require": "./dist/cjs/dedup.js"
     },
     "./digest": {
-      "types": "./dist/types/digest.d.ts",
+      "types": {
+        "import": "./dist/types/digest.d.ts",
+        "require": "./dist/cjs/digest.d.ts"
+      },
       "import": "./dist/esm/digest.js",
       "require": "./dist/cjs/digest.js"
     },
     "./ws": {
-      "types": "./dist/types/ws.d.ts",
+      "types": {
+        "import": "./dist/types/ws.d.ts",
+        "require": "./dist/cjs/ws.d.ts"
+      },
       "import": "./dist/esm/ws.js",
       "require": "./dist/cjs/ws.js"
     },
     "./lifecycle": {
-      "types": "./dist/types/lifecycle.d.ts",
+      "types": {
+        "import": "./dist/types/lifecycle.d.ts",
+        "require": "./dist/cjs/lifecycle.d.ts"
+      },
       "import": "./dist/esm/lifecycle.js",
       "require": "./dist/cjs/lifecycle.js"
     },
     "./interceptors": {
-      "types": "./dist/types/interceptors.d.ts",
+      "types": {
+        "import": "./dist/types/interceptors.d.ts",
+        "require": "./dist/cjs/interceptors.d.ts"
+      },
       "import": "./dist/esm/interceptors.js",
       "require": "./dist/cjs/interceptors.js"
     },
     "./core": {
-      "types": "./dist/types/core.d.ts",
+      "types": {
+        "import": "./dist/types/core.d.ts",
+        "require": "./dist/cjs/core.d.ts"
+      },
       "import": "./dist/esm/core.js",
       "require": "./dist/cjs/core.js"
     },
     "./cookie-parser": {
-      "types": "./dist/types/cookie-parser.d.ts",
+      "types": {
+        "import": "./dist/types/cookie-parser.d.ts",
+        "require": "./dist/cjs/cookie-parser.d.ts"
+      },
       "import": "./dist/esm/cookie-parser.js",
       "require": "./dist/cjs/cookie-parser.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "sideEffects": false,
   "files": [
     "dist",
+    "src",
     "README.md",
     "LICENSE"
   ],

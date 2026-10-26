@@ -341,15 +341,16 @@ export class FetchTransport implements Transport {
     } catch {
       return; // Malformed URLs fail later, with a better message.
     }
-    if (!parsed.hostname || isIP(parsed.hostname)) return;
+    if (!parsed.hostname || isIPAddress(parsed.hostname)) return;
 
     let addresses: Array<{ address: string; family: number }>;
     try {
       // `all: true` so every candidate is inspected, matching what the socket
       // would have been able to reach.
+      const lookup = await getDnsLookup();
       addresses = await new Promise<Array<{ address: string; family: number }>>(
         (resolve, reject) => {
-          dnsLookup(parsed.hostname, { all: true }, (err, res) =>
+          lookup(parsed.hostname, { all: true }, (err, res) =>
             err ? reject(err) : resolve(res as Array<{ address: string; family: number }>),
           );
         },
@@ -1793,8 +1794,31 @@ export function parseBody<T>(
 // ============================================================================
 
 // FIX 12: normalizeHeaders centralised in utils.ts.
-import { lookup as dnsLookup } from "node:dns";
-import { isIP } from "node:net";
+//
+// `node:dns` is loaded lazily. A static import here made the browser bundle
+// unloadable even though the browser never takes a Node transport: esbuild
+// cannot bundle `node:dns`, and the import ran before the runtime check could
+// avoid it. The promise is shared, so the cost is one import per process.
+let dnsLookupPromise: Promise<typeof import("node:dns").lookup> | null = null;
+function getDnsLookup(): Promise<typeof import("node:dns").lookup> {
+  dnsLookupPromise ??= import("node:dns").then((mod) => mod.lookup);
+  return dnsLookupPromise;
+}
+
+/**
+ * Whether a URL hostname is an IP literal.
+ *
+ * `URL.hostname` brackets IPv6 literals, while a bare IPv4 address is already
+ * unambiguous. This replaces `node:net`'s `isIP()` in the fetch preflight so
+ * the module has no static Node builtin import; the full address-range check
+ * still happens in {@link isBlockedAddress}.
+ */
+function isIPAddress(host: string): boolean {
+  if (host.startsWith("[") && host.endsWith("]")) return true;
+  const parts = host.split(".");
+  return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+
 /** One instance, shared: it holds no per-request state. */
 const PINNED_LOOKUP = createPinnedLookup();
 
@@ -1872,31 +1896,34 @@ export function createPinnedLookup(): import("node:net").LookupFunction {
     // yields `LookupAddress[]`. Left as a plain object literal it picks the
     // single-address overload, and `.filter` below does not exist on a string.
     const resolved: import("node:dns").LookupAllOptions = { ...options, all: true };
-    dnsLookup(hostname, resolved, (err, addresses) => {
-      if (err) {
-        fail(err);
-        return;
-      }
-      const safe = filterSafeAddresses(addresses ?? []);
-      if (safe.length === 0) {
-        // Report it as a name-resolution failure rather than a connection
-        // error: nothing was dialled, and the distinction matters to a caller
-        // deciding whether to retry or to fail over.
-        const blocked = (addresses ?? []).map((a) => a.address).join(", ") || "no addresses";
-        const e: NodeJS.ErrnoException = new Error(
-          `Refusing to connect to ${hostname}: it resolves only to a blocked address (${blocked})`,
-        );
-        e.code = "EBLOCKEDHOST";
-        fail(e);
-        return;
-      }
-      if (wantsAll) {
-        callback(null, safe);
-        return;
-      }
-      const first = safe[0]!;
-      callback(null, first.address, first.family);
-    });
+    const runLookup = (lookup: typeof import("node:dns").lookup): void => {
+      lookup(hostname, resolved, (err, addresses) => {
+        if (err) {
+          fail(err);
+          return;
+        }
+        const safe = filterSafeAddresses(addresses ?? []);
+        if (safe.length === 0) {
+          // Report it as a name-resolution failure rather than a connection
+          // error: nothing was dialled, and the distinction matters to a caller
+          // deciding whether to retry or to fail over.
+          const blocked = (addresses ?? []).map((a) => a.address).join(", ") || "no addresses";
+          const e: NodeJS.ErrnoException = new Error(
+            `Refusing to connect to ${hostname}: it resolves only to a blocked address (${blocked})`,
+          );
+          e.code = "EBLOCKEDHOST";
+          fail(e);
+          return;
+        }
+        if (wantsAll) {
+          callback(null, safe);
+          return;
+        }
+        const first = safe[0]!;
+        callback(null, first.address, first.family);
+      });
+    };
+    void getDnsLookup().then(runLookup).catch(fail);
   };
 }
 
@@ -1947,7 +1974,7 @@ function detectHTTPVersion(response: Response, _headers: Record<string, string>)
   // a `[[typed]]` lie. A consumer switching on "HTTP/1.1" silently fell through,
   // and on a runtime the library does not run in CI the type checker is the only
   // thing that would have said so. Both arms now go through one translation, and
-  // anything unrecognised falls through to the evidence below rather than being
+  // anything unrecognised falls through to the default below rather than being
   // reported as a protocol.
   const denoResponse = response as unknown as { httpVersion?: string };
   const runtimeVersion = denoResponse.httpVersion;
@@ -1956,33 +1983,12 @@ function detectHTTPVersion(response: Response, _headers: Record<string, string>)
     if (normalized) return normalized;
   }
 
-  // Server capability advertisement.
-  // Servers that support HTTP/3 advertise: Alt-Svc: h3="...", h3-29="..."
-  //
-  // kinetex does not speak HTTP/3, and no runtime it targets has a stable
-  // HTTP/3 client, so an h3 advertisement is deliberately NOT reported as
-  // HTTP/3: the response in hand was served over HTTP/2, and saying otherwise
-  // would misreport the protocol actually used. A runtime that ever does
-  // negotiate h3 itself reaches the same answer below rather than claiming a
-  // version the transport cannot produce.
-  const altSvc = response.headers.get("alt-svc");
-
-  // Alt-Svc advertisement: infer HTTP version from the advertised protocols.
-  // - h3 (QUIC) means the server supports HTTP/3
-  // - h2 means the server supports HTTP/2
-  // Most h3-capable servers also support h2; advertise Alt-Svc: h3="...", h2="..."
-  // But some (e.g. Cloudflare) only advertise h3 — the current response is
-  // served over HTTP/2 regardless, since fetch() negotiated HTTP/2 or higher.
-  if (altSvc) {
-    const hasH3 = altSvc.includes('h3="') || altSvc.includes("h3-29=") || altSvc.includes("h3-32=");
-    const hasH2 = altSvc.includes('h2="');
-    if (hasH2) return "HTTP/2";
-    // h3 without h2 means server supports HTTP/3 — current response is at least HTTP/2
-    if (hasH3) return "HTTP/2";
-  }
-
-  // Default to HTTP/1.1 — only report HTTP/2+ when there is runtime-specific evidence
-  // (httpVersion on Response, Alt-Svc header, or underlying transport confirmation).
+  // `Alt-Svc` advertises what a server *can* speak; it does not describe the
+  // protocol that carried this response. Node's fetch (undici) speaks HTTP/1.1,
+  // so a plain HTTP/1.1 server advertising h2 was previously reported as
+  // HTTP/2 — a false statement about the response, not a capability hint.
+  // Report runtime evidence when it exists, otherwise the fetch transport's
+  // actual protocol. Server capabilities belong in a separate field.
   return "HTTP/1.1";
 }
 

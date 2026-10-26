@@ -2,12 +2,14 @@
  * Discover the `node:` builtins referenced by `src/`, for the browser bundles.
  *
  * The browser bundles build with `--platform=browser`, where esbuild refuses to
- * bundle a Node builtin: it errors instead of stubbing. So every `node:`
- * specifier under `src/` has to be marked external, and when that set was
- * written out by hand in `scripts/build.ts` it fell behind `src/` twice —
- * `node:tls` with the CONNECT-tunnel work in `src/proxy.ts`, and `node:url` with
- * the IDNA fallback in `src/cookie-parser.ts`. `npm run build` is the first
- * thing `scripts/release.ts` runs, so each omission stopped a release outright.
+ * bundle a Node builtin: it errors instead of stubbing. Every `node:` specifier
+ * under `src/` is therefore rewritten to a browser shim (see
+ * `src/shims/browser-node.ts`), and the list of specifiers to rewrite has to be
+ * complete. When that list was written out by hand in `scripts/build.ts` it fell
+ * behind `src/` twice — `node:tls` with the CONNECT-tunnel work in
+ * `src/proxy.ts`, and `node:url` with the IDNA fallback in
+ * `src/cookie-parser.ts`. `npm run build` is the first thing
+ * `scripts/release.ts` runs, so each omission stopped a release outright.
  *
  * Deriving the set removes the class of bug rather than the two instances: there
  * is no longer a list that an import can outrun. This lives in its own module
@@ -63,12 +65,13 @@ export function referencedNodeBuiltins(dir: string): Set<string> {
 }
 
 /**
- * The externals to pass to esbuild, sorted so the build command is stable.
+ * The `node:` specifiers to alias to the browser shim, sorted so the build
+ * command is stable.
  *
  * An empty result means the scan matched nothing, which would leave the browser
- * bundles externalising nothing and failing on the first builtin they met. That
- * is a broken scan rather than a source tree with no Node code, so it throws
- * here where the message can say so.
+ * bundles with no aliases and failing on the first builtin they met. That is a
+ * broken scan rather than a source tree with no Node code, so it throws here
+ * where the message can say so.
  */
 export function nodeExternals(srcDir: string): string[] {
   const found = referencedNodeBuiltins(srcDir);
