@@ -377,16 +377,23 @@ if (!HAVE_OPENSSL) {
       allowPrivateNetwork: true,
     });
     try {
-      assert.equal(priv(transport, "_http1Agent"), null, "no agent before the first request");
+      assert.equal(priv(transport, "_http1Agent"), null, "no plain agent before the first request");
+      assert.equal(
+        priv(transport, "_http1SecureAgent"),
+        null,
+        "no secure agent before the first request",
+      );
       await withoutFetch(async () => {
         for (let i = 0; i < 3; i++) {
           const raw = await transport.send(echoRequest(h.url));
           if (raw.body) await readRawBody(raw.body, 0, h.url, null);
         }
       });
+      // The echo server is HTTPS, so the tunnel uses the secure agent. The
+      // agents are split by scheme because an http.Agent cannot speak TLS.
       const agent = priv<{ maxSockets: number; options: { keepAlive?: boolean } }>(
         transport,
-        "_http1Agent",
+        "_http1SecureAgent",
       );
       assert.ok(agent, "agent should exist after a request");
       assert.equal(agent.options.keepAlive, true);
@@ -412,7 +419,12 @@ if (!HAVE_OPENSSL) {
       const raw = await withoutFetch(() => transport.send(echoRequest(h.url)));
       if (raw.body) await readRawBody(raw.body, 0, h.url, null);
       assert.equal(raw.status, 200);
-      assert.equal(priv(transport, "_http1Agent"), null, "opt-out must skip the dedicated agent");
+      assert.equal(priv(transport, "_http1Agent"), null, "opt-out must skip the plain agent");
+      assert.equal(
+        priv(transport, "_http1SecureAgent"),
+        null,
+        "opt-out must skip the secure agent too",
+      );
     } finally {
       transport.destroy();
       h.close();
@@ -441,9 +453,14 @@ if (!HAVE_OPENSSL) {
       const raw = await transport.send(echoRequest(h.url));
       if (raw.body) await readRawBody(raw.body, 0, h.url, null);
     });
-    assert.ok(priv(transport, "_http1Agent"), "agent should exist after a request");
+    assert.ok(priv(transport, "_http1SecureAgent"), "agent should exist after a request");
     transport.destroy();
-    assert.equal(priv(transport, "_http1Agent"), null, "destroy() must release the agent");
+    assert.equal(priv(transport, "_http1Agent"), null, "destroy() must release the plain agent");
+    assert.equal(
+      priv(transport, "_http1SecureAgent"),
+      null,
+      "destroy() must release the secure agent",
+    );
     h.close();
   });
 }

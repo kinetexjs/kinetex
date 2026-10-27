@@ -41,7 +41,14 @@ import type {
   PipelineStageName,
 } from "./types.ts";
 
-import { KinetexError, HTTPStatusError, AbortError, RedirectError, toRequestId } from "./types.ts";
+import {
+  KinetexError,
+  HTTPStatusError,
+  AbortError,
+  RedirectError,
+  TimeoutError,
+  toRequestId,
+} from "./types.ts";
 
 import {
   isValidHeaderName,
@@ -51,6 +58,7 @@ import {
   randomBytes,
   perfNow,
   isSensitiveHeader,
+  mergeSignals,
 } from "./utils.ts";
 import { CREDENTIAL_HEADERS } from "./cache.ts";
 import { createRateLimitInterceptor, ConcurrencyLimiter } from "./interceptors.ts";
@@ -58,7 +66,7 @@ import { SigV4Signer } from "./aws-sigv4.ts";
 import { createDigestAuthorizer } from "./digest.ts";
 import { generateIdempotencyKey, isValidIdempotencyKey, parseRetryAfter } from "./headers.ts";
 
-import { DEFAULT_ACCEPT_ENCODING, encodeMultipart } from "./core.ts";
+import { DEFAULT_ACCEPT_ENCODING, encodeMultipart, normalizeHTTPVersion } from "./core.ts";
 import {
   createTransport,
   sendWithTimeout,
@@ -1264,6 +1272,13 @@ export class Kinetex {
   private readonly _wsClients: Set<WSClient> = new Set();
 
   /**
+   * Controllers covering one request attempt — transport and body read.
+   * `destroy()` aborts these so a caller blocked on a stalled body is released
+   * instead of waiting for a server that will never finish.
+   */
+  private readonly _activeRequestControllers: Set<AbortController> = new Set();
+
+  /**
    * Optional bulkhead bounding in-flight requests. `null` when
    * `concurrencyLimit` is not configured, which keeps the hot path free of a
    * limiter check.
@@ -1321,9 +1336,15 @@ export class Kinetex {
     }
 
     // Transport — pass strictHeaders option through to FetchTransport
+    // Normalise before choosing a transport: `httpVersion: "http/1.1"` and
+    // `"1.1"` mean the same thing as the canonical spelling, but the factory
+    // previously compared against the literal string and built a transport
+    // that dropped `ca` / `proxy` for the lowercase forms.
+    const configuredVersion = normalizeHTTPVersion(String(config.httpVersion ?? "HTTP/2"));
+    const preferHTTP2 = configuredVersion !== "HTTP/1.1" && configuredVersion !== "HTTP/1.0";
     this.transport = createTransport(
       config.fetch,
-      config.httpVersion !== "HTTP/1.1",
+      preferHTTP2,
       // The HTTP/2 session pool was configurable on the transport but the
       // client always passed `undefined` here, so `sessionPool` on the client
       // config could not tune it.
@@ -2086,13 +2107,44 @@ export class Kinetex {
     }
 
     // ── Build initial request ─────────────────────────────────────────────
-    const fullUrl = buildURL(
+    let fullUrl = buildURL(
       options.baseURL ?? this.cfg.baseURL,
       url,
       mergeParams(this.cfg.params, options.params),
       undefined,
       this.cfg.allowPrivateNetwork === true,
     );
+
+    // URL userinfo (`https://user:pass@host/`) is Basic auth, as it is in
+    // axios. It also has to be removed from the URL before it reaches fetch:
+    // the Fetch spec rejects a Request whose URL carries credentials, and the
+    // thrown message embeds the full URL — credentials included. Extracting it
+    // here fixes both: the header is applied below and every later error,
+    // redirect and log sees a credential-free URL.
+    let urlAuth: { type: "basic"; username: string; password: string } | undefined;
+    try {
+      const parsed = new URL(fullUrl);
+      if (parsed.username !== "" || parsed.password !== "") {
+        const decode = (value: string): string => {
+          try {
+            return decodeURIComponent(value);
+          } catch {
+            return value;
+          }
+        };
+        urlAuth = {
+          type: "basic",
+          username: decode(parsed.username),
+          password: decode(parsed.password),
+        };
+        parsed.username = "";
+        parsed.password = "";
+        fullUrl = parsed.href;
+      }
+    } catch {
+      // buildURL already rejects malformed URLs; leave the string untouched so
+      // the normal validation path reports it.
+    }
 
     // A client-level `proxy` is honoured by the Node transport, which tunnels
     // every connection through it with CONNECT. A per-request `proxy` cannot be:
@@ -2192,6 +2244,18 @@ export class Kinetex {
       }
     }
 
+    // Normalise accepted spellings once, before hooks see the request, so an
+    // unknown value fails as a validation error rather than silently using
+    // HTTP/2. The transport repeats the check for direct users.
+    const requestedVersion = String(options.httpVersion ?? this.cfg.httpVersion ?? "HTTP/2");
+    const httpVersion = normalizeHTTPVersion(requestedVersion);
+    if (httpVersion === null) {
+      throw new KinetexError(
+        `Invalid httpVersion "${requestedVersion}" — expected "HTTP/2", "HTTP/1.1" or "HTTP/1.0"`,
+        "EVALIDATION",
+      );
+    }
+
     let req: KinetexRequest = {
       url: fullUrl,
       // Use the normalized method, not the caller's casing: `send(url, "patch")`
@@ -2215,7 +2279,7 @@ export class Kinetex {
         ? { maxRedirects: options.maxRedirects ?? this.cfg.maxRedirects }
         : {}),
       meta: { ...options.meta },
-      httpVersion: options.httpVersion ?? this.cfg.httpVersion ?? "HTTP/2",
+      httpVersion,
     };
 
     // A `FormData` body is encoded here rather than handed to the transport,
@@ -2273,7 +2337,9 @@ export class Kinetex {
     }
 
     // ── Apply auth ─────────────────────────────────────────────────────────
-    const auth = options.auth !== false ? (options.auth ?? this.cfg.auth) : undefined;
+    // Explicit auth wins over credentials embedded in the URL; `auth: false`
+    // disables both.
+    const auth = options.auth !== false ? (options.auth ?? this.cfg.auth ?? urlAuth) : undefined;
     if (auth) req = await applyAuth(req, auth);
 
     // ── Apply global transformRequest ──────────────────────────────────────
@@ -2862,6 +2928,17 @@ export class Kinetex {
         let nextUrl: string;
         try {
           const locationUrl = new URL(location, raw.url);
+          // A redirect target carrying `user:pass@` would either be rejected by
+          // fetch (after putting the credentials in the error) or, worse, be
+          // forwarded as Basic auth to whatever origin the 3xx names. Credentials
+          // belong in the initial request or an auth config, not in a redirect.
+          if (locationUrl.username !== "" || locationUrl.password !== "") {
+            throw new KinetexError(
+              `Redirect Location must not include credentials: ${redactUserInfo(location)}`,
+              "EVALIDATION",
+              { request: req },
+            );
+          }
           nextUrl = locationUrl.href;
 
           // Security: Reject unsafe protocols that could be used for SSRF/injection attacks.
@@ -2949,14 +3026,22 @@ export class Kinetex {
           /* nextUrl was already validated above */
         }
         if (crossOrigin) {
-          for (const h of CROSS_ORIGIN_STRIP_HEADERS) {
-            delete nextHeaders[h];
-          }
+          // Header names are case-insensitive, and interceptors are free to
+          // write canonical case. Deleting the lowercase spelling alone let
+          // `Authorization`, `Cookie`, `X-Api-Key` and `Proxy-Authorization`
+          // survive the hop. Match every stored key case-insensitively.
+          const stripHeader = (name: string): void => {
+            const lower = name.toLowerCase();
+            for (const key of Object.keys(nextHeaders)) {
+              if (key.toLowerCase() === lower) delete nextHeaders[key];
+            }
+          };
+          for (const h of CROSS_ORIGIN_STRIP_HEADERS) stripHeader(h);
           // An `apikey` auth header name is chosen by the application, so it is
           // not in the well-known list. It is a credential all the same, and it
           // was being forwarded verbatim to the new origin.
           if (appliedAuth && appliedAuth.type === "apikey") {
-            delete nextHeaders[appliedAuth.header.toLowerCase()];
+            stripHeader(appliedAuth.header);
           }
         }
 
@@ -3295,143 +3380,181 @@ export class Kinetex {
     const dispatchJar = await this.getCookieJar();
     const effectiveAuth = options.auth !== false ? (options.auth ?? this.cfg.auth) : undefined;
 
+    // One controller covers the whole attempt: the transport (including every
+    // redirect hop) and the response-body read. `sendWithTimeout` only guarded
+    // the header phase — it cleared its timer when the transport resolved, so a
+    // server that sent headers and then stalled held the caller past `timeout`
+    // indefinitely. The same controller gives `destroy()` a handle on an
+    // in-flight body read.
+    const attemptController = new AbortController();
+    const attemptSignal = mergeSignals(req.signal, attemptController.signal) ?? null;
+    const sendReq = attemptSignal === req.signal ? req : { ...req, signal: attemptSignal };
+    this._activeRequestControllers.add(attemptController);
+    const deadlineTimer =
+      timeout > 0
+        ? setTimeout(() => attemptController.abort(new TimeoutError(timeout, req)), timeout)
+        : null;
+    const endAttempt = (): void => {
+      if (deadlineTimer !== null) clearTimeout(deadlineTimer);
+      this._activeRequestControllers.delete(attemptController);
+    };
+    const attemptError = (err: unknown): unknown => {
+      if (!attemptController.signal.aborted) return err;
+      const reason: unknown = attemptController.signal.reason;
+      return reason instanceof Error ? reason : err;
+    };
+
     this._trace(_traceId, "transport_send", "start", startMs, attempt);
     let raw: RawResponse;
+    let rawBody: Uint8Array;
     try {
-      raw = await this._sendFollowingRedirects(
-        req,
-        timeout,
-        dispatchJar ?? undefined,
-        effectiveAuth,
-      );
-    } catch (err) {
-      // Cancel the progress-tracking ReadableStream to release the underlying
-      // resource (byte counter, event listeners) when the transport throws.
-      if (_uploadStreamForCleanup) {
-        try {
-          _uploadStreamForCleanup.cancel("Request failed").catch(() => {
-            /* ignore */
-          });
-        } catch {
-          /* ignore */
-        }
-      }
-      throw err;
-    }
-    this._trace(_traceId, "transport_send", "end", startMs, attempt);
-
-    // ── Lifecycle: after request ───────────────────────────────────────────
-    // "After the request is sent (before response is processed)" — the window
-    // between the transport answering and the response being built, and the
-    // only place a caller can observe that the wire round trip is over without
-    // also having to see the parsed response. It was declared on `LifecycleHooks`
-    // and documented twice in the README, and never invoked: a caller who
-    // registered it got silence, on every code path, for every status.
-    //
-    // Deliberately *not* fired on the throw above: the request was not sent.
-    if (this.cfg.hooks?.onAfterRequest) {
-      for (const fn of this.cfg.hooks.onAfterRequest) {
-        await fn(req, this._hookCtx(ctx));
-      }
-    }
-
-    // ── Handle 304 Not Modified ────────────────────────────────────────────
-    if (raw.status === 304) {
-      const cache = await this.getCache();
-      if (cache) {
-        const revalidated = await cache.revalidate(
-          { url: req.url, method: req.method, headers: req.headers },
-          { status: 304, statusText: "Not Modified", headers: raw.headers, body: null },
+      try {
+        // `0` here is deliberate: the attempt controller above is the deadline.
+        // A per-hop timer would restart at every redirect and let a chain of
+        // slow hops exceed `timeout` by a multiple of the hop count.
+        raw = await this._sendFollowingRedirects(
+          sendReq,
+          0,
+          dispatchJar ?? undefined,
+          effectiveAuth,
         );
-        if (revalidated) {
-          return await this._buildResponse<T>(
-            revalidated.response as import("./core.ts").RawResponse,
-            req,
-            true,
-            attempt,
-            startMs,
-            options,
-          );
+      } catch (err) {
+        // Cancel the progress-tracking ReadableStream to release the underlying
+        // resource (byte counter, event listeners) when the transport throws.
+        if (_uploadStreamForCleanup) {
+          try {
+            _uploadStreamForCleanup.cancel("Request failed").catch(() => {
+              /* ignore */
+            });
+          } catch {
+            /* ignore */
+          }
+        }
+        throw err;
+      }
+      this._trace(_traceId, "transport_send", "end", startMs, attempt);
+
+      // ── Lifecycle: after request ───────────────────────────────────────────
+      // "After the request is sent (before response is processed)" — the window
+      // between the transport answering and the response being built, and the
+      // only place a caller can observe that the wire round trip is over without
+      // also having to see the parsed response. It was declared on `LifecycleHooks`
+      // and documented twice in the README, and never invoked: a caller who
+      // registered it got silence, on every code path, for every status.
+      //
+      // Deliberately *not* fired on the throw above: the request was not sent.
+      if (this.cfg.hooks?.onAfterRequest) {
+        for (const fn of this.cfg.hooks.onAfterRequest) {
+          await fn(req, this._hookCtx(ctx));
         }
       }
-    }
 
-    // ── Decompress body ───────────────────────────────────────────────────
-    // Node.js HTTP/2 does not auto-decompress — we must do it ourselves.
-    // fetch()-based runtimes (Deno, Bun, Browser) auto-decompress and set
-    // alreadyDecompressed=true. Strip the content-encoding header when the
-    // transport already decompressed so we don't double-decompress.
-    if (raw.alreadyDecompressed) {
-      delete raw.headers["content-encoding"];
-      delete raw.headers["Content-Encoding"];
-    }
-    const decompressedBody = await decompressBodyStream(raw.body, raw.headers);
-
-    // ── Download progress ──────────────────────────────────────────────────
-    // Intercept the decompressed stream to count bytes as they are read.
-    const _downloadCbs: import("./types.ts").ProgressCallback[] = [];
-    if (options.onDownloadProgress) _downloadCbs.push(options.onDownloadProgress);
-    if (this.cfg.hooks?.onDownloadProgress) _downloadCbs.push(...this.cfg.hooks.onDownloadProgress);
-    const onDownload = _downloadCbs.length > 0 ? _downloadCbs : null;
-    let bodyStream = decompressedBody;
-    if (onDownload && bodyStream) {
-      const contentLength = raw.headers["content-length"];
-      const totalBytes = contentLength ? parseInt(contentLength, 10) : null;
-      const dlTracker = new ProgressTracker(totalBytes && !isNaN(totalBytes) ? totalBytes : null, {
-        onProgress: (snap: import("./progress.ts").ProgressSnapshot) => {
-          // ProgressSnapshot and ProgressEvent have identical structures
-          // This is a safe cast between equivalent types from different modules
-          const event: import("./types.ts").ProgressEvent =
-            snap as import("./types.ts").ProgressEvent;
-          for (const cb of _downloadCbs) cb(event);
-        },
-        ...(req.signal !== null ? { signal: req.signal } : {}),
-      });
-      // Capture the SOURCE in its own binding. `bodyStream` is reassigned to
-      // this wrapper immediately after construction, so closing over it made
-      // `cancel()` cancel *itself*: readRawBody's reader.cancel() (size limit,
-      // abort, read error) re-entered this function, which threw
-      // "Invalid state: ReadableStream is locked" from inside the cancel
-      // algorithm and left that inner promise unhandled (process-level crash on
-      // Node). start() only worked by accident, relying on the async-fn body
-      // running synchronously up to the first await.
-      const source: ReadableStream<Uint8Array> = bodyStream;
-      bodyStream = new ReadableStream<Uint8Array>({
-        async start(controller) {
-          const reader = source.getReader();
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) {
-                dlTracker.complete();
-                controller.close();
-                break;
-              }
-              dlTracker.update(value.byteLength);
-              controller.enqueue(value);
-            }
-          } catch (e) {
-            controller.error(e);
-          } finally {
-            reader.releaseLock();
+      // ── Handle 304 Not Modified ────────────────────────────────────────────
+      if (raw.status === 304) {
+        const cache = await this.getCache();
+        if (cache) {
+          const revalidated = await cache.revalidate(
+            { url: req.url, method: req.method, headers: req.headers },
+            { status: 304, statusText: "Not Modified", headers: raw.headers, body: null },
+          );
+          if (revalidated) {
+            return await this._buildResponse<T>(
+              revalidated.response as import("./core.ts").RawResponse,
+              req,
+              true,
+              attempt,
+              startMs,
+              options,
+            );
           }
-        },
-        cancel(reason) {
-          // Forward cancellation to the real source and swallow its failure:
-          // a rejection here is never observed by the cancelling reader.
-          void source.cancel(reason).catch(() => {});
-        },
-      });
-    }
+        }
+      }
 
-    // ── Read body with size limit ──────────────────────────────────────────
-    // 100 MB by default rather than unbounded: without a cap a hostile or
-    // simply broken server can drive this process out of memory, because the
-    // body is read in full before the caller sees a byte of it. An explicit
-    // `0` opts back out, which is what that value has always meant.
-    const maxSize =
-      options.maxResponseSize ?? this.cfg.maxResponseSize ?? DEFAULT_MAX_RESPONSE_SIZE;
-    const rawBody = await readRawBody(bodyStream, maxSize, raw.url, req.signal);
+      // ── Decompress body ───────────────────────────────────────────────────
+      // Node.js HTTP/2 does not auto-decompress — we must do it ourselves.
+      // fetch()-based runtimes (Deno, Bun, Browser) auto-decompress and set
+      // alreadyDecompressed=true. Strip the content-encoding header when the
+      // transport already decompressed so we don't double-decompress.
+      if (raw.alreadyDecompressed) {
+        delete raw.headers["content-encoding"];
+        delete raw.headers["Content-Encoding"];
+      }
+      const decompressedBody = await decompressBodyStream(raw.body, raw.headers);
+
+      // ── Download progress ──────────────────────────────────────────────────
+      // Intercept the decompressed stream to count bytes as they are read.
+      const _downloadCbs: import("./types.ts").ProgressCallback[] = [];
+      if (options.onDownloadProgress) _downloadCbs.push(options.onDownloadProgress);
+      if (this.cfg.hooks?.onDownloadProgress)
+        _downloadCbs.push(...this.cfg.hooks.onDownloadProgress);
+      const onDownload = _downloadCbs.length > 0 ? _downloadCbs : null;
+      let bodyStream = decompressedBody;
+      if (onDownload && bodyStream) {
+        const contentLength = raw.headers["content-length"];
+        const totalBytes = contentLength ? parseInt(contentLength, 10) : null;
+        const dlTracker = new ProgressTracker(
+          totalBytes && !isNaN(totalBytes) ? totalBytes : null,
+          {
+            onProgress: (snap: import("./progress.ts").ProgressSnapshot) => {
+              // ProgressSnapshot and ProgressEvent have identical structures
+              // This is a safe cast between equivalent types from different modules
+              const event: import("./types.ts").ProgressEvent =
+                snap as import("./types.ts").ProgressEvent;
+              for (const cb of _downloadCbs) cb(event);
+            },
+            ...(attemptSignal !== null ? { signal: attemptSignal } : {}),
+          },
+        );
+        // Capture the SOURCE in its own binding. `bodyStream` is reassigned to
+        // this wrapper immediately after construction, so closing over it made
+        // `cancel()` cancel *itself*: readRawBody's reader.cancel() (size limit,
+        // abort, read error) re-entered this function, which threw
+        // "Invalid state: ReadableStream is locked" from inside the cancel
+        // algorithm and left that inner promise unhandled (process-level crash on
+        // Node). start() only worked by accident, relying on the async-fn body
+        // running synchronously up to the first await.
+        const source: ReadableStream<Uint8Array> = bodyStream;
+        bodyStream = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            const reader = source.getReader();
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                  dlTracker.complete();
+                  controller.close();
+                  break;
+                }
+                dlTracker.update(value.byteLength);
+                controller.enqueue(value);
+              }
+            } catch (e) {
+              controller.error(e);
+            } finally {
+              reader.releaseLock();
+            }
+          },
+          cancel(reason) {
+            // Forward cancellation to the real source and swallow its failure:
+            // a rejection here is never observed by the cancelling reader.
+            void source.cancel(reason).catch(() => {});
+          },
+        });
+      }
+
+      // ── Read body with size limit ──────────────────────────────────────────
+      // 100 MB by default rather than unbounded: without a cap a hostile or
+      // simply broken server can drive this process out of memory, because the
+      // body is read in full before the caller sees a byte of it. An explicit
+      // `0` opts back out, which is what that value has always meant.
+      const maxSize =
+        options.maxResponseSize ?? this.cfg.maxResponseSize ?? DEFAULT_MAX_RESPONSE_SIZE;
+      rawBody = await readRawBody(bodyStream, maxSize, raw.url, attemptSignal);
+    } catch (err) {
+      throw attemptError(err);
+    } finally {
+      endAttempt();
+    }
 
     // ── Cookie jar (incoming Set-Cookie) ──────────────────────────────────
     const jar = await this.getCookieJar();
@@ -4073,6 +4196,20 @@ export class Kinetex {
       }
     }
     this._wsClients.clear();
+
+    // Abort request attempts still in flight — including body reads that have
+    // already received headers. Destroying the transport alone tore down the
+    // sockets but left the readRawBody promise parked on a stalled stream, so a
+    // caller awaiting that request never settled after `destroy()` resolved.
+    const destroyed = new KinetexError("Client destroyed", "EABORT");
+    for (const controller of this._activeRequestControllers) {
+      try {
+        controller.abort(destroyed);
+      } catch {
+        /* best-effort */
+      }
+    }
+    this._activeRequestControllers.clear();
 
     // NOTE: the cache is deliberately NOT cleared here. destroy() releases
     // resources; it must not purge data, and a user-supplied adapter

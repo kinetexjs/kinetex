@@ -318,6 +318,49 @@ async function main(): Promise<void> {
     assertStripped(mk, "x-api-key", "key-123");
   });
 
+  await test("mixed-case credential headers are stripped cross-origin", async () => {
+    // Header names are case-insensitive, and interceptors may write the
+    // canonical spelling. KX-09: the strip loop deleted only the lowercase
+    // names, so these survived the hop.
+    const mk = makeMock((req) =>
+      req.url.startsWith("https://evil.example.test")
+        ? { kind: "ok" }
+        : { kind: "redirect", location: "https://evil.example.test/mixed" },
+    );
+    const c = new Kinetex({ baseURL: "https://api.example.test", cookieJar: true });
+    const restore = swapTransport(c, mk.transport);
+    c.useRequest((ctx) => {
+      ctx.request.headers["Authorization"] = "Bearer MIXED";
+      ctx.request.headers["Cookie"] = "session=MIXED";
+      ctx.request.headers["X-Api-Key"] = "MIXED";
+      ctx.request.headers["Proxy-Authorization"] = "Basic MIXED";
+    });
+    try {
+      await c.get("/start");
+    } finally {
+      restore();
+    }
+
+    assert.equal(mk.received.length, 2, "expected exactly 2 hops");
+    const first = mk.received[0];
+    // Positive control: the canonical spellings really were on hop 0.
+    assert.equal(first.headers["Authorization"], "Bearer MIXED");
+    assert.equal(first.headers["Cookie"], "session=MIXED");
+    assert.equal(first.headers["X-Api-Key"], "MIXED");
+    assert.equal(first.headers["Proxy-Authorization"], "Basic MIXED");
+
+    const credentialNames = new Set([
+      "authorization",
+      "cookie",
+      "x-api-key",
+      "proxy-authorization",
+    ]);
+    const leaked = Object.keys(mk.received[1].headers).filter((name) =>
+      credentialNames.has(name.toLowerCase()),
+    );
+    assert.deepEqual(leaked, [], `credential headers leaked across origins: ${leaked.join(", ")}`);
+  });
+
   await test("x-auth-token / x-access-token / x-refresh-token stripped cross-origin", async () => {
     const mk = makeMock((req) =>
       req.url.startsWith("https://evil.example.test")

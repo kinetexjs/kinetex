@@ -733,12 +733,14 @@ await test("client.destroy() drains waiters so shutdown cannot hang", async () =
     // `settled.length` was the whole assertion, and `.catch(() => "err")`
     // means it is 10 for any ten settled promises — including a `destroy()`
     // that did nothing at all, since 10 x 400ms of serial work is 4s and the
-    // budget was 5s. What has to hold is that the nine *queued* callers were
-    // rejected rather than served.
+    // budget was 5s. What has to hold is that every caller was rejected rather
+    // than served: the nine *queued* callers by the limiter drain, and the one
+    // holding the permit by the attempt abort that `destroy()` performs (KX-12
+    // — a hard teardown must not leave an in-flight body read parked).
     const rejected = settled.filter((r) => r === "err").length;
     const served = settled.length - rejected;
-    assert.equal(rejected, 9, `the drain must reject all 9 queued callers, rejected ${rejected}`);
-    assert.equal(served, 1, "only the request already holding the permit completes");
+    assert.equal(rejected, 10, `destroy() must reject every pending caller, rejected ${rejected}`);
+    assert.equal(served, 0, "a hard teardown must not serve an in-flight request");
     assert.equal(probe.hits, 1, "a drained waiter must never reach the transport");
     assert.ok(elapsed < 1_500, `drain settled in ${elapsed}ms; a no-op destroy would take ~4000ms`);
   } finally {

@@ -1613,31 +1613,24 @@ if (!openssl) {
     const proxy = await startProxy();
     const transport = new NodeHTTP2Transport({ proxy: { url: proxy.url }, ca: ca as string });
     try {
-      // The target is an https (not h2) server, so the session cannot be
-      // established — what matters is that the tunnel was opened first and
-      // that the failure is not the thenable-socket crash.
-      await assert.rejects(
-        () => transport.send(transportRequest(target.url, "HTTP/2")),
-        (err: unknown) => {
-          // The old predicate was `assert.ok(!(err instanceof Error) || !/…/)`,
-          // which is true for every error ever thrown. Pin what actually
-          // happens: the tunnel opens, the socket reaches node:http2 as a
-          // real TLSSocket, and the failure is the expected ALPN mismatch
-          // against a non-h2 origin.
-          assert.ok(err instanceof KinetexError, `unexpected rejection: ${String(err)}`);
-          assert.equal(err.code, "ENETWORK");
-          assert.ok(
-            !/stream\.pause is not a function/.test(err.message),
-            "createConnection must not hand node:http2 a promise",
-          );
-          assert.match(err.message, /protocol|negotiat|alpn|http2/i);
-          return true;
-        },
-      );
-      assert.equal(proxy.seen.length, 1, "http2 must open its session via the tunnel");
+      // The target is an https (not h2) server, so the h2 handshake is
+      // refused. The transport must open the tunnel first, then fall back to
+      // HTTP/1.1 over the same proxy configuration — not crash on the
+      // thenable socket that `createConnection` used to return, and not
+      // silently skip the tunnel for the retry.
+      const raw = await transport.send(transportRequest(target.url, "HTTP/2"));
+      const text = raw.body ? await new Response(raw.body).text() : "";
+      assert.equal(raw.status, 200);
+      assert.match(text, /tls-through-proxy/);
+      assert.ok(proxy.seen.length >= 1, "the session must open through the tunnel");
       assert.ok(
-        proxy.seen[0].startsWith("CONNECT "),
-        `the session must be dialled with CONNECT, got ${proxy.seen[0]}`,
+        proxy.seen.every((head) => head.startsWith("CONNECT ")),
+        `every dial must be a CONNECT, got ${proxy.seen.join(" | ")}`,
+      );
+      const t = new URL(target.url);
+      assert.ok(
+        proxy.seen.every((head) => head.startsWith(`CONNECT ${t.hostname}:${t.port} HTTP/1.1`)),
+        "the tunnel must be opened to the target",
       );
     } finally {
       transport.destroy();
@@ -1669,8 +1662,10 @@ if (!openssl) {
         proxy.url,
         "the transport must still hold the proxy url it was given",
       );
-      const agent = (transport as unknown as { _http1Agent?: { options: { ca?: string } } })
-        ._http1Agent;
+      // The target is https, so the tunnel uses the secure agent. Agent
+      // construction is split by scheme: a plain http.Agent cannot speak TLS.
+      const agent = (transport as unknown as { _http1SecureAgent?: { options: { ca?: string } } })
+        ._http1SecureAgent;
       assert.ok(agent, "the agent must be built even without a ca");
       assert.equal(agent.options.ca, undefined, "no ca must not be invented");
     } finally {
@@ -1694,8 +1689,8 @@ if (!openssl) {
       const text = raw.body ? await new Response(raw.body).text() : "";
       assert.equal(raw.status, 200);
 
-      const agent = (transport as unknown as { _http1Agent: { options: { ca?: string } } })
-        ._http1Agent;
+      const agent = (transport as unknown as { _http1SecureAgent: { options: { ca?: string } } })
+        ._http1SecureAgent;
       assert.ok(agent, "the keep-alive agent must have been created");
       assert.equal(
         agent.options.ca,
@@ -1809,6 +1804,68 @@ await test("a per-request proxy is refused with an accurate reason", async () =>
     client.destroy();
   }
 });
+
+if (!openssl) {
+  console.log("  ⏭  skipped: client-level proxy tests need openssl");
+} else {
+  // KX-08: a forced HTTP/1.1 preference used to bypass NodeHTTP2Transport
+  // entirely, so a configured `proxy` and `ca` were silently dropped. The
+  // client must keep the Node transport and let `httpVersion` choose the h1
+  // path inside it.
+  await test("a client-level proxy carries a forced HTTP/1.1 request", async () => {
+    const target = await startTlsTarget();
+    const proxy = await startProxy();
+    const client = new Kinetex({
+      proxy: { url: proxy.url },
+      ca: ca as string,
+      allowPrivateNetwork: true,
+      httpVersion: "HTTP/1.1",
+      retry: { maxRetries: 0 },
+      timeout: 5_000,
+    });
+    try {
+      const res = await client.get<string>(target.url);
+      assert.equal(res.status, 200);
+      assert.equal(res.data, "tls-through-proxy");
+      assert.equal(proxy.seen.length, 1, "the request must go through the proxy");
+      assert.match(proxy.seen[0] ?? "", /^CONNECT 127\.0\.0\.1:\d+ HTTP\/1\.1/);
+    } finally {
+      await client.destroy();
+      await proxy.close();
+      await target.close();
+    }
+  });
+
+  // KX-08: `http1KeepAlive: false` used to be implemented by omitting the
+  // agent, and the proxy is implemented as an agent override — so disabling
+  // keep-alive silently disabled the proxy. It must still tunnel.
+  await test("http1KeepAlive:false still tunnels through the proxy", async () => {
+    const target = await startTlsTarget();
+    const proxy = await startProxy();
+    const client = new Kinetex({
+      proxy: { url: proxy.url },
+      ca: ca as string,
+      allowPrivateNetwork: true,
+      httpVersion: "HTTP/1.1",
+      sessionPool: { http1KeepAlive: false },
+      retry: { maxRetries: 0 },
+      timeout: 5_000,
+    });
+    try {
+      const first = await client.get<string>(target.url);
+      const second = await client.get<string>(target.url);
+      assert.equal(first.status, 200);
+      assert.equal(first.data, "tls-through-proxy");
+      assert.equal(second.status, 200);
+      assert.equal(second.data, "tls-through-proxy");
+      assert.equal(proxy.seen.length, 2, "with keep-alive off each request needs its own CONNECT");
+    } finally {
+      await client.destroy();
+      await proxy.close();
+      await target.close();
+    }
+  });
+}
 
 console.log(`\n${passed} passed, ${failures.length} failed`);
 if (failures.length > 0) {

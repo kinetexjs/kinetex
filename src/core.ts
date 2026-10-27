@@ -576,6 +576,12 @@ export class NodeHTTP2Transport implements Transport {
   /** Cached HTTP/1.1 fallback transport — reuse instead of creating fresh FetchTransport per call */
   private _http1Fallback: FetchTransport | null = null;
   /**
+   * Origins that rejected HTTP/2 during TLS ALPN. The first request pays the
+   * failed handshake; every later request for the same origin goes straight to
+   * HTTP/1.1 instead of repeating it.
+   */
+  private readonly _http1OnlyOrigins = new Set<string>();
+  /**
    * Dedicated keep-alive agent for the legacy `node:https` path.
    *
    * This path called `https.request(options)` with no `agent`, so behaviour was
@@ -593,7 +599,9 @@ export class NodeHTTP2Transport implements Transport {
   private readonly _allowPrivateNetwork: boolean;
   private readonly _http1KeepAlive: boolean;
   private readonly _http1MaxSockets: number;
-  private _http1Agent: import("node:https").Agent | null = null;
+  /** One agent per protocol: an http.Agent cannot speak TLS and vice versa. */
+  private _http1Agent: import("node:http").Agent | null = null;
+  private _http1SecureAgent: import("node:https").Agent | null = null;
   /** HTTP(S) CONNECT proxy, or undefined for a direct connection. */
   private readonly _proxy: import("./types.ts").ProxyConfig | undefined;
 
@@ -788,6 +796,13 @@ export class NodeHTTP2Transport implements Transport {
       },
     );
 
+    // A pooled ClientHttp2Session is a live handle. Left ref'd, Node keeps the
+    // event loop alive after the last response, so a one-shot script that does
+    // not call destroy() never exits. `unref()` drops that handle's own hold
+    // on the loop; active streams still hold it while they are open, which is
+    // why this is safe to do at session creation rather than only when idle.
+    session.unref();
+
     session.on("goaway", () => {
       this._evictSession(origin, session);
     });
@@ -834,16 +849,41 @@ export class NodeHTTP2Transport implements Transport {
   async send(req: KinetexRequest): Promise<RawResponse> {
     const url = new URL(req.url);
 
-    // HTTP/2 only works over HTTPS (or h2c for cleartext, but that's rare)
-    if (url.protocol !== "https:" || req.httpVersion === "HTTP/1.1") {
+    // Normalise every accepted spelling before it reaches the transport. The
+    // old check compared against the literal "HTTP/1.1", so "http/1.1", "1.1"
+    // and "HTTP/1.0" silently took the HTTP/2 path. An unrecognised value is a
+    // caller error, not a request to negotiate, so it fails before dialling.
+    const requested = req.httpVersion === undefined ? null : normalizeHTTPVersion(req.httpVersion);
+    if (req.httpVersion !== undefined && requested === null) {
+      throw new KinetexError(
+        `Invalid httpVersion "${String(req.httpVersion)}" — expected "HTTP/2", "HTTP/1.1" or "HTTP/1.0"`,
+        "EVALIDATION",
+        { request: req },
+      );
+    }
+
+    // HTTP/2 only works over HTTPS (or h2c for cleartext, but that's rare).
+    //
+    // `HTTP/1.0` is accepted as a preference, not a promise: Node has no
+    // HTTP/1.0 client mode, so it resolves to the HTTP/1.1 path and the
+    // response reports the protocol actually used.
+    if (
+      url.protocol !== "https:" ||
+      requested === "HTTP/1.1" ||
+      requested === "HTTP/1.0" ||
+      this._http1OnlyOrigins.has(url.origin)
+    ) {
       return this._sendHTTP1(req);
     }
 
     try {
       return await this._sendHTTP2(req, url);
     } catch (err) {
-      // ALPN negotiation failed or server doesn't support h2 — fall back
-      if (isHTTP2FallbackError(err)) {
+      // ALPN negotiation failed or the server does not support h2. Remember
+      // the origin so subsequent requests skip the doomed handshake, and only
+      // replay requests whose body can still be sent again.
+      if (isHTTP2FallbackError(err) && isReplayableBody(req.body)) {
+        this._http1OnlyOrigins.add(url.origin);
         return this._sendHTTP1(req);
       }
       throw err;
@@ -1212,9 +1252,13 @@ export class NodeHTTP2Transport implements Transport {
    * Fallback to HTTP/1.1 via fetch() or legacy node:https.
    */
   private _sendHTTP1(req: KinetexRequest): Promise<RawResponse> {
-    // Fall back to fetch for HTTP/1.1 on Node — works in Node 18+
-    // For older Node, use node:https
-    if (typeof globalThis.fetch === "function") {
+    // `ca` and `proxy` cannot be expressed through the platform fetch API
+    // without an undici dispatcher, which this package deliberately does not
+    // depend on. The node:http(s) path honours both, so use it whenever either
+    // is configured instead of silently dropping the setting.
+    const needsNodeTls = this._ca !== undefined || this._proxy !== undefined;
+
+    if (typeof globalThis.fetch === "function" && !needsNodeTls) {
       if (!this._http1Fallback) {
         const opts: FetchTransportOptions = {
           fetchFn: globalThis.fetch,
@@ -1223,6 +1267,11 @@ export class NodeHTTP2Transport implements Transport {
           // down, `new NodeHTTP2Transport({ requestTimeoutMs: 500 })` hung for
           // the full response time on any non-https URL or HTTP/1.1 request.
           requestTimeoutMs: this._requestTimeoutMs,
+          // Both were accepted by this transport and then dropped on the
+          // fallback path, so a private hostname hit the DNS screen with the
+          // default `false` and a private-network request failed even though
+          // the client had opted in.
+          allowPrivateNetwork: this._allowPrivateNetwork,
         };
         if (this._onDroppedHeader !== undefined) opts.onDroppedHeader = this._onDroppedHeader;
         this._http1Fallback = new FetchTransport(opts);
@@ -1237,8 +1286,12 @@ export class NodeHTTP2Transport implements Transport {
    * Legacy HTTP/1.1 via node:https for Node.js <18 (no global fetch).
    */
   private async _sendHTTP1Legacy(req: KinetexRequest): Promise<RawResponse> {
-    const https = await import("node:https");
     const url = new URL(req.url);
+    const secure = url.protocol === "https:";
+    // A proxy or custom CA forces this path even on Node 18+, so it must be
+    // able to speak plain HTTP as well as TLS. Reaching for node:https for an
+    // `http://` URL wrapped the socket in TLS and failed the handshake.
+    const nodeHttp = secure ? await import("node:https") : await import("node:http");
 
     // A `FormData` body is encoded before the request options are built, for
     // the same reason as on the HTTP/2 path: the multipart boundary is
@@ -1259,11 +1312,16 @@ export class NodeHTTP2Transport implements Transport {
 
     const options: import("node:http").RequestOptions = {
       hostname: url.hostname,
-      port: url.port || "443",
+      port: url.port || (secure ? "443" : "80"),
       path: url.pathname + url.search,
       method: legacyReq.method,
       headers: legacyReq.headers,
-      ...(this._http1KeepAlive ? { agent: this._getHttp1Agent(https) } : {}),
+      // A proxy is implemented by overriding the agent's createConnection, so
+      // it needs an agent even when keep-alive is disabled. Previously
+      // `http1KeepAlive: false` silently bypassed the proxy.
+      ...(this._http1KeepAlive || this._proxy !== undefined
+        ? { agent: this._getHttp1Agent(nodeHttp, secure) }
+        : {}),
       // `ca` was accepted by the transport but never reached this path, so a
       // private or self-signed peer could not be reached without disabling
       // verification process-wide.
@@ -1273,7 +1331,8 @@ export class NodeHTTP2Transport implements Transport {
     };
 
     return new Promise<RawResponse>((resolve, reject) => {
-      const httpReq = https.request(options, (httpRes) => {
+      const request = nodeHttp.request as typeof import("node:https").request;
+      const httpReq = request(options, (httpRes) => {
         const resHeaders: Record<string, string> = {};
         for (const [k, v] of Object.entries(httpRes.headers)) {
           if (v !== undefined) resHeaders[k] = Array.isArray(v) ? v.join(", ") : v;
@@ -1327,55 +1386,76 @@ export class NodeHTTP2Transport implements Transport {
   /**
    * Lazily create the keep-alive agent used by the legacy HTTP/1.1 path.
    *
-   * @param https - The already-imported `node:https` module.
-   * @returns The shared agent, reused across requests.
+   * @param nodeHttp - The already-imported `node:http` or `node:https` module.
+   * @param secure - Whether this agent will dial TLS.
+   * @returns The shared agent for that protocol, reused across requests.
    */
-  private _getHttp1Agent(https: typeof import("node:https")): import("node:https").Agent {
-    if (!this._http1Agent) {
-      this._http1Agent = new https.Agent({
-        keepAlive: true,
-        maxSockets: this._http1MaxSockets,
-        maxFreeSockets: this._http1MaxSockets,
-        // A private/self-signed peer must be trusted before the socket enters
-        // the pool, otherwise the agent only fails later on reuse.
-        ...(this._ca !== undefined ? { ca: this._ca } : {}),
-      });
+  private _getHttp1Agent(
+    nodeHttp: typeof import("node:https") | typeof import("node:http"),
+    secure: boolean,
+  ): import("node:http").Agent | import("node:https").Agent {
+    const existing = secure ? this._http1SecureAgent : this._http1Agent;
+    if (existing) return existing;
 
-      if (this._proxy !== undefined) {
-        // Assigned to the INSTANCE, not passed in the agent options:
-        // `new Agent({ createConnection })` only copies it into
-        // `agent.options`, while `Agent.prototype.createSocket` calls
-        // `this.createConnection(...)` — the prototype method. Passing it in
-        // the options is silently ignored and the agent dials the origin
-        // directly, bypassing the proxy entirely.
-        //
-        // `createSocket` does:
-        //     const s = this.createConnection(options, oncreate);
-        //     if (s) oncreate(null, s);
-        // so returning a Promise would be truthy and the agent would adopt
-        // the thenable as a socket. The callback form is the supported way to
-        // connect asynchronously: this returns undefined and reports the
-        // tunneled socket through `oncreate`.
-        //
-        // The tunnel is already TLS-wrapped for an https origin, which is
-        // exactly what https.Agent expects createConnection to return.
-        this._http1Agent.createConnection = ((
-          opts: import("node:tls").ConnectionOptions,
-          oncreate: (err: Error | null, socket?: import("node:net").Socket) => void,
-        ) => {
-          void this._createProxiedSocket(
-            `https://${String(opts.host ?? opts.servername ?? "localhost")}:${String(opts.port ?? 443)}`,
-            undefined,
-            undefined,
-          ).then(
-            (socket) => oncreate(null, socket),
-            (err: Error) => oncreate(err),
-          );
-          return undefined;
-        }) as unknown as typeof import("node:https").Agent.prototype.createConnection;
-      }
+    // The two Agent classes share the option surface used here; the secure
+    // one additionally reads `ca`, which the plain one ignores.
+    const Agent = nodeHttp.Agent as typeof import("node:https").Agent;
+    const agent = new Agent({
+      keepAlive: this._http1KeepAlive,
+      maxSockets: this._http1MaxSockets,
+      maxFreeSockets: this._http1MaxSockets,
+      // A private/self-signed peer must be trusted before the socket enters
+      // the pool, otherwise the agent only fails later on reuse.
+      ...(secure && this._ca !== undefined ? { ca: this._ca } : {}),
+    });
+    if (secure) this._http1SecureAgent = agent;
+    else this._http1Agent = agent;
+
+    if (this._proxy !== undefined) {
+      // Assigned to the INSTANCE, not passed in the agent options:
+      // `new Agent({ createConnection })` only copies it into
+      // `agent.options`, while `Agent.prototype.createSocket` calls
+      // `this.createConnection(...)` — the prototype method. Passing it in
+      // the options is silently ignored and the agent dials the origin
+      // directly, bypassing the proxy entirely.
+      //
+      // `createSocket` does:
+      //     const s = this.createConnection(options, oncreate);
+      //     if (s) oncreate(null, s);
+      // so returning a Promise would be truthy and the agent would adopt
+      // the thenable as a socket. The callback form is the supported way to
+      // connect asynchronously: this returns undefined and reports the
+      // tunneled socket through `oncreate`.
+      //
+      // The tunnel is already TLS-wrapped for an https origin, which is
+      // exactly what https.Agent expects createConnection to return.
+      agent.createConnection = ((
+        opts: import("node:tls").ConnectionOptions & { protocol?: string },
+        oncreate: (err: Error | null, socket?: import("node:net").Socket) => void,
+      ) => {
+        // The agent does not reliably put `protocol` in the connection
+        // options, so fall back to the scheme this agent was built for. A
+        // plain-HTTP proxy tunnel must stay plain; defaulting to https would
+        // TLS-wrap it and fail the handshake.
+        const protocol =
+          opts.protocol === "http:" || opts.protocol === "https:"
+            ? opts.protocol
+            : secure
+              ? "https:"
+              : "http:";
+        const defaultPort = protocol === "http:" ? 80 : 443;
+        void this._createProxiedSocket(
+          `${protocol}//${String(opts.host ?? opts.servername ?? "localhost")}:${String(opts.port ?? defaultPort)}`,
+          undefined,
+          undefined,
+        ).then(
+          (socket) => oncreate(null, socket),
+          (err: Error) => oncreate(err),
+        );
+        return undefined;
+      }) as unknown as typeof import("node:https").Agent.prototype.createConnection;
     }
-    return this._http1Agent;
+    return agent;
   }
 
   /**
@@ -1431,10 +1511,13 @@ export class NodeHTTP2Transport implements Transport {
     }
     this.sessions.clear();
 
-    // Drain the legacy HTTP/1.1 keep-alive pool too, so a destroyed transport
-    // leaves no idle sockets behind holding the event loop open.
+    // Drain the legacy HTTP/1.1 keep-alive pools too, so a destroyed transport
+    // leaves no idle sockets behind holding the event loop open. There is one
+    // agent per scheme: an http.Agent cannot speak TLS and vice versa.
     this._http1Agent?.destroy();
     this._http1Agent = null;
+    this._http1SecureAgent?.destroy();
+    this._http1SecureAgent = null;
   }
 }
 
@@ -1495,7 +1578,15 @@ export function createTransport(
       );
     }
   }
-  if (IS_NODE && preferHTTP2 && !needsFetchTransport) {
+  // A forced HTTP/1.1 preference does not by itself justify dropping to
+  // FetchTransport: `ca` and `proxy` can only be honoured by the Node HTTP
+  // transport (fetch has no equivalent without an undici dispatcher). Keep the
+  // Node transport when either is configured and let `req.httpVersion` choose
+  // the HTTP/1.1 path inside it.
+  const needsNodeTransport =
+    preferHTTP2 || transportOptions?.ca !== undefined || transportOptions?.proxy !== undefined;
+
+  if (IS_NODE && needsNodeTransport && !needsFetchTransport) {
     return new NodeHTTP2Transport({
       ...(sessionOptions?.sessionTTLMs !== undefined
         ? { sessionTTLMs: sessionOptions.sessionTTLMs }
@@ -1957,7 +2048,7 @@ export function normalizeHeaders(headers: Headers): Record<string, string> {
  * "1.1") plus the union's own members, case- and whitespace-insensitively, so a
  * peer cannot widen the field to a string by adding a prefix.
  */
-function normalizeHTTPVersion(raw: string): HTTPVersion | null {
+export function normalizeHTTPVersion(raw: string): HTTPVersion | null {
   const v = raw.trim().toLowerCase();
   if (v === "2" || v === "2.0" || v === "h2" || v === "http/2" || v === "http/2.0") return "HTTP/2";
   if (v === "1" || v === "1.0" || v === "http/1" || v === "http/1.0") return "HTTP/1.0";
@@ -1998,13 +2089,47 @@ function detectHTTPVersion(response: Response, _headers: Record<string, string>)
  */
 function isHTTP2FallbackError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
-  const msg = err.message.toLowerCase();
-  return (
-    msg.includes("alpn") ||
-    msg.includes("h2") ||
-    msg.includes("http2") ||
-    (err as NodeJS.ErrnoException).code === "ERR_HTTP2_ERROR"
-  );
+
+  const codeOf = (candidate: Error): string =>
+    ((candidate as NodeJS.ErrnoException).code ?? "").toString();
+
+  const isNegotiationFailure = (candidate: Error): boolean => {
+    const code = codeOf(candidate);
+    // An HTTP/1.1-only TLS server rejects the h2 ALPN offer with this code.
+    // Its message is "no application protocol" and contains neither "alpn"
+    // nor "h2", so the old message-only predicate missed the exact failure it
+    // was written for.
+    if (code === "ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL") return true;
+    if (code.startsWith("ERR_HTTP2_")) return true;
+
+    // Negotiation-specific phrases only. A generic "HTTP/2 …" message is the
+    // library's own error — a request timeout or a redirect gate — and
+    // replaying that over HTTP/1.1 would hide it. The previous predicate
+    // matched any message containing "http/2", which made a timed-out h2
+    // request re-run (and a refused redirect get followed) on the h1 path.
+    const msg = candidate.message.toLowerCase();
+    return msg.includes("alpn") || msg.includes("no application protocol");
+  };
+
+  if (isNegotiationFailure(err)) return true;
+  // Stream errors are wrapped as `KinetexError("…", "ENETWORK", { cause })`;
+  // the Node code lives on the cause.
+  const cause = (err as { cause?: unknown }).cause;
+  return cause instanceof Error && isNegotiationFailure(cause);
+}
+
+/**
+ * Whether a request body can be written a second time.
+ *
+ * The HTTP/2 → HTTP/1.1 fallback replays the request. A stream or Blob has
+ * already been consumed (or locked) by the first attempt, so replaying it
+ * would either throw or send an empty body; the caller gets the original
+ * transport error instead.
+ */
+function isReplayableBody(body: import("./types.ts").BodyInit): boolean {
+  if (body === null) return true;
+  if (body instanceof ReadableStream) return false;
+  return !(typeof Blob !== "undefined" && body instanceof Blob);
 }
 
 // ── Node.js stream helpers (only executed on Node) ────────────────────────────
