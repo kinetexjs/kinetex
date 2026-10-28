@@ -721,6 +721,17 @@ describe("isSafeURL SSRF battle", () => {
     assert.equal(isSafeURL("http://93.184.216.34/"), true);
     assert.equal(isSafeURL("http://[2606:2800:220:1:248:1893:25c8:1946]/"), true);
   });
+
+  it("allows double dots inside a path segment", () => {
+    // `foo..bar.txt` is a filename, not path traversal. Rejecting every
+    // occurrence of ".." made the guard refuse ordinary URLs.
+    assert.equal(isSafeURL("https://example.com/files/foo..bar.txt"), true);
+    assert.equal(isSafeURL("https://example.com/foo..bar"), true);
+    // The URL parser resolves literal and percent-encoded dot segments before
+    // isSafeURL sees the pathname; the request lands on a normal path.
+    assert.equal(isSafeURL("https://example.com/a/../b"), true);
+    assert.equal(isSafeURL("https://example.com/%2e%2e/secret"), true);
+  });
 });
 
 // ── randomBytes CSPRNG contract ────────────────────────────────────────────────

@@ -1164,6 +1164,61 @@ await test("addAround hook wraps the dispatch", async () => {
   assert.equal(res.status, 200, "and the dispatch must still run");
 });
 
+await test("an around hook dispatches exactly once", async () => {
+  const reg = new HookRegistry();
+  let dispatches = 0;
+  reg.addAround(async (_ctx, next) => next());
+  const req = hookReq();
+  const res = await reg.wrapWithAround(createHookContext(req), async () => {
+    dispatches++;
+    return hookRes({ request: req });
+  })();
+  assert.equal(dispatches, 1, "the dispatch must not be called a second time");
+  assert.equal(res.status, 200);
+});
+
+await test("an around hook can short-circuit without calling next", async () => {
+  const reg = new HookRegistry();
+  let dispatches = 0;
+  const short = hookRes({ status: 201, statusText: "Created", body: "short" });
+  reg.addAround(async () => short);
+  const res = await reg.wrapWithAround(createHookContext(hookReq()), async () => {
+    dispatches++;
+    return hookRes();
+  })();
+  assert.equal(dispatches, 0, "the dispatch must be skipped");
+  assert.equal(res.status, 201);
+  assert.equal(res.body, "short");
+});
+
+await test("a rejected async around hook propagates or is isolated by safe", async () => {
+  const critical = new HookRegistry();
+  critical.addAround(async () => {
+    throw new Error("async-around-boom");
+  });
+  await assert.rejects(
+    () => critical.wrapWithAround(createHookContext(hookReq()), async () => hookRes())(),
+    /async-around-boom/,
+    "a safe:false around hook rejection must reach the caller",
+  );
+
+  const safe = new HookRegistry();
+  safe.addAround(
+    async () => {
+      throw new Error("async-around-safe-boom");
+    },
+    { safe: true },
+  );
+  const origError = console.error;
+  console.error = () => {};
+  try {
+    const res = await safe.wrapWithAround(createHookContext(hookReq()), async () => hookRes())();
+    assert.equal(res.status, 200, "a safe:true rejection must fall back to the dispatch");
+  } finally {
+    console.error = origError;
+  }
+});
+
 // ============================================================================
 // HOOK EMITTER
 // ============================================================================
@@ -1974,9 +2029,8 @@ await test("regression: safe:false propagates on every phase", async () => {
 
   const around = new HookRegistry();
   around.addAround(boom);
-  // The wrapper calls the hook synchronously, so this throws rather than
-  // returning a rejected promise and `assert.rejects` is the wrong shape.
-  assert.throws(
+  // Around hooks are async, so the failure surfaces as a rejected promise.
+  await assert.rejects(
     () => around.wrapWithAround(ctx, async () => hookRes())(),
     /hook-boom/,
     "a safe:false around hook must propagate",

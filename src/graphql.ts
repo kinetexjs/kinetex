@@ -1001,6 +1001,7 @@ export class GraphQLClient {
           ? { operationName: extractOperationName(query)! }
           : {}),
       ...(options.extensions !== undefined ? { extensions: options.extensions } : {}),
+      ...(options.headers !== undefined ? { headers: options.headers } : {}),
     } as GraphQLRequest<V>;
 
     return await this._execute<T, V>(req, options.signal ?? null);
@@ -1025,6 +1026,7 @@ export class GraphQLClient {
     variables?: V,
     options: {
       operationName?: string;
+      headers?: Record<string, string>;
       signal?: AbortSignal;
       extensions?: Record<string, unknown>;
     } = {},

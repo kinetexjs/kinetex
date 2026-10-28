@@ -768,10 +768,20 @@ export function isSafeURL(
       }
     }
 
-    // Check for suspicious patterns (path traversal)
-    if (parsed.hostname.includes("..") || parsed.pathname.includes("..")) {
-      return false;
-    }
+    // Check for suspicious patterns (path traversal). Only a whole `..`
+    // segment is traversal: `foo..bar.txt` is a perfectly ordinary filename,
+    // and rejecting it made the SSRF guard refuse valid URLs. Encoded dots are
+    // decoded before comparison because the server may decode them again.
+    if (parsed.hostname.includes("..")) return false;
+    const hasTraversal = parsed.pathname.split("/").some((segment) => {
+      if (segment === "..") return true;
+      try {
+        return decodeURIComponent(segment) === "..";
+      } catch {
+        return false;
+      }
+    });
+    if (hasTraversal) return false;
 
     // Check hostname length (RFC 1035)
     if (parsed.hostname.length > 253) return false;

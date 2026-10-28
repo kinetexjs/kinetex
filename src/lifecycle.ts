@@ -743,21 +743,24 @@ export class HookRegistry {
     let fn = dispatch;
     for (const hook of sorted) {
       const next = fn;
-      fn = () => {
+      fn = async () => {
         if (!this._shouldRun(hook, ctx)) return next();
-        // `safe` is honoured here too. It used to be ignored, and ignored in
-        // the *other* direction: a `safe: true` around hook that threw took the
-        // whole request down. On failure the dispatch is still run, because an
-        // around hook that throws before calling `next` has no response to
-        // return and the pipeline cannot continue without one.
-        let failed = false;
-        const result = this._safeRunSync(hook, () => {
-          failed = true;
-          return hook.fn(ctx, next);
-        });
-        this._maybeEject(hook, this.aroundHooks);
-        if (failed) return next();
-        return result!;
+        // Around hooks are async by contract. `_safeRunSync` could not await
+        // them, so a rejected `safe: false` hook escaped as an unhandled
+        // rejection instead of failing the request, and a hook that returned a
+        // synthetic response without calling `next()` was overridden because
+        // the old code marked `failed` *before* invoking the hook and then
+        // dispatched a second time. Await the hook and only fall back to
+        // `next()` when a `safe: true` hook actually throws.
+        try {
+          return await hook.fn(ctx, next);
+        } catch (err) {
+          if (!hook.safe) throw err;
+          console.error(`[lifecycle] Hook "${hook.id}" threw:`, err);
+          return next();
+        } finally {
+          this._maybeEject(hook, this.aroundHooks);
+        }
       };
     }
 

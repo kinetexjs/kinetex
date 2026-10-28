@@ -61,7 +61,11 @@ import {
   mergeSignals,
 } from "./utils.ts";
 import { CREDENTIAL_HEADERS } from "./cache.ts";
-import { createRateLimitInterceptor, ConcurrencyLimiter } from "./interceptors.ts";
+import {
+  createRateLimitInterceptor,
+  ConcurrencyLimiter,
+  type InterceptorResponse,
+} from "./interceptors.ts";
 import { SigV4Signer } from "./aws-sigv4.ts";
 import { createDigestAuthorizer } from "./digest.ts";
 import { generateIdempotencyKey, isValidIdempotencyKey, parseRetryAfter } from "./headers.ts";
@@ -846,6 +850,25 @@ function redactUserInfo(url: string): string {
   } catch {
     return url.replace(/\/\/[^/@]*@/, "//");
   }
+}
+
+/**
+ * Distinguish a synthetic interceptor response from a replacement request.
+ *
+ * A request interceptor may return either. Both are objects with a `url`-ish
+ * shape only on the request side, so the discriminator is the response's
+ * numeric `status` plus a `headers` record and a `body` field.
+ */
+function isInterceptorResponse(value: unknown): value is InterceptorResponse {
+  if (value === null || typeof value !== "object") return false;
+  const v = value as Partial<InterceptorResponse>;
+  return (
+    typeof v.status === "number" &&
+    typeof v.statusText === "string" &&
+    v.headers !== null &&
+    typeof v.headers === "object" &&
+    "body" in v
+  );
 }
 
 /**
@@ -3123,8 +3146,21 @@ export class Kinetex {
 
     // ── Request interceptors ───────────────────────────────────────────────
     this._trace(_traceId, "request_interceptors", "start", startMs, attempt);
-    req = await this._runRequestInterceptors(ctx);
+    const intercepted = await this._runRequestInterceptors(ctx);
     this._trace(_traceId, "request_interceptors", "end", startMs, attempt);
+    if (isInterceptorResponse(intercepted)) {
+      return this._finishSyntheticResponse<T>(
+        intercepted,
+        req,
+        ctx,
+        options,
+        startMs,
+        attempt,
+        timeout,
+        retryCfg ?? false,
+      );
+    }
+    req = intercepted;
 
     // ── Lifecycle: before request ──────────────────────────────────────────
     this._trace(_traceId, "lifecycle_before", "start", startMs, attempt);
@@ -3695,11 +3731,21 @@ export class Kinetex {
    * Run all registered request interceptors in sequence.
    * Each interceptor may modify the request, replace it, or short-circuit.
    */
-  private async _runRequestInterceptors(ctx: InterceptorContext): Promise<KinetexRequest> {
+  private async _runRequestInterceptors(
+    ctx: InterceptorContext,
+  ): Promise<KinetexRequest | InterceptorResponse> {
     let req = ctx.request;
     for (const fn of this.interceptors.request) {
       ctx.request = req;
       const result = await fn(ctx);
+      if (isInterceptorResponse(result)) {
+        // A synthetic response — a cache hit, a stub, an offline replay — must
+        // stop the chain here. It used to be discarded because only a
+        // replacement request was accepted, so the interceptor ran, returned a
+        // response, and the pipeline still hit the network.
+        ctx.response = result;
+        return result;
+      }
       if (result && "url" in result && !("status" in result)) {
         req = result as KinetexRequest;
       } else if (ctx.request !== req) {
@@ -3815,6 +3861,94 @@ export class Kinetex {
     }
 
     return null;
+  }
+
+  /**
+   * Turn a synthetic response returned by a request interceptor into a normal
+   * `KinetexResponse`, then run the same response-side phases a network
+   * response goes through.
+   */
+  private async _finishSyntheticResponse<T>(
+    synthetic: InterceptorResponse,
+    req: KinetexRequest,
+    ctx: InterceptorContext,
+    options: SendOptions<T>,
+    startMs: number,
+    attempt: number,
+    timeout: number,
+    retryCfg: RetryConfig | false,
+  ): Promise<KinetexResponse<T>> {
+    const rawBody =
+      synthetic.body instanceof Uint8Array
+        ? synthetic.body
+        : typeof synthetic.body === "string"
+          ? new TextEncoder().encode(synthetic.body)
+          : null;
+
+    const contentType =
+      synthetic.headers["content-type"] ?? synthetic.headers["Content-Type"] ?? null;
+    const responseURL = synthetic.url ?? req.url;
+    const data = rawBody
+      ? await parseBody<T>(
+          rawBody,
+          contentType,
+          options.parseResponse,
+          options.parseFailure,
+          synthetic.headers,
+          responseURL,
+        )
+      : (null as T);
+
+    const res: KinetexResponse<T> = {
+      status: synthetic.status,
+      statusText: synthetic.statusText,
+      headers: synthetic.headers,
+      data,
+      rawBody,
+      body: synthetic.body,
+      url: responseURL,
+      cached: synthetic.cached === true,
+      redirected: false,
+      httpVersion: synthetic.httpVersion ?? "HTTP/1.1",
+      durationMs: perfNow() - startMs,
+      request: req,
+      attempt,
+      raw: synthetic.raw,
+    };
+
+    ctx.response = res as unknown as InterceptorResponse;
+    const finalRes = await this._runResponseInterceptors<T>(
+      ctx,
+      res,
+      req,
+      timeout,
+      options,
+      startMs,
+      attempt,
+      retryCfg,
+    );
+
+    if (this.cfg.hooks?.onBeforeResponse) {
+      let current = finalRes as KinetexResponse<unknown>;
+      for (const fn of this.cfg.hooks.onBeforeResponse) {
+        const r = await fn(current, this._hookCtx(ctx));
+        if (r) current = r;
+      }
+    }
+
+    const throwOnErr = options.throwOnError ?? this.cfg.throwOnError ?? true;
+    if (throwOnErr && finalRes.status >= 400) {
+      throw new HTTPStatusError(finalRes as KinetexResponse<unknown>, req);
+    }
+
+    if (this.cfg.hooks?.onAfterResponse) {
+      for (const fn of this.cfg.hooks.onAfterResponse) {
+        await fn(finalRes as KinetexResponse<unknown>, this._hookCtx(ctx));
+      }
+    }
+
+    options.onSuccess?.(finalRes);
+    return finalRes;
   }
 
   // ── §8.10  Convenience: build response from cache entry ───────────────────

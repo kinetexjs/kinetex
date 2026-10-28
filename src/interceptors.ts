@@ -68,6 +68,12 @@ export interface InterceptorResponse {
   raw?: unknown;
   /** Reference back to the request that produced this response */
   request: InterceptorRequest;
+  /** Final URL when a synthetic response differs from the request URL. */
+  url?: string;
+  /** True when the response was served from a cache interceptor. */
+  cached?: boolean;
+  /** HTTP version to report to callers for a synthetic response. */
+  httpVersion?: import("./types.ts").HTTPVersion;
 }
 
 /** Context object threaded through the entire pipeline for one request. */
@@ -132,7 +138,7 @@ export type ErrorInterceptorResult = void | undefined | InterceptorResponse;
 /** Generic interceptor function type (internal use). */
 export type InterceptorFn<T = unknown> = (ctx: InterceptorContext) => Promise<T> | T;
 
-import { getAuthFingerprint } from "./cache.ts";
+import { buildVaryKey, getAuthFingerprint } from "./cache.ts";
 import { perfNow, sleep, redactHeaders as redactHeaderValues } from "./utils.ts";
 import { KinetexError } from "./types.ts";
 // `BodyInit` must come from here, not from the global DOM lib. The global one
@@ -1121,9 +1127,27 @@ export function createCacheInterceptor(config: Partial<CacheConfig> = {}): {
   const cfg = { ...CACHE_DEFAULTS, ...config };
   const store = new Map<string, CacheEntry>();
   const lru: string[] = []; // front = most-recently-used
+  /** Base key → the response's `Vary` header. "*" means never cache. */
+  const varyByBase = new Map<string, string>();
 
-  function cacheKey(req: InterceptorRequest): string {
-    return cfg.cacheKey ? cfg.cacheKey(req) : `${req.method}:${req.url}`;
+  async function cacheKey(req: InterceptorRequest): Promise<string> {
+    const base = cfg.cacheKey ? cfg.cacheKey(req) : `${req.method}:${req.url}`;
+    // Two users hitting the same URL must not share a response just because
+    // the URL is the same. The fingerprint covers Authorization, Cookie and
+    // the rest of CREDENTIAL_HEADERS, and is stable for anonymous requests.
+    const auth = await getAuthFingerprint(req.headers);
+    return auth ? `${base}|${auth}` : base;
+  }
+
+  function entryKey(
+    base: string,
+    varyHeader: string,
+    headers: Record<string, string>,
+  ): string | null {
+    if (!varyHeader) return base;
+    const varyKey = buildVaryKey(varyHeader, headers);
+    // null is `Vary: *` — the response is per-user and must not be reused.
+    return varyKey === null ? null : `${base}|vary:${varyKey}`;
   }
 
   function touchLRU(key: string): void {
@@ -1142,33 +1166,43 @@ export function createCacheInterceptor(config: Partial<CacheConfig> = {}): {
     const swr = cc.match(/stale-while-revalidate=(\d+)/)?.[1];
     const noStore = /no-store/i.test(cc);
     const noCache = /no-cache/i.test(cc);
+    // `private` is a per-user response. Storing it in a shared interceptor
+    // cache is exactly how one tenant sees another tenant's data.
+    const isPrivate = /(?:^|,)\s*private(?:\s*(?:,|=|$))/i.test(cc);
 
-    if (cfg.honorCacheControl && (noStore || noCache)) return { ttlMs: 0, swrMs: 0 };
+    if (cfg.honorCacheControl && (noStore || noCache || isPrivate)) {
+      return { ttlMs: 0, swrMs: 0 };
+    }
 
     const ttlMs = maxAge ? parseInt(maxAge, 10) * 1000 : cfg.defaultTtlMs;
     const swrMs = swr ? parseInt(swr, 10) * 1000 : 0;
     return { ttlMs, swrMs };
   }
 
-  const requestInterceptor: RequestInterceptorFn = (ctx) => {
+  const requestInterceptor: RequestInterceptorFn = async (ctx) => {
     if (!cfg.cacheMethods.includes(ctx.request.method.toUpperCase())) return undefined;
-    const key = cacheKey(ctx.request);
+    const base = await cacheKey(ctx.request);
+    const vary = varyByBase.get(base) ?? "";
+    if (vary === "*") return undefined;
+    const key = entryKey(base, vary, ctx.request.headers);
+    if (!key) return undefined;
     const entry = store.get(key);
     if (!entry) return undefined;
 
     const t = now();
 
-    // Fresh — return cached
+    // Fresh — return cached. `cached: true` stops the response interceptor
+    // from re-storing the hit and extending its own TTL on every read.
     if (entry.expiresAt > t) {
       touchLRU(key);
       ctx.store.set(CACHE_HIT_KEY, true);
-      return { ...entry.response, request: ctx.request };
+      return { ...entry.response, request: ctx.request, cached: true };
     }
 
     // Stale-while-revalidate — return stale but allow pipeline to continue
     if (entry.staleUntil > t) {
       touchLRU(key);
-      ctx.store.set(CACHE_STALE_KEY, entry);
+      ctx.store.set(CACHE_STALE_KEY, { entry, key });
       // inject conditional headers for revalidation
       if (entry.etag) {
         ctx.request = {
@@ -1186,30 +1220,41 @@ export function createCacheInterceptor(config: Partial<CacheConfig> = {}): {
     return undefined;
   };
 
-  const responseInterceptor: ResponseInterceptorFn = (ctx) => {
-    if (!ctx.response) return;
+  const responseInterceptor: ResponseInterceptorFn = async (ctx) => {
+    if (!ctx.response || ctx.response.cached) return;
     if (!cfg.cacheMethods.includes(ctx.request.method.toUpperCase())) return;
 
-    const key = cacheKey(ctx.request);
+    const base = await cacheKey(ctx.request);
 
     // 304 Not Modified — restore body from stale entry
     if (ctx.response.status === 304) {
-      const stale = ctx.store.get(CACHE_STALE_KEY) as CacheEntry | undefined;
+      const stale = ctx.store.get(CACHE_STALE_KEY) as
+        { entry: CacheEntry; key: string } | undefined;
       if (stale) {
-        const { ttlMs, swrMs } = parseTtl(stale.response);
+        const { ttlMs, swrMs } = parseTtl(stale.entry.response);
         const t = now();
         const updated: CacheEntry = {
-          ...stale,
+          ...stale.entry,
           createdAt: t,
           expiresAt: t + ttlMs,
           staleUntil: t + ttlMs + swrMs,
         };
-        store.set(key, updated);
-        touchLRU(key);
-        ctx.response = { ...stale.response, request: ctx.request };
+        store.set(stale.key, updated);
+        touchLRU(stale.key);
+        ctx.response = { ...stale.entry.response, request: ctx.request, cached: true };
         return;
       }
     }
+
+    const varyHeader = ctx.response.headers["vary"] ?? ctx.response.headers["Vary"] ?? "";
+    const key = entryKey(base, varyHeader, ctx.request.headers);
+    if (!key) {
+      // `Vary: *` — remember that this URL is uncacheable and drop anything
+      // previously stored under the old variant.
+      varyByBase.set(base, "*");
+      return;
+    }
+    varyByBase.set(base, varyHeader);
 
     const { ttlMs, swrMs } = parseTtl(ctx.response);
     if (ttlMs <= 0) return;

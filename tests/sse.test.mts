@@ -159,6 +159,18 @@ await test("comment line ignored", async () => {
   assert.strictEqual(new SSEParser().feed(": c\ndata: x\n\n").length, 1);
 });
 
+await test("a leading BOM does not swallow the first event", async () => {
+  const direct = new SSEParser().feed("\uFEFFdata: first\n\n");
+  assert.strictEqual(direct.length, 1);
+  assert.strictEqual(direct[0].data, "first");
+
+  const split = new SSEParser();
+  assert.strictEqual(split.feed("\uFEFF").length, 0);
+  const events = split.feed("data: second\n\n");
+  assert.strictEqual(events.length, 1);
+  assert.strictEqual(events[0].data, "second");
+});
+
 await test("unknown field ignored", async () => {
   assert.strictEqual(new SSEParser().feed("foo: bar\ndata: x\n\n").length, 1);
 });

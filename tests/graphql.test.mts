@@ -1853,6 +1853,28 @@ await t("a repeated query reuses its APQ hash rather than growing the cache", as
   }
 });
 
+await t("per-call headers reach query and mutate", async () => {
+  const seen: Array<string | string[] | undefined> = [];
+  const srv = createServer((req, res) => {
+    seen.push(req.headers["x-per-call"]);
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"data":{"ok":true}}');
+    });
+  });
+  await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
+  const port = (srv.address() as AddressInfo).port;
+  const client = new GraphQLClient({ url: `http://127.0.0.1:${port}/graphql` });
+  try {
+    await client.query("{ a }", undefined, { headers: { "x-per-call": "query" } });
+    await client.mutate("mutation { b }", undefined, { headers: { "x-per-call": "mutate" } });
+    assert.deepEqual(seen, ["query", "mutate"], "both operations must send their own headers");
+  } finally {
+    srv.close();
+  }
+});
+
 console.log(
   `  GRAPHQL: ${passed}/${passed + failed} passed${failed > 0 ? `  (${failed} FAILED)` : ""}`,
 );
