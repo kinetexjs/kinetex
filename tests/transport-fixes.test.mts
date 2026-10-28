@@ -535,12 +535,18 @@ server.on("stream", (stream) => {
   stream.respond({ ":status": 200, "content-type": "text/plain" });
   stream.end("ok");
 });
+// The fixture must not be the thing that holds the loop open. On Node 22
+// close() leaves the accepted HTTP/2 session live, and a live server session
+// keeps the process alive even when the listener is unref'd. The assertion is
+// about the *client* session, so unref the server side as well.
+server.on("session", (session) => session.unref());
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const { port } = server.address();
 const client = kinetex({ ca: cert, allowPrivateNetwork: true, retry: { maxRetries: 0 }, timeout: 5000, httpVersion: "HTTP/2" });
 const res = await client.get("https://localhost:" + port + "/");
 console.log("got", res.status, res.httpVersion);
 server.close();
+server.unref();
 // Deliberately no client.destroy().
 `;
 
