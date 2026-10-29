@@ -2146,6 +2146,9 @@ await test("formatProgress formats ProgressSnapshot to string", async () => {
     eta: 5000,
     elapsed: 5000,
     done: false,
+    failed: false,
+    aborted: false,
+    error: null,
     bytesLoaded: 500_000,
   };
   const str = formatProgress(snap);

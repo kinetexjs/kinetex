@@ -381,6 +381,11 @@ export class CircuitBreaker {
     this._totalSuccesses++;
     this._consecutiveFails = 0;
 
+    // A sibling HALF_OPEN probe may have failed and reopened the circuit while
+    // this probe was still in flight. Its success must not be counted as a
+    // CLOSED-state result or close the circuit that the failure just opened.
+    if (this._state === "OPEN") return;
+
     if (this._state === "HALF_OPEN") {
       this._consecutiveSucc++;
       if (this._consecutiveSucc >= this.successThreshold) {
@@ -402,6 +407,13 @@ export class CircuitBreaker {
     this._totalFailures++;
     this._consecutiveSucc = 0;
     this._consecutiveFails++;
+
+    // A sibling HALF_OPEN probe settled after the first failure reopened the
+    // circuit. Count this failure, but do not transition (or fire onOpen) a
+    // second time: two failing probes are one opening, not two. Falling
+    // through to the CLOSED branch below was worse — with a threshold of 1 it
+    // pushed the failure into the window and fired onOpen a third time.
+    if (this._state === "OPEN") return;
 
     if (this._state === "HALF_OPEN") {
       // Single failure in HALF_OPEN re-opens immediately

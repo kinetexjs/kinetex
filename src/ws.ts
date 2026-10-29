@@ -80,10 +80,14 @@ export interface WSClientConfig {
   /** Subprotocols to negotiate during the handshake. */
   protocols?: string | string[];
   /**
-   * Headers to inject.
-   * On Deno/Bun/Node 22 these become real HTTP Upgrade request headers.
-   * On browsers the WS API does not allow custom headers; they are appended
-   * as URL query parameters instead.
+   * Headers to inject into the HTTP Upgrade request.
+   *
+   * Node.js 22+ (`undici`), Bun and runtimes that accept a `WebSocketInit`
+   * object send these as real handshake headers. Runtimes whose WebSocket
+   * exposes `setHeader` (Deno) use that instead. Browsers cannot set custom
+   * handshake headers, so they are appended as URL query parameters. A
+   * non-browser runtime that supports neither mechanism throws a WSError
+   * rather than silently dropping authentication headers.
    */
   headers?: Record<string, string>;
   /** Maximum reconnect attempts before giving up. 0 = unlimited. Default: 10 */
@@ -988,28 +992,72 @@ export class WSClient {
 
       // WebSocket is now built-in across all supported runtimes:
       // Browser, Deno, Bun, Node.js 22+, Cloudflare Workers, etc.
-      // Use global WebSocket constructor directly
-      let ws: WebSocket;
-      try {
-        ws = this._protocols ? new WebSocket(url, this._protocols) : new WebSocket(url);
-      } catch (err) {
-        clearConn();
-        this._state = "CLOSED";
-        reject(
-          new WSError("Failed to construct WebSocket", err instanceof Error ? err : undefined),
-        );
-        return;
+      // Use global WebSocket constructor directly.
+      const handshakeHeaders = this._headers && !isBrowser ? this._headers : undefined;
+      let ws: WebSocket | null = null;
+      let headersSentViaInit = false;
+
+      // Node.js 22+ (undici), Bun and workerd accept a WebSocketInit object as
+      // the second constructor argument even though the WHATWG signature only
+      // names subprotocols:
+      //
+      //   new WebSocket(url, { protocols, headers })
+      //
+      // This is the only way to put headers on the handshake in Node 22+:
+      // its global WebSocket has no `setHeader`, so the old code silently
+      // dropped every `Authorization` header. A runtime that rejects the
+      // object falls through to the standard constructor below.
+      if (handshakeHeaders) {
+        const init: { headers: Record<string, string>; protocols?: string | string[] } = {
+          headers: { ...handshakeHeaders },
+        };
+        if (this._protocols !== undefined) init.protocols = this._protocols;
+        try {
+          ws = new WebSocket(url, init as unknown as string | string[]);
+          headersSentViaInit = true;
+        } catch {
+          ws = null;
+        }
       }
 
-      // Native header injection (Deno/Bun/Node)
-      // Some runtimes (Deno) have setHeader method on WebSocket
-      if (this._headers && !isBrowser) {
-        // Type assertion for runtime-specific WebSocket extensions
+      if (!ws) {
+        try {
+          ws = this._protocols ? new WebSocket(url, this._protocols) : new WebSocket(url);
+        } catch (err) {
+          clearConn();
+          this._state = "CLOSED";
+          reject(
+            new WSError("Failed to construct WebSocket", err instanceof Error ? err : undefined),
+          );
+          return;
+        }
+      }
+
+      // Runtimes with a non-standard setHeader (Deno) take this path. If the
+      // init object was rejected and there is no setHeader either, headers
+      // cannot be sent at all — fail loudly instead of opening an
+      // unauthenticated connection.
+      if (handshakeHeaders && !headersSentViaInit) {
         const wsExt = ws as unknown as { setHeader?: (key: string, value: string) => void };
         if (typeof wsExt.setHeader === "function") {
-          for (const [k, v] of Object.entries(this._headers)) {
+          for (const [k, v] of Object.entries(handshakeHeaders)) {
             wsExt.setHeader(k, v);
           }
+        } else {
+          clearConn();
+          this._state = "CLOSED";
+          try {
+            ws.close();
+          } catch {
+            /* not open yet — close() may throw in CONNECTING */
+          }
+          reject(
+            new WSError(
+              "This runtime's WebSocket cannot send custom handshake headers — " +
+                "use a runtime with WebSocketInit headers (Node 22+, Bun) or Deno's setHeader",
+            ),
+          );
+          return;
         }
       }
 

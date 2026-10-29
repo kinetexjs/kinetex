@@ -714,6 +714,12 @@ export interface ProgressEvent {
   elapsed: number;
   /** Whether the transfer is complete. */
   done: boolean;
+  /** Whether the transfer ended in an error rather than completing. */
+  failed: boolean;
+  /** Whether the transfer was cancelled or aborted. */
+  aborted: boolean;
+  /** The error that ended the transfer, when one is known. */
+  error: Error | null;
 }
 
 /** Progress callback. */
