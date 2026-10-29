@@ -4388,9 +4388,9 @@ await test("NodeHTTP2Transport: two sequential requests reuse the same session",
 suite("HTTP/2 protocol verification");
 
 // Bun fetch() does not expose httpVersion on Response.
-// HTTP/2 is only reported when Alt-Svc headers provide evidence.
-// Servers with Alt-Svc (pokeapi.co) → HTTP/2.
-// Servers without Alt-Svc (the plain-HTTP fixture) → HTTP/1.1 (safe default).
+// Deno/Bun fetch() does not expose the protocol that actually carried the
+// response. Alt-Svc advertises what an origin *supports*, not what answered
+// this request, so it must not rewrite the reported version.
 
 await test("HTTPS to the local fixture defaults to HTTP/1.1 (no Alt-Svc)", async () => {
   const client = new Kinetex({
@@ -4425,15 +4425,18 @@ await test("HTTPS to the local fixture /uuid defaults to HTTP/1.1 (no Alt-Svc)",
   assert.ok(r.data.uuid.match(/^[0-9a-f-]{36}$/), "Should receive a valid UUID response");
 });
 
-// pokeapi.co advertises Alt-Svc: h2 which our detection picks up
-await test("an Alt-Svc h2 advertisement reports HTTP/2", async () => {
+await test("an Alt-Svc h2 advertisement still reports the protocol used", async () => {
   const client = new Kinetex({
     baseURL: HTTPBIN_LOCAL_ORIGIN,
     timeout: T,
     allowPrivateNetwork: true,
   });
   const r = await client.get<{ name: unknown }>("/alt-svc-h2");
-  assert.equal(r.httpVersion, "HTTP/2", "an Alt-Svc h2 advertisement must report HTTP/2");
+  assert.equal(
+    r.httpVersion,
+    "HTTP/1.1",
+    "Alt-Svc advertises a capability; it must not rewrite the protocol that answered",
+  );
   assert.equal(r.status, 200);
   assert.ok(r.data.name);
 });
