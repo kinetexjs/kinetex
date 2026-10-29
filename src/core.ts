@@ -192,6 +192,14 @@ export interface RawResponse {
   httpVersion: HTTPVersion;
   /** Whether the body has already been decompressed by the transport layer */
   alreadyDecompressed?: boolean;
+  /**
+   * The runtime object that produced this response.
+   *
+   * A fetch `Response` on the FetchTransport path, a `ClientHttp2Stream` for
+   * HTTP/2, or an `IncomingMessage` for the Node HTTP/1 transport. Absent on a
+   * cache hit or a synthesized response.
+   */
+  raw?: unknown;
 }
 
 // ============================================================================
@@ -532,6 +540,7 @@ export class FetchTransport implements Transport {
       redirected: response.redirected,
       httpVersion,
       alreadyDecompressed,
+      raw: response,
     };
   }
 }
@@ -1141,6 +1150,7 @@ export class NodeHTTP2Transport implements Transport {
             redirected,
             httpVersion: "HTTP/2",
             alreadyDecompressed: false,
+            raw: stream,
           });
         });
 
@@ -1349,6 +1359,7 @@ export class NodeHTTP2Transport implements Transport {
           redirected: false,
           httpVersion: "HTTP/1.1",
           alreadyDecompressed: false, // node:https does NOT auto-decompress
+          raw: httpRes,
         });
       });
 

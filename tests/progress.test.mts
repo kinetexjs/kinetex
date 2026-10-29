@@ -106,9 +106,12 @@ await test("update increments loaded and computes percent", async () => {
   const s = t.update(250);
   // The whole snapshot, not three of its eight fields.
   assertEqual(Object.keys(s).sort(), [
+    "aborted",
     "done",
     "elapsed",
+    "error",
     "eta",
+    "failed",
     "loaded",
     "percent",
     "rate",
@@ -514,6 +517,9 @@ await test("a zero rate is omitted rather than shown as 0 B/s", async () => {
     eta: null,
     elapsed: 0,
     done: false,
+    failed: false,
+    aborted: false,
+    error: null,
   });
   // No rate, no ETA (eta is null), and the percentage is still shown.
   assertEqual(fp, "0 B / 100 B (0.0%)");
@@ -546,16 +552,49 @@ await test("throttleProgress emits the first call and every done snapshot", asyn
   const fn = throttleProgress(() => {
     count++;
   }, 0.1); // very low Hz → 10s window
-  fn({ loaded: 100, total: 200, percent: 50, rate: 0, eta: null, elapsed: 100, done: false });
+  fn({
+    loaded: 100,
+    total: 200,
+    percent: 50,
+    rate: 0,
+    eta: null,
+    elapsed: 100,
+    done: false,
+    failed: false,
+    aborted: false,
+    error: null,
+  });
   // The first call is never throttled. It used to be: the baseline was 0 and
   // the gate is `now - last >= interval` against `performance.now()`, so for
   // the first 10 seconds of the process's life nothing was emitted at all.
   assertEqual(count, 1, "the first update is always delivered");
   // A second non-done call inside the window is dropped.
-  fn({ loaded: 150, total: 200, percent: 75, rate: 0, eta: null, elapsed: 150, done: false });
+  fn({
+    loaded: 150,
+    total: 200,
+    percent: 75,
+    rate: 0,
+    eta: null,
+    elapsed: 150,
+    done: false,
+    failed: false,
+    aborted: false,
+    error: null,
+  });
   assertEqual(count, 1, "a repeat inside the window is throttled");
   // done=true always fires, throttle or not.
-  fn({ loaded: 200, total: 200, percent: 100, rate: 0, eta: 0, elapsed: 200, done: true });
+  fn({
+    loaded: 200,
+    total: 200,
+    percent: 100,
+    rate: 0,
+    eta: 0,
+    elapsed: 200,
+    done: true,
+    failed: false,
+    aborted: false,
+    error: null,
+  });
   assertEqual(count, 2, "the final snapshot is never throttled");
 });
 
@@ -682,7 +721,7 @@ await test("with abort signal during stream", async () => {
   assert.equal((caught as Error).name, "AbortError");
 });
 
-await test("upload error marks tracker complete", async () => {
+await test("upload error marks tracker failed, not complete", async () => {
   // Create a source stream that errors on second chunk
   const errStream = new ReadableStream({
     async start(c) {
@@ -706,7 +745,15 @@ await test("upload error marks tracker complete", async () => {
     },
     "reading past a failed upload must reject",
   );
-  assertOk(tracker.isDone);
+  // A broken upload did not finish. The old code called complete() here,
+  // reporting done=true and (for a known total) percent=100.
+  assertEqual(tracker.isDone, false);
+  assertEqual(tracker.isFailed, true);
+  assertEqual(tracker.error?.message, "source failed");
+  const snap = tracker.snapshot();
+  assertEqual(snap.done, false);
+  assertEqual(snap.failed, true);
+  assertEqual(snap.aborted, false);
 });
 
 // ── withDownloadProgress ─────────────────────────────────────────────────
@@ -766,6 +813,45 @@ await test("abort during download triggers abort handler", async () => {
     },
     "an aborted download must reject rather than hang or resolve",
   );
+  assertEqual(tracker.isDone, false, "an aborted download is not complete");
+  assertEqual(tracker.isFailed, true);
+  assertEqual(tracker.isAborted, true);
+  assertEqual(tracker.snapshot().done, false);
+  assertEqual(tracker.snapshot().aborted, true);
+});
+
+await test("download error marks tracker failed, not complete", async () => {
+  const stream = new ReadableStream({
+    async start(c) {
+      c.enqueue(new Uint8Array([1, 2, 3]));
+      await delay(10);
+      c.error(new Error("body broke"));
+    },
+  });
+  const { response, tracker } = withDownloadProgress(
+    new Response(stream, { headers: { "content-length": "100" } }),
+  );
+  const reader = response.body!.getReader();
+  const first = await reader.read();
+  assertEqual(first.done, false);
+  await assert.rejects(() => reader.read(), /body broke/);
+  assertEqual(tracker.isDone, false, "a broken body did not finish");
+  assertEqual(tracker.isFailed, true);
+  assertEqual(tracker.snapshot().done, false);
+  assertEqual(tracker.snapshot().failed, true);
+  assertEqual(tracker.snapshot().percent, 3, "3 of 100 bytes, not 100%");
+  assertEqual(tracker.error?.message, "body broke");
+});
+
+await test("complete() does not overwrite a failure", async () => {
+  const t = new ProgressTracker(100);
+  t.update(10);
+  t.fail(new Error("network"));
+  const snap = t.complete();
+  assertEqual(snap.done, false);
+  assertEqual(snap.failed, true);
+  assertEqual(snap.percent, 10);
+  assertEqual(t.isDone, false);
 });
 
 await test("cancelling the wrapper cancels the source reader", async () => {
@@ -845,7 +931,7 @@ await test("a clean EOF completes the tracker and closes the stream", async () =
   assertEqual(tracker.snapshot().percent, 100);
 });
 
-await test("error during read is caught and tracker completes", async () => {
+await test("error during read is caught and tracker fails", async () => {
   // Stream that errors after first chunk
   const stream = new ReadableStream({
     async start(c) {
@@ -867,7 +953,11 @@ await test("error during read is caught and tracker completes", async () => {
     },
     "reading past a failed download must reject",
   );
-  assertOk(tracker.isDone);
+  // A read error is not a completed body: the tracker records the failure and
+  // leaves `done` false so listeners cannot mistake it for a 100% download.
+  assertEqual(tracker.isDone, false);
+  assertEqual(tracker.isFailed, true);
+  assertEqual(tracker.error?.message, "stream error");
 });
 
 // ── streamWithProgress ───────────────────────────────────────────────────
@@ -1180,13 +1270,25 @@ await test("regression: the first progress event is never throttled away", async
   const throttled = throttleProgress(() => {
     n++;
   }, 0.1);
-  throttled({ loaded: 1, total: null, percent: null, rate: 0, eta: null, elapsed: 0, done: false });
+  const mkSnap = (loaded: number, elapsed: number, done: boolean) => ({
+    loaded,
+    total: null,
+    percent: null,
+    rate: 0,
+    eta: null,
+    elapsed,
+    done,
+    failed: false,
+    aborted: false,
+    error: null,
+  });
+  throttled(mkSnap(1, 0, false));
   assertEqual(n, 1, "the standalone helper delivers its first call too");
-  throttled({ loaded: 2, total: null, percent: null, rate: 0, eta: null, elapsed: 1, done: false });
+  throttled(mkSnap(2, 1, false));
   assertEqual(n, 1, "and throttles the second");
-  throttled({ loaded: 3, total: null, percent: null, rate: 0, eta: null, elapsed: 2, done: true });
+  throttled(mkSnap(3, 2, true));
   assertEqual(n, 2, "while done always passes");
-  throttled({ loaded: 4, total: null, percent: null, rate: 0, eta: null, elapsed: 3, done: true });
+  throttled(mkSnap(4, 3, true));
   assertEqual(n, 3, "every time");
 
   // hz 0 means "no throttle" and must still deliver everything.
@@ -1203,6 +1305,9 @@ await test("regression: the first progress event is never throttled away", async
       eta: null,
       elapsed: 0,
       done: false,
+      failed: false,
+      aborted: false,
+      error: null,
     });
   }
   assertEqual(all, 5);

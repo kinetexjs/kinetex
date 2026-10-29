@@ -725,6 +725,57 @@ await test("onOpen fires again when HALF_OPEN probe fails (re-opens)", async () 
   assert.equal(count, 2);
 });
 
+await test("concurrent HALF_OPEN probes fire onOpen once, not once per probe", async () => {
+  // Two probes are allowed through the half-open window. When both fail, the
+  // first transition HALF_OPEN → OPEN; the second must only update counters.
+  // Previously the second failure fell through to the CLOSED branch and — with
+  // failureThreshold 1 — fired onOpen a third time for two openings.
+  let opens = 0;
+  let halfOpens = 0;
+  const cb = new CircuitBreaker("cb4-concurrent", {
+    windowSize: 5,
+    failureThreshold: 1,
+    resetTimeoutMs: 50,
+    halfOpenConcurrency: 2,
+    failures: { networkErrors: true },
+    onOpen: () => {
+      opens++;
+    },
+    onHalfOpen: () => {
+      halfOpens++;
+    },
+  });
+
+  await assert.rejects(() => cb.execute(() => Promise.reject(netErr())), isNetworkFailure);
+  assert.equal(opens, 1);
+  await new Promise((r) => setTimeout(r, 80));
+
+  let rejectA: (e: unknown) => void = () => {};
+  let rejectB: (e: unknown) => void = () => {};
+  const a = new Promise((_resolve, reject) => {
+    rejectA = reject;
+  });
+  const b = new Promise((_resolve, reject) => {
+    rejectB = reject;
+  });
+  const probeA = cb.execute(() => a);
+  const probeB = cb.execute(() => b);
+  const settledA = assert.rejects(() => probeA, isNetworkFailure);
+  const settledB = assert.rejects(() => probeB, isNetworkFailure);
+  // Both calls passed _checkTransition and took a probe slot.
+  assert.equal(halfOpens, 1);
+  assert.equal(cb.snapshot.inFlightProbes, 2);
+
+  rejectA(netErr());
+  await settledA;
+  assert.equal(opens, 2, "the first failing probe re-opens the circuit");
+  rejectB(netErr());
+  await settledB;
+  assert.equal(opens, 2, "the sibling failure must not fire onOpen again");
+  assert.equal(cb.state, "OPEN");
+  assert.equal(cb.snapshot.inFlightProbes, 0);
+});
+
 await test("onClose fires on reset() with a CLOSED snapshot", async () => {
   let fired = false;
   let seen: string | null = null;

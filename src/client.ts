@@ -971,8 +971,13 @@ function buildURL(
 
   let full: string;
 
-  if (/^https?:\/\//i.test(url)) {
+  if (/^(?:https?|wss?):\/\//i.test(url)) {
     // An absolute URL owns its path and query; baseURL is not involved.
+    // WebSocket schemes are absolute too: `client.ws()` widens the allowed
+    // scheme list, and treating `ws://host/path` as a relative path joined it
+    // onto the base URL (turning it into `https://base/ws://host/path`) so the
+    // origin check saw the base's own origin and let a mismatched endpoint
+    // through. Any scheme not in `allowedSchemes` is rejected by isSafeURL.
     full = url;
   } else if (base) {
     // Join the base and the relative request explicitly. Passing the whole
@@ -2285,8 +2290,12 @@ export class Kinetex {
 
     const client = new WSClient({
       url: fullURL,
-      headers: { ...authHeaders, ...(headers as Record<string, string>) },
+      // `...mergedOptions` first: it still carries `options.headers`, and
+      // spreading it last overwrote the merged client-level + per-call
+      // headers computed above. `client.ws()` therefore dropped every
+      // client-level header, including the ones it exists to inherit.
       ...mergedOptions,
+      headers: { ...authHeaders, ...(headers as Record<string, string>) },
       onClose: trackingOnClose,
     });
 
@@ -3847,6 +3856,10 @@ export class Kinetex {
                 controller.enqueue(value);
               }
             } catch (e) {
+              // A failed body read is not a completed download. Mark the
+              // tracker failed so onDownloadProgress listeners do not receive
+              // a final done/100% event for a transfer that never finished.
+              dlTracker.fail(e, attemptSignal?.aborted === true);
               controller.error(e);
             } finally {
               reader.releaseLock();
@@ -3856,6 +3869,7 @@ export class Kinetex {
             // Forward cancellation to the real source and swallow its failure:
             // a rejection here is never observed by the cancelling reader.
             void source.cancel(reason).catch(() => {});
+            dlTracker.fail(new DOMException("Download cancelled", "AbortError"), true);
           },
         });
       }
@@ -3920,6 +3934,9 @@ export class Kinetex {
       durationMs,
       request: req,
       attempt,
+      // The transport's own object (fetch Response, IncomingMessage, …).
+      // Absent for cache/synthetic responses, which have no runtime object.
+      ...(raw.raw !== undefined ? { raw: raw.raw } : {}),
     };
 
     // Apply transformResponse now that the response object exists, so the hook
@@ -4218,7 +4235,9 @@ export class Kinetex {
       durationMs: perfNow() - startMs,
       request: req,
       attempt,
-      raw: synthetic.raw,
+      // A synthesized response has no runtime object. Keep the property
+      // absent rather than present-and-undefined, matching the field's docs.
+      ...(synthetic.raw !== undefined ? { raw: synthetic.raw } : {}),
     };
 
     ctx.response = res as unknown as InterceptorResponse;
@@ -4298,6 +4317,7 @@ export class Kinetex {
     const wasRedirected = "redirected" in raw ? (raw as RawResponse).redirected : false;
     const responseHTTPVersion =
       "httpVersion" in raw ? (raw as RawResponse).httpVersion : "HTTP/1.1";
+    const rawTransport = "raw" in raw ? (raw as RawResponse).raw : undefined;
 
     return {
       status: raw.status,
@@ -4314,6 +4334,10 @@ export class Kinetex {
       durationMs,
       request: req,
       attempt,
+      // Cache entries and synthesized responses have no runtime object. The
+      // conditional spread keeps `raw` absent rather than present-and-undefined,
+      // which is what the field's optional type promises.
+      ...(rawTransport !== undefined ? { raw: rawTransport } : {}),
     };
   }
 
