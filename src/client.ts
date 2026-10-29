@@ -36,6 +36,7 @@ import type {
   HeadersInit,
   QueryParams,
   QueryValue,
+  QueryArrayFormat,
   BodyInit,
   RequestInterceptor,
   ResponseInterceptor,
@@ -72,7 +73,12 @@ import {
 } from "./interceptors.ts";
 import { SigV4Signer } from "./aws-sigv4.ts";
 import { createDigestAuthorizer } from "./digest.ts";
-import { generateIdempotencyKey, isValidIdempotencyKey, parseRetryAfter } from "./headers.ts";
+import {
+  HttpHeaders,
+  generateIdempotencyKey,
+  isValidIdempotencyKey,
+  parseRetryAfter,
+} from "./headers.ts";
 
 import { DEFAULT_ACCEPT_ENCODING, encodeMultipart, normalizeHTTPVersion } from "./core.ts";
 import {
@@ -892,8 +898,20 @@ function buildURL(
   allowedSchemes: string[] = ["http", "https"],
   allowPrivateNetwork = false,
   paramsSerializer?: ParamsSerializer,
+  arrayFormat: QueryArrayFormat = "bracket",
 ): string {
   const MAX_QUERY_PARAM_COUNT = 100;
+
+  if (arrayFormat !== "bracket" && arrayFormat !== "repeat") {
+    throw new KinetexError(
+      `Invalid arrayFormat "${String(arrayFormat)}" — expected "bracket" or "repeat"`,
+      "EVALIDATION",
+    );
+  }
+
+  /** Encode one array key according to the configured format. */
+  const arrayKey = (key: string): string =>
+    arrayFormat === "bracket" && !key.endsWith("[]") ? `${key}[]` : key;
 
   /**
    * Walk query params once, enforcing the count limit, handing each surviving
@@ -905,11 +923,9 @@ function buildURL(
    * inside two loops — so the two paths could drift and the cap could end up
    * enforced in one spelling of the query but not the other.
    *
-   * Encoding stays with the caller, and so does the array/scalar distinction:
-   * the primary path must `append` array elements (so `?a=1&a=2` survives) but
-   * `set` a scalar (so it replaces a value the URL already carried). The
-   * fallback appends to a list it is building and does not care. That
-   * difference is observable, so `emit` is told which case it is in.
+   * Every pair is appended, never set: axios keeps a value the URL already
+   * carries (`?x=old&x=new`), and replacing it silently changed the request.
+   * Objects are rejected here rather than stringified to `[object Object]`.
    */
   const forEachQueryParam = (
     params: Record<string, unknown>,
@@ -925,17 +941,29 @@ function buildURL(
         );
       }
     };
+    const scalar = (key: string, value: unknown): string => {
+      if (
+        value !== null &&
+        (typeof value === "object" || typeof value === "function" || typeof value === "symbol")
+      ) {
+        throw new KinetexError(
+          `Query parameter "${key}" must be a scalar or an array of scalars — nested objects are not supported`,
+          "EVALIDATION",
+        );
+      }
+      return String(value);
+    };
     for (const [key, value] of Object.entries(params)) {
       if (value === null || value === undefined) continue;
       if (Array.isArray(value)) {
         for (const v of value) {
           if (v === null || v === undefined) continue;
           count();
-          emit(key, String(v), true);
+          emit(key, scalar(key, v), true);
         }
       } else {
         count();
-        emit(key, String(value), false);
+        emit(key, scalar(key, value), false);
       }
     }
   };
@@ -944,25 +972,53 @@ function buildURL(
   let full: string;
 
   if (/^https?:\/\//i.test(url)) {
+    // An absolute URL owns its path and query; baseURL is not involved.
     full = url;
+  } else if (base) {
+    // Join the base and the relative request explicitly. Passing the whole
+    // base to `new URL(relative, base)` treated the query as part of the
+    // directory and dropped both its query and its path (`/v1?key=abc` +
+    // `users` became `/users`). Parse the base, resolve the request path
+    // against the base *path*, then merge both query strings.
+    const baseUrl = new URL(base);
+    if (url.startsWith("//")) {
+      // A protocol-relative request names its own host; only the scheme is
+      // inherited. It must not carry the base path or query with it.
+      full = new URL(url, `${baseUrl.protocol}//${baseUrl.host}`).href;
+    } else {
+      // Leading slashes are stripped before resolution so `/users` joins
+      // under `/v1` (axios' combineURLs behaviour) instead of resetting to
+      // the origin root.
+      const basePath = baseUrl.pathname;
+      const dummy = new URL("http://kinetex.invalid");
+      dummy.pathname = basePath.endsWith("/") ? basePath : `${basePath}/`;
+      const relative = url.replace(/^\/+/, "");
+      const resolved = new URL(relative.length > 0 ? relative : ".", dummy.href);
+
+      // A request that only carries a query/fragment (`?x=1`, `#top`) must
+      // keep the base pathname rather than append the dummy directory slash.
+      const rawPath = url.match(/^[^?#]*/)?.[0] ?? "";
+      if (rawPath.length === 0) resolved.pathname = basePath;
+
+      const baseSearch = [...baseUrl.searchParams];
+      baseUrl.pathname = resolved.pathname;
+      // A fragment on the base is never sent; a fragment on the request is
+      // retained so callers can still inspect the fully-resolved URL.
+      baseUrl.hash = resolved.hash;
+      baseUrl.search = "";
+      for (const [key, value] of baseSearch) baseUrl.searchParams.append(key, value);
+      for (const [key, value] of resolved.searchParams) {
+        baseUrl.searchParams.append(key, value);
+      }
+      full = baseUrl.href;
+    }
   } else {
-    const b = base ?? "";
-    // Use URL for proper path resolution to handle edge cases
+    // With no base the request has to be absolute (or a path the runtime
+    // accepts); keep the historical fallback for that case.
     try {
-      // FIX 3: Ensure relative paths (without leading /) don't get concatenated
-      // directly onto the base, producing e.g. ".../v1users" instead of ".../v1/users".
-      // Strategy: strip trailing slash from base, prefix url with "/" when needed,
-      // then let the URL constructor resolve correctly.
-      const bClean = b.replace(/\/$/, "");
-      const p = url.startsWith("/") ? url.slice(1) : url;
-      full = new URL(p, bClean + "/").href;
-      // Remove trailing slash we added to base only if original url had none
-      // (URL constructor is the source of truth — result is always correct)
+      full = new URL(url).href;
     } catch {
-      // Fallback: simple concatenation — ensure exactly one slash between base and path
-      const bClean = b.endsWith("/") ? b : b + "/";
-      const p = url.startsWith("/") ? url.slice(1) : url;
-      full = bClean + p;
+      full = url.startsWith("/") ? url : `/${url}`;
     }
   }
 
@@ -1042,11 +1098,10 @@ function buildURL(
         "EVALIDATION",
       );
     }
-    // An array element appends, so `?a=1&a=2` survives; a scalar sets, so it
-    // replaces a value the URL already carried under that name.
+    // Every value appends, so a key the URL already carries is preserved
+    // (`?x=old&x=new`) and arrays follow the configured bracket/repeat form.
     forEachQueryParam(params, (key, value, fromArray) => {
-      if (fromArray) u.searchParams.append(key, value);
-      else u.searchParams.set(key, value);
+      u.searchParams.append(fromArray ? arrayKey(key) : key, value);
     });
     const result = u.toString();
 
@@ -1076,8 +1131,9 @@ function buildURL(
       full += "?";
     }
     const paramParts: string[] = [];
-    forEachQueryParam(params ?? {}, (key, value) => {
-      paramParts.push(`${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
+    forEachQueryParam(params ?? {}, (key, value, fromArray) => {
+      const name = fromArray ? arrayKey(key) : key;
+      paramParts.push(`${encodeURIComponent(name)}=${encodeURIComponent(value)}`);
     });
     const result = full + paramParts.join("&");
 
@@ -1108,44 +1164,92 @@ function buildURL(
 
 /**
  * Merge multiple header sources into a single normalized record.
- * Validates header names and values per RFC 7230.
+ *
+ * Accepts plain objects, WHATWG `Headers`, kinetex's own `HttpHeaders`, and
+ * arrays of `[name, value]` pairs. Unknown shapes are rejected instead of
+ * being stringified into numeric keys or silently becoming `{}`.
+ *
  * @param sources - Header sources to merge (later sources override earlier).
  * @returns Merged headers with lowercase keys.
- * @throws {KinetexError} EVALIDATION — if any header name or value is invalid.
+ * @throws {KinetexError} EVALIDATION — if a source, name, or value is invalid.
  */
 function mergeHeaders(
-  ...sources: (HeadersInit | Record<string, string> | undefined)[]
+  ...sources: (HeadersInit | HttpHeaders | undefined)[]
 ): Record<string, string> {
   const out = Object.create(null) as Record<string, string>;
+
+  /** Convert one authority's header bags into lowercased entries. */
+  const readSource = (source: HeadersInit | HttpHeaders): Iterable<[unknown, unknown]> => {
+    if (typeof Headers !== "undefined" && source instanceof Headers) {
+      return source.entries();
+    }
+    if (
+      source instanceof HttpHeaders ||
+      (typeof source === "object" &&
+        source !== null &&
+        (source as { [Symbol.toStringTag]?: unknown })[Symbol.toStringTag] === "HttpHeaders")
+    ) {
+      return (source as HttpHeaders).entries();
+    }
+    if (Array.isArray(source)) {
+      for (const pair of source) {
+        if (!Array.isArray(pair) || pair.length !== 2) {
+          throw new KinetexError("Header array entries must be [name, value] pairs", "EVALIDATION");
+        }
+      }
+      return source as Iterable<[unknown, unknown]>;
+    }
+    if (typeof source === "object" && source !== null) {
+      // Only a plain record is a header bag. A Map, Set or class instance
+      // would have been enumerated as `{}` by the old Object.keys() loop.
+      const proto = Object.getPrototypeOf(source);
+      if (proto !== Object.prototype && proto !== null) {
+        throw new KinetexError(
+          `Unsupported headers value (${Object.prototype.toString.call(source)}) — pass a plain object, Headers, or [name, value] pairs`,
+          "EVALIDATION",
+        );
+      }
+      return Object.entries(source);
+    }
+    throw new KinetexError(
+      `Unsupported headers value (${typeof source}) — pass a plain object, Headers, or [name, value] pairs`,
+      "EVALIDATION",
+    );
+  };
+
   for (const source of sources) {
     if (!source) continue;
-    // FIX 17: use Object.keys() — enumerates only own *enumerable* properties,
-    // which is what we want. getOwnPropertyNames would also yield non-enumerable
-    // properties (e.g. array's "length"), even though the type check below would
-    // filter "length" out — the intent is clearer with Object.keys().
-    const keys = Object.keys(source);
-    for (const k of keys) {
-      // Skip dangerous property names even with Object.create(null)
-      if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
-      // Validate header name (RFC 7230) — prevents header injection via malformed names
-      if (!isValidHeaderName(k)) {
+    const local = new Map<string, string[]>();
+    for (const [rawName, rawValue] of readSource(source)) {
+      const name = String(rawName);
+      // Skip dangerous property names even with Object.create(null).
+      if (name === "__proto__" || name === "constructor" || name === "prototype") continue;
+      // Validate header name (RFC 7230) — prevents header injection via malformed names.
+      if (!isValidHeaderName(name)) {
         throw new KinetexError(
-          `Invalid header name: "${k}" — contains forbidden characters`,
+          `Invalid header name: "${name}" — contains forbidden characters`,
           "EVALIDATION",
         );
       }
-      // Convert non-string values to strings
-      const v = (source as Record<string, unknown>)[k];
-      if (v === undefined || v === null) continue;
-      const value = Array.isArray(v) ? v.map(String).join(", ") : String(v);
-      if (!isValidHeaderValue(value)) {
-        throw new KinetexError(
-          `Invalid header value for ${k}: contains forbidden characters`,
-          "EVALIDATION",
-        );
+      if (rawValue === undefined || rawValue === null) continue;
+      const values = Array.isArray(rawValue) ? rawValue : [rawValue];
+      const lower = name.toLowerCase();
+      const existing = local.get(lower) ?? [];
+      for (const value of values) {
+        const text = String(value);
+        if (!isValidHeaderValue(text)) {
+          throw new KinetexError(
+            `Invalid header value for ${name}: contains forbidden characters`,
+            "EVALIDATION",
+          );
+        }
+        existing.push(text);
       }
-      out[k.toLowerCase()] = value;
+      local.set(lower, existing);
     }
+    // A later source replaces the same header from an earlier source, while
+    // duplicate pairs/arrays within one source are combined once.
+    for (const [name, values] of local) out[name] = values.join(", ");
   }
   return out;
 }
@@ -2067,6 +2171,8 @@ export class Kinetex {
       this.cfg.params,
       ["http", "https", "ws", "wss"],
       this.cfg.allowPrivateNetwork,
+      this.cfg.paramsSerializer,
+      this.cfg.arrayFormat,
     );
     const headers = mergeHeaders(this.cfg.headers, options.headers as Record<string, string>);
 
@@ -2274,6 +2380,7 @@ export class Kinetex {
       undefined,
       this.cfg.allowPrivateNetwork === true,
       options.paramsSerializer ?? this.cfg.paramsSerializer,
+      options.arrayFormat ?? this.cfg.arrayFormat,
     );
 
     // URL userinfo (`https://user:pass@host/`) is Basic auth, as it is in
@@ -3162,14 +3269,19 @@ export class Kinetex {
           });
         }
 
-        // RFC 7231 §6.4: 301/302/303 → GET + drop body
-        //                 307/308    → keep original method + body
-        const nextMethod: HTTPMethod =
-          raw.status === 301 || raw.status === 302 || raw.status === 303
-            ? "GET"
-            : currentReq.method;
+        // RFC 9110 §15.4, and the behaviour axios inherits from
+        // follow-redirects:
+        //   301/302 + POST → GET + drop the body
+        //   303 + non-GET/HEAD → GET + drop the body
+        //   301/302/303 + HEAD → stay HEAD (a HEAD must never become a GET)
+        //   307/308 → keep the method and the body
+        //   everything else keeps its method and body.
+        const methodBecomesGet =
+          ((raw.status === 301 || raw.status === 302) && currentReq.method === "POST") ||
+          (raw.status === 303 && currentReq.method !== "GET" && currentReq.method !== "HEAD");
+        const nextMethod: HTTPMethod = methodBecomesGet ? "GET" : currentReq.method;
         const nextBody: BodyInit | null =
-          nextMethod === "GET" || nextMethod === "HEAD" ? null : currentReq.body;
+          methodBecomesGet || nextMethod === "HEAD" ? null : currentReq.body;
 
         // A 307/308 keeps the method and the body, so the hop needs the body
         // again — and a stream or Blob body is spent: the first attempt consumed
@@ -3241,6 +3353,19 @@ export class Kinetex {
           // No jar: drop the caller's cookie header with the other credentials
           // (mirrors what fetch() does for a cross-origin redirect).
           delete nextHeaders["cookie"];
+        }
+
+        // When the redirect changes the method to GET the body is gone, so
+        // entity headers that described it must go too. Keeping
+        // `content-type: text/plain` on the follow-up GET made servers parse an
+        // empty body as a form/text payload.
+        if (methodBecomesGet) {
+          for (const name of Object.keys(nextHeaders)) {
+            const lower = name.toLowerCase();
+            if (lower.startsWith("content-") || lower === "transfer-encoding") {
+              delete nextHeaders[name];
+            }
+          }
         }
 
         currentReq = {
@@ -4385,6 +4510,7 @@ export class Kinetex {
       undefined,
       this.cfg.allowPrivateNetwork,
       this.cfg.paramsSerializer,
+      this.cfg.arrayFormat,
     );
 
     // Route through the full kinetex pipeline (auth, interceptors, rate-limit, CB, etc.)
@@ -4445,6 +4571,7 @@ export class Kinetex {
       undefined,
       this.cfg.allowPrivateNetwork,
       this.cfg.paramsSerializer,
+      this.cfg.arrayFormat,
     );
 
     // Route through the full kinetex pipeline (auth, interceptors, rate-limit, CB, OTel, etc.)
@@ -4503,6 +4630,7 @@ export class Kinetex {
       undefined,
       this.cfg.allowPrivateNetwork,
       this.cfg.paramsSerializer,
+      this.cfg.arrayFormat,
     );
 
     // Route through the full kinetex pipeline
@@ -4672,12 +4800,9 @@ export class FluentRequest {
     return this;
   }
 
-  /** Merge a headers map. */
+  /** Merge a headers map, `Headers` instance, or `[name, value]` pairs. */
   headers(headers: HeadersInit): this {
-    this._options.headers = {
-      ...(this._options.headers as Record<string, string>),
-      ...(headers as Record<string, string>),
-    };
+    this._options.headers = mergeHeaders(this._options.headers, headers);
     return this;
   }
 

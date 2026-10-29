@@ -70,14 +70,27 @@ export function toRequestId(id: string): RequestId {
   return id as RequestId;
 }
 
-/** A plain record of header name → value(s). */
-export type HeadersInit = Record<string, string | string[]>;
+/**
+ * A header source: a plain record, a WHATWG `Headers` instance, or an array of
+ * `[name, value]` pairs. The last two forms are accepted because callers often
+ * forward a `Headers` object or a serialised pair list straight from `fetch`.
+ */
+export type HeadersInit =
+  Record<string, string | string[] | number | boolean | null | undefined> | Headers | string[][];
 
 /** Serializable query parameter value types. */
 export type QueryValue = string | number | boolean | null | undefined;
 
 /** Query parameter map — supports arrays for repeated keys. */
 export type QueryParams = Record<string, QueryValue | QueryValue[]>;
+
+/**
+ * How array query parameters are encoded.
+ *
+ * - `"bracket"` (default) — `a[]=1&a[]=2`, matching axios' default serializer.
+ * - `"repeat"` — `a=1&a=2`, the historical kinetex spelling.
+ */
+export type QueryArrayFormat = "bracket" | "repeat";
 
 /**
  * Query serializer used by axios-style request configs.
@@ -1036,6 +1049,14 @@ export interface KinetexConfig {
   paramsSerializer?: ParamsSerializer;
 
   /**
+   * How array query parameters are encoded. Default: `"bracket"`.
+   *
+   * `"bracket"` matches axios (`a[]=1&a[]=2`); `"repeat"` preserves the older
+   * kinetex spelling (`a=1&a=2`).
+   */
+  arrayFormat?: QueryArrayFormat;
+
+  /**
    * Disable transparent `content-encoding` decompression.
    *
    * Node transports honour this; a custom `fetch` transport may have decoded
@@ -1416,6 +1437,8 @@ export interface SendOptions<T = unknown> {
   validateStatus?: ((status: number) => boolean) | null;
   /** Axios-compatible query-string serializer. */
   paramsSerializer?: ParamsSerializer;
+  /** Override how array query parameters are encoded for this request. */
+  arrayFormat?: QueryArrayFormat;
   /** Decode responseType explicitly instead of relying on content-type. */
   responseType?: ResponseType;
   /** Disable transparent content-encoding decompression. */

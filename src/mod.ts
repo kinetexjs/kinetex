@@ -277,6 +277,7 @@ export type {
   HeadersInit,
   QueryParams,
   QueryValue,
+  QueryArrayFormat,
   BodyInit,
   Runtime,
   KinetexRequest,

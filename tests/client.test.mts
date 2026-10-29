@@ -1195,14 +1195,14 @@ await test("per-request params merged with config params", async () => {
   assert.equal(data.args["extra"], "extra-value");
 });
 
-await test("array params sent as repeated keys", async () => {
-  const data = await bin
-    .GET("/get")
-    .params({ tag: ["a", "b", "c"] })
-    .json<{ args: Record<string, string> }>();
-  console.log(`    → array params: ${JSON.stringify(data.args)}`);
+await test("array params sent as repeated keys with arrayFormat repeat", async () => {
+  const data = await bin.get<{ args: Record<string, string> }>("/get", {
+    params: { tag: ["a", "b", "c"] },
+    arrayFormat: "repeat",
+  });
+  console.log(`    → array params: ${JSON.stringify(data.data.args)}`);
   // httpbin echoes repeated keys as an array
-  assert.deepEqual(data.args["tag"] as unknown, ["a", "b", "c"]);
+  assert.deepEqual(data.data.args["tag"] as unknown, ["a", "b", "c"]);
 });
 
 // ============================================================================
