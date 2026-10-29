@@ -80,6 +80,30 @@ export type QueryValue = string | number | boolean | null | undefined;
 export type QueryParams = Record<string, QueryValue | QueryValue[]>;
 
 /**
+ * Query serializer used by axios-style request configs.
+ *
+ * A function receives the merged query parameters and returns the encoded
+ * query string (with or without a leading `?`). The object form matches the
+ * shape axios 1.x accepts.
+ */
+export type ParamsSerializer =
+  | ((params: QueryParams) => string)
+  | {
+      /** Encode the parameters into a query string. */
+      serialize: (params: QueryParams) => string;
+    };
+
+/**
+ * Controls how the response body is decoded.
+ *
+ * Mirrors axios `responseType`. `arraybuffer` returns a `Uint8Array` (which is
+ * also what Node callers get from axios' Buffer-backed response), `blob`
+ * returns a `Blob`, and `stream` returns a Node `Readable` on Node or a
+ * `ReadableStream` elsewhere.
+ */
+export type ResponseType = "json" | "text" | "arraybuffer" | "blob" | "stream";
+
+/**
  * Request body types accepted by kinetex.
  * Compatible with the Fetch API's BodyInit.
  *
@@ -988,6 +1012,37 @@ export interface KinetexConfig {
   /** Maximum request body size in bytes. 0 = no limit. Default: 0 */
   maxRequestSize?: number;
 
+  /** Axios-compatible alias for {@link maxResponseSize}. */
+  maxContentLength?: number;
+
+  /** Axios-compatible alias for {@link maxRequestSize}. */
+  maxBodyLength?: number;
+
+  /**
+   * Default response decoding for every request.
+   *
+   * When omitted, kinetex's content-type-driven parser is used.
+   */
+  responseType?: ResponseType;
+
+  /**
+   * Decide whether an HTTP status is successful. Returning `false` throws
+   * {@link HTTPStatusError}; `null` accepts every status. When omitted,
+   * {@link throwOnError} controls 4xx/5xx responses.
+   */
+  validateStatus?: ((status: number) => boolean) | null;
+
+  /** Default custom query-string serializer. */
+  paramsSerializer?: ParamsSerializer;
+
+  /**
+   * Disable transparent `content-encoding` decompression.
+   *
+   * Node transports honour this; a custom `fetch` transport may have decoded
+   * the body before kinetex sees it and cannot be reversed.
+   */
+  decompress?: boolean;
+
   /** Follow redirects. Default: true */
   followRedirects?: boolean;
 
@@ -1323,6 +1378,13 @@ export interface SendOptions<T = unknown> {
   params?: QueryParams;
   /** Request body. */
   body?: RequestBody;
+  /**
+   * Axios-compatible alias for {@link body}.
+   *
+   * Supplying both `body` and `data` is rejected rather than silently choosing
+   * one.
+   */
+  data?: RequestBody;
   /** Override timeout in ms. */
   timeout?: number;
   /** Override the whole-request ceiling for this request. 0 disables it. */
@@ -1335,14 +1397,34 @@ export interface SendOptions<T = unknown> {
   proxy?: ProxyConfig | false;
   /** Maximum request body size in bytes. 0 = no limit. */
   maxRequestSize?: number;
+  /** Axios-compatible alias for {@link maxRequestSize}. */
+  maxBodyLength?: number;
   /** AbortSignal. */
   signal?: AbortSignal;
   /** Per-request cache config. */
   cache?: CacheRequestConfig | false;
   /** Response size limit in bytes. */
   maxResponseSize?: number;
+  /** Axios-compatible alias for {@link maxResponseSize}. */
+  maxContentLength?: number;
   /** Whether to throw on HTTP 4xx/5xx. */
   throwOnError?: boolean;
+  /**
+   * Axios-compatible status validator. Returning `false` throws
+   * {@link HTTPStatusError}; `null` accepts every status.
+   */
+  validateStatus?: ((status: number) => boolean) | null;
+  /** Axios-compatible query-string serializer. */
+  paramsSerializer?: ParamsSerializer;
+  /** Decode responseType explicitly instead of relying on content-type. */
+  responseType?: ResponseType;
+  /** Disable transparent content-encoding decompression. */
+  decompress?: boolean;
+  /**
+   * Per-request response transform, applied after parsing and before response
+   * interceptors. Runs after the client-level `transformResponse`.
+   */
+  transformResponse?: (data: unknown, response: KinetexResponse<unknown>) => unknown;
   /** Whether to follow redirects. */
   followRedirects?: boolean;
   /** Max redirects. */
@@ -1404,6 +1486,30 @@ export interface SendOptions<T = unknown> {
   /** Arbitrary metadata attached to the request. */
   meta?: Record<string, unknown>;
 }
+
+/**
+ * Axios-style request configuration accepted by `client.request(config)`.
+ *
+ * All {@link SendOptions} fields are accepted, plus `url`, `method` and the
+ * axios spellings for the body and response options.
+ */
+export interface RequestConfig<T = unknown> extends SendOptions<T> {
+  /** Absolute URL, or a path resolved against `baseURL`. */
+  url?: string;
+  /** HTTP method. Case-insensitive; defaults to `GET`. */
+  method?: HTTPMethod | string;
+  /**
+   * Node HTTP agents are not supported because kinetex pools its own
+   * connections. Passing one fails with `EVALIDATION` instead of silently
+   * ignoring it; use the client's `proxy`/`dispatcher` options instead.
+   */
+  httpAgent?: unknown;
+  /** See {@link RequestConfig.httpAgent}. */
+  httpsAgent?: unknown;
+}
+
+/** Alias that makes axios migrations read naturally. */
+export type AxiosRequestConfig<T = unknown> = RequestConfig<T>;
 
 // ============================================================================
 // §15  HAR

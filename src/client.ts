@@ -21,6 +21,9 @@ import type {
   KinetexRequest,
   KinetexResponse,
   SendOptions,
+  RequestConfig,
+  ParamsSerializer,
+  ResponseType,
   HTTPMethod,
   AuthConfig,
   ProxyConfig,
@@ -59,6 +62,7 @@ import {
   perfNow,
   isSensitiveHeader,
   mergeSignals,
+  safeJSONParse,
 } from "./utils.ts";
 import { CREDENTIAL_HEADERS } from "./cache.ts";
 import {
@@ -887,6 +891,7 @@ function buildURL(
   params: QueryParams | undefined,
   allowedSchemes: string[] = ["http", "https"],
   allowPrivateNetwork = false,
+  paramsSerializer?: ParamsSerializer,
 ): string {
   const MAX_QUERY_PARAM_COUNT = 100;
 
@@ -962,6 +967,62 @@ function buildURL(
   }
 
   if (!params || Object.keys(params).length === 0) {
+    if (!isSafeURL(full, allowedSchemes, { allowPrivateNetwork })) {
+      throw new KinetexError(
+        `URL "${redactUserInfo(full)}" failed safety check — blocked private/loopback address or forbidden scheme`,
+        "EVALIDATION",
+      );
+    }
+    return full;
+  }
+
+  if (paramsSerializer) {
+    if (!isSafeURL(full, allowedSchemes, { allowPrivateNetwork })) {
+      throw new KinetexError(
+        `URL "${redactUserInfo(full)}" failed safety check — blocked private/loopback address or forbidden scheme`,
+        "EVALIDATION",
+      );
+    }
+    const serialize =
+      typeof paramsSerializer === "function" ? paramsSerializer : paramsSerializer.serialize;
+    if (typeof serialize !== "function") {
+      throw new KinetexError(
+        "paramsSerializer must be a function or an object with a serialize() method",
+        "EVALIDATION",
+      );
+    }
+    let serialized: unknown;
+    try {
+      serialized = serialize(params);
+    } catch (err) {
+      throw new KinetexError(
+        `paramsSerializer failed: ${err instanceof Error ? err.message : String(err)}`,
+        "EVALIDATION",
+        { cause: err },
+      );
+    }
+    if (typeof serialized !== "string") {
+      throw new KinetexError("paramsSerializer must return a string", "EVALIDATION");
+    }
+    // Accept the common leading `?`/`&` spellings without doubling separators.
+    const query = serialized.replace(/^[?&]/, "");
+    if (query.length > 0) {
+      const hashIndex = full.indexOf("#");
+      const beforeHash = hashIndex === -1 ? full : full.slice(0, hashIndex);
+      const hash = hashIndex === -1 ? "" : full.slice(hashIndex);
+      const separator = beforeHash.includes("?")
+        ? beforeHash.endsWith("?") || beforeHash.endsWith("&")
+          ? ""
+          : "&"
+        : "?";
+      full = beforeHash + separator + query + hash;
+    }
+    if (full.length > MAX_URL_LENGTH) {
+      throw new KinetexError(
+        `URL length ${full.length} bytes exceeds limit of ${MAX_URL_LENGTH} bytes`,
+        "EVALIDATION",
+      );
+    }
     if (!isSafeURL(full, allowedSchemes, { allowPrivateNetwork })) {
       throw new KinetexError(
         `URL "${redactUserInfo(full)}" failed safety check — blocked private/loopback address or forbidden scheme`,
@@ -1087,6 +1148,82 @@ function mergeHeaders(
     }
   }
   return out;
+}
+
+/**
+ * Decode a response body according to an explicit axios-style `responseType`.
+ *
+ * Without a `responseType`, the content-type-driven parser is used. A custom
+ * `parseResponse` always wins because it is the most specific instruction the
+ * caller gave.
+ */
+async function parseResponseWithType<T>(
+  rawBody: Uint8Array,
+  contentType: string | null,
+  responseType: ResponseType | undefined,
+  customParser:
+    ((raw: Uint8Array, headers: Record<string, string>, url: string) => T | Promise<T>) | undefined,
+  onParseFailure: ((raw: Uint8Array, error: Error) => void) | undefined,
+  headers: Record<string, string>,
+  url: string,
+): Promise<T> {
+  if (customParser) return await customParser(rawBody, headers, url);
+  if (responseType === undefined) {
+    return (await parseBody<T>(rawBody, contentType, undefined, onParseFailure, headers, url)) as T;
+  }
+
+  switch (responseType) {
+    case "json": {
+      if (rawBody.byteLength === 0) return null as T;
+      const text = new TextDecoder("utf-8").decode(rawBody);
+      const parsed = safeJSONParse<T>(text, {
+        maxStringLength: 10_000_000,
+        maxDepth: 100,
+        maxArrayLength: 100_000,
+      });
+      if (!parsed.success) {
+        throw new KinetexError(
+          `Response body is not valid JSON: ${parsed.message ?? "parse failed"}`,
+          "EPARSE",
+        );
+      }
+      return parsed.value as T;
+    }
+    case "text":
+      return new TextDecoder("utf-8").decode(rawBody) as T;
+    case "arraybuffer":
+      // Uint8Array is the cross-runtime byte container and matches what Node
+      // callers already receive from axios' Buffer-backed arraybuffer mode.
+      return rawBody as T;
+    case "blob": {
+      if (typeof Blob === "undefined") {
+        throw new KinetexError(
+          "responseType 'blob' requires a runtime with a global Blob",
+          "EVALIDATION",
+        );
+      }
+      return new Blob([rawBody as BlobPart], {
+        type: contentType ?? "",
+      }) as T;
+    }
+    case "stream": {
+      if (IS_NODE) {
+        const { Readable } = await import("node:stream");
+        return Readable.from([rawBody]) as T;
+      }
+      return new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(rawBody);
+          controller.close();
+        },
+      }) as T;
+    }
+    default:
+      throw new KinetexError(
+        `Unsupported responseType "${String(responseType)}" — expected "json", "text", "arraybuffer", "blob" or "stream"`,
+        "EVALIDATION",
+      );
+  }
 }
 
 // ============================================================================
@@ -2136,6 +2273,7 @@ export class Kinetex {
       mergeParams(this.cfg.params, options.params),
       undefined,
       this.cfg.allowPrivateNetwork === true,
+      options.paramsSerializer ?? this.cfg.paramsSerializer,
     );
 
     // URL userinfo (`https://user:pass@host/`) is Basic auth, as it is in
@@ -2210,35 +2348,50 @@ export class Kinetex {
     // over the limit the caller had set.
     let preEncodedForm: { bytes: Uint8Array; boundary: string } | undefined;
 
+    // `data` is the axios spelling of `body`. Reject both rather than silently
+    // choosing one, but let `body: null` remain an explicit "no body".
+    if (options.body !== undefined && options.data !== undefined) {
+      throw new KinetexError(
+        "Pass either `body` or `data`, not both — they are aliases for the request body",
+        "EVALIDATION",
+      );
+    }
+    const requestBody = options.body !== undefined ? options.body : options.data;
+
     // Enforce request size limit if configured
-    const maxRequestSize = options.maxRequestSize ?? this.cfg.maxRequestSize ?? 0;
-    if (maxRequestSize > 0 && options.body) {
+    const maxRequestSize =
+      options.maxRequestSize ??
+      options.maxBodyLength ??
+      this.cfg.maxRequestSize ??
+      this.cfg.maxBodyLength ??
+      0;
+    if (maxRequestSize > 0 && requestBody !== undefined && requestBody !== null) {
       let bodySize = 0;
-      if (typeof options.body === "string") {
-        bodySize = new TextEncoder().encode(options.body).byteLength;
-      } else if (options.body instanceof Uint8Array) {
-        bodySize = options.body.byteLength;
-      } else if (options.body instanceof ArrayBuffer) {
-        bodySize = options.body.byteLength;
-      } else if (options.body instanceof Blob) {
-        bodySize = options.body.size;
-      } else if (ArrayBuffer.isView(options.body)) {
+      if (typeof requestBody === "string") {
+        bodySize = new TextEncoder().encode(requestBody).byteLength;
+      } else if (requestBody instanceof Uint8Array) {
+        bodySize = requestBody.byteLength;
+      } else if (requestBody instanceof ArrayBuffer) {
+        bodySize = requestBody.byteLength;
+      } else if (requestBody instanceof Blob) {
+        bodySize = requestBody.size;
+      } else if (ArrayBuffer.isView(requestBody)) {
         // FIX (H4): other typed-array/DataView views were uncounted.
         // ArrayBuffer.isView() is used instead of `instanceof ArrayBufferView`
         // because there is no runtime global to instanceof against.
-        bodySize = (options.body as ArrayBufferView).byteLength;
-      } else if (options.body instanceof URLSearchParams) {
+        bodySize = (requestBody as ArrayBufferView).byteLength;
+      } else if (requestBody instanceof URLSearchParams) {
         // FIX (H4): previously silently skipped — count the serialized form.
-        bodySize = new TextEncoder().encode(options.body.toString()).byteLength;
-      } else if (options.body instanceof FormData) {
+        bodySize = new TextEncoder().encode(requestBody.toString()).byteLength;
+      } else if (requestBody instanceof FormData) {
         // FIX (H4): the old branch skipped FormData entirely, which allowed
         // unbounded uploads past the configured limit; it then replaced the
         // skip with an estimate whose per-part constant was smaller than the
         // framing it stood in for. The exact bytes are the only honest
         // answer, and they are needed a few lines below anyway.
-        preEncodedForm = await encodeMultipart(options.body);
+        preEncodedForm = await encodeMultipart(requestBody);
         bodySize = preEncodedForm.bytes.byteLength;
-      } else if (options.body instanceof ReadableStream) {
+      } else if (requestBody instanceof ReadableStream) {
         // FIX (H4): a stream's size cannot be known without consuming it —
         // reject rather than silently bypassing the limit. Callers who need
         // streaming uploads must pass maxRequestSize: 0 explicitly.
@@ -2246,9 +2399,9 @@ export class Kinetex {
           `maxRequestSize cannot be enforced for ReadableStream bodies — pass maxRequestSize: 0 to opt out, or buffer the body first`,
           "EVALIDATION",
         );
-      } else if (options.body && typeof options.body === "object") {
+      } else if (typeof requestBody === "object") {
         try {
-          bodySize = new TextEncoder().encode(JSON.stringify(options.body)).byteLength;
+          bodySize = new TextEncoder().encode(JSON.stringify(requestBody)).byteLength;
         } catch (err) {
           // A circular (or BigInt-containing) body threw a raw TypeError from
           // inside the size guard, masking the real serialization error.
@@ -2290,7 +2443,7 @@ export class Kinetex {
       // A plain object/array is accepted by the public API (RequestBody) and is
       // JSON-encoded in the block immediately below, so the request object only
       // ever holds a real BodyInit by the time this function returns.
-      body: (options.body ?? null) as BodyInit | null,
+      body: (requestBody ?? null) as BodyInit | null,
       signal: options.signal ?? null,
       // Resolved once here so the manual redirect follower sees the same
       // effective values the caller asked for. Spread (not `??`) because the
@@ -3515,7 +3668,11 @@ export class Kinetex {
         delete raw.headers["content-encoding"];
         delete raw.headers["Content-Encoding"];
       }
-      const decompressedBody = await decompressBodyStream(raw.body, raw.headers);
+      const shouldDecompress = options.decompress ?? this.cfg.decompress ?? true;
+      const decompressedBody =
+        shouldDecompress || raw.alreadyDecompressed
+          ? await decompressBodyStream(raw.body, raw.headers)
+          : raw.body;
 
       // ── Download progress ──────────────────────────────────────────────────
       // Intercept the decompressed stream to count bytes as they are read.
@@ -3584,7 +3741,11 @@ export class Kinetex {
       // body is read in full before the caller sees a byte of it. An explicit
       // `0` opts back out, which is what that value has always meant.
       const maxSize =
-        options.maxResponseSize ?? this.cfg.maxResponseSize ?? DEFAULT_MAX_RESPONSE_SIZE;
+        options.maxResponseSize ??
+        options.maxContentLength ??
+        this.cfg.maxResponseSize ??
+        this.cfg.maxContentLength ??
+        DEFAULT_MAX_RESPONSE_SIZE;
       rawBody = await readRawBody(bodyStream, maxSize, raw.url, attemptSignal);
     } catch (err) {
       throw attemptError(err);
@@ -3603,14 +3764,15 @@ export class Kinetex {
     // ── Parse body ────────────────────────────────────────────────────────
     const ct = raw.headers["content-type"] ?? null;
     this._trace(_traceId, "response_parse", "start", startMs, attempt);
-    const data = (await parseBody<T>(
+    const data = await parseResponseWithType<T>(
       rawBody,
       ct,
+      options.responseType ?? this.cfg.responseType,
       options.parseResponse,
       options.parseFailure,
       raw.headers,
       raw.url,
-    )) as T;
+    );
     this._trace(_traceId, "response_parse", "end", startMs, attempt);
 
     // ── Build response object ──────────────────────────────────────────────
@@ -3637,12 +3799,21 @@ export class Kinetex {
 
     // Apply transformResponse now that the response object exists, so the hook
     // receives the real response (status/headers/url) rather than the empty
-    // placeholder it used to be handed.
-    if (this.cfg.transformResponse) {
+    // placeholder it used to be handed. A per-request transform runs after the
+    // client-level one, matching the axios expectation that config wins.
+    const transforms = [
+      this.cfg.transformResponse as
+        ((data: unknown, response: KinetexResponse<unknown>) => unknown) | undefined,
+      options.transformResponse,
+    ].filter(
+      (fn): fn is (data: unknown, response: KinetexResponse<unknown>) => unknown =>
+        typeof fn === "function",
+    );
+    for (const transform of transforms) {
       // `data` is readonly on the public type; the cast is confined to this one
       // write, immediately after construction.
-      (res as { data: T }).data = this.cfg.transformResponse<T>(
-        res.data,
+      (res as { data: unknown }).data = await transform(
+        (res as { data: unknown }).data,
         res as KinetexResponse<unknown>,
       );
     }
@@ -3707,8 +3878,17 @@ export class Kinetex {
     }
 
     // ── Throw on HTTP error ────────────────────────────────────────────────
+    // `validateStatus` is the axios contract: it decides success for *every*
+    // status, including redirects that were not followed. Without it, keep the
+    // existing throwOnError behaviour. `null` means "accept everything".
+    const hasRequestValidator = options.validateStatus !== undefined;
+    const validateStatus = hasRequestValidator ? options.validateStatus : this.cfg.validateStatus;
     const throwOnErr = options.throwOnError ?? this.cfg.throwOnError ?? true;
-    if (throwOnErr && finalRes.status >= 400) {
+    const shouldThrow =
+      validateStatus !== undefined
+        ? validateStatus !== null && !validateStatus(finalRes.status)
+        : throwOnErr && finalRes.status >= 400;
+    if (shouldThrow) {
       throw new HTTPStatusError(finalRes as KinetexResponse<unknown>, req);
     }
 
@@ -4112,9 +4292,52 @@ export class Kinetex {
   // §10  FLUENT CHAIN ENTRY POINTS
   // ============================================================================
 
+  /**
+   * Execute an axios-style request config, or begin a fluent request chain.
+   *
+   * @example
+   * ```ts
+   * const res = await client.request({
+   *   url: "/upload",
+   *   method: "POST",
+   *   data: form,
+   *   responseType: "json",
+   * });
+   * ```
+   */
+  request<T = unknown>(config: RequestConfig<T>): Promise<KinetexResponse<T>>;
   /** Begin a fluent request chain. */
-  request(method: HTTPMethod, url: string): FluentRequest {
-    return new FluentRequest(this, method, url);
+  request(method: HTTPMethod, url: string): FluentRequest;
+  request<T = unknown>(
+    methodOrConfig: HTTPMethod | RequestConfig<T>,
+    url?: string,
+  ): Promise<KinetexResponse<T>> | FluentRequest {
+    if (typeof methodOrConfig === "string") {
+      if (url === undefined) {
+        throw new KinetexError(
+          "request(method, url) requires a URL — use request(config) for an axios-style config",
+          "EVALIDATION",
+        );
+      }
+      return new FluentRequest(this, methodOrConfig, url);
+    }
+    return this._sendConfig(methodOrConfig);
+  }
+
+  /** Execute a {@link RequestConfig} through the normal send pipeline. */
+  private async _sendConfig<T>(config: RequestConfig<T>): Promise<KinetexResponse<T>> {
+    const { url, method = "GET", httpAgent, httpsAgent, ...options } = config;
+    if (httpAgent !== undefined || httpsAgent !== undefined) {
+      throw new KinetexError(
+        "httpAgent/httpsAgent are not supported — kinetex pools its own connections. " +
+          "Use the client's `proxy` or `dispatcher` option instead.",
+        "EVALIDATION",
+      );
+    }
+    if (typeof url !== "string" || url.length === 0) {
+      throw new KinetexError("request(config) requires a non-empty `url` string", "EVALIDATION");
+    }
+    return this.send<T>(url, String(method).toUpperCase() as HTTPMethod, options);
   }
 
   /** Begin a fluent GET chain. */
@@ -4161,6 +4384,7 @@ export class Kinetex {
       this.cfg.params,
       undefined,
       this.cfg.allowPrivateNetwork,
+      this.cfg.paramsSerializer,
     );
 
     // Route through the full kinetex pipeline (auth, interceptors, rate-limit, CB, etc.)
@@ -4220,6 +4444,7 @@ export class Kinetex {
       this.cfg.params,
       undefined,
       this.cfg.allowPrivateNetwork,
+      this.cfg.paramsSerializer,
     );
 
     // Route through the full kinetex pipeline (auth, interceptors, rate-limit, CB, OTel, etc.)
@@ -4277,6 +4502,7 @@ export class Kinetex {
       this.cfg.params,
       undefined,
       this.cfg.allowPrivateNetwork,
+      this.cfg.paramsSerializer,
     );
 
     // Route through the full kinetex pipeline
