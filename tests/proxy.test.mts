@@ -1601,6 +1601,79 @@ if (!openssl) {
         `CONNECT ${t.hostname}:${t.port} HTTP/1.1`,
         "the tunnel must be opened to the TARGET, not to the proxy itself",
       );
+
+      // The secure agent has the mirror of the plain-agent fallback: if Node
+      // omits `protocol` from the connection options, an https agent must
+      // still default to https rather than downgrading the tunnel.
+      const secureAgent = (
+        transport as unknown as {
+          _http1SecureAgent: {
+            createConnection: (
+              opts: { host: string; port: number },
+              cb: (err: Error | null, socket?: import("node:net").Socket) => void,
+            ) => void;
+          };
+        }
+      )._http1SecureAgent;
+      const extra = await new Promise<import("node:net").Socket>((resolve, reject) => {
+        secureAgent.createConnection({ host: "127.0.0.1", port: Number(t.port) }, (err, socket) => {
+          if (err) reject(err);
+          else resolve(socket!);
+        });
+      });
+      extra.destroy();
+    } finally {
+      transport.destroy();
+      await proxy.close();
+      await target.close();
+    }
+  });
+
+  await test("a plain-HTTP request uses the plain agent through the proxy", async () => {
+    // The secure/insecure agent split is separate state: an https target set
+    // `_http1SecureAgent`, and a plain target has to build the other one.
+    // Sharing either field would send TLS through a plain socket, or plain
+    // HTTP through a TLS agent.
+    const target = await startTarget();
+    const proxy = await startProxy();
+    const transport = new NodeHTTP2Transport({ proxy: { url: proxy.url } });
+    try {
+      const raw = await withoutFetch(() =>
+        transport.send(transportRequest(target.url, "HTTP/1.1")),
+      );
+      const text = raw.body ? await new Response(raw.body).text() : "";
+      assert.equal(raw.status, 200);
+      assert.match(text, /tunnelled:\/hello/);
+      assert.equal(proxy.seen.length, 1, "the request must go through the proxy");
+      const plainAgent = (transport as unknown as { _http1Agent?: unknown })._http1Agent;
+      assert.ok(plainAgent, "a plain-HTTP proxy request must build the plain agent");
+      assert.equal(
+        (transport as unknown as { _http1SecureAgent?: unknown })._http1SecureAgent,
+        null,
+        "it must not reuse the secure agent",
+      );
+
+      // Exercise the defensive protocol fallback: Node does not always put
+      // `protocol` in the options handed to `createConnection`. The agent must
+      // infer the scheme it was built for instead of defaulting everything to
+      // https.
+      const socket = await new Promise<import("node:net").Socket>((resolve, reject) => {
+        (
+          plainAgent as {
+            createConnection: (
+              opts: { host: string; port: number },
+              cb: (err: Error | null, socket?: import("node:net").Socket) => void,
+            ) => void;
+          }
+        ).createConnection(
+          { host: "127.0.0.1", port: Number(new URL(target.url).port) },
+          (err, connected) => {
+            if (err) reject(err);
+            else resolve(connected!);
+          },
+        );
+      });
+      socket.destroy();
     } finally {
       transport.destroy();
       await proxy.close();
