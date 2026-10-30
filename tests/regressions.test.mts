@@ -660,6 +660,105 @@ describe("P0-2 download-progress wrapper cancels the SOURCE, not itself", () => 
       },
     );
   });
+
+  it("cancels the upload-progress stream when the transport throws", async () => {
+    let seenBody: unknown;
+    const transport = {
+      async send(req: KinetexRequest): Promise<RawResponse> {
+        seenBody = req.body;
+        throw new Error("transport offline");
+      },
+    };
+    const c = new Kinetex({ baseURL: "https://api.example.test" });
+    const s = withTransport(c, transport);
+    try {
+      await assert.rejects(
+        () => s.client.post("/upload", new Uint8Array(8), { onUploadProgress: () => {} }),
+        /transport offline/,
+      );
+      assert.ok(seenBody instanceof ReadableStream, "the cleanup must see the wrapped stream");
+    } finally {
+      s.restore();
+    }
+  });
+
+  it("propagates a source-stream error through the download wrapper", async () => {
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2, 3]));
+        controller.error(new Error("source exploded"));
+      },
+    });
+    const transport = {
+      async send(req: KinetexRequest): Promise<RawResponse> {
+        return {
+          status: 200,
+          statusText: "200",
+          headers: { "content-type": "text/plain" },
+          body: source,
+          url: req.url,
+          redirected: false,
+          httpVersion: "HTTP/1.1",
+          alreadyDecompressed: true,
+        } as RawResponse;
+      },
+    };
+    const c = new Kinetex({ baseURL: "https://api.example.test" });
+    const s = withTransport(c, transport);
+    try {
+      await assert.rejects(
+        () => s.client.get("/stream", { onDownloadProgress: () => {} }),
+        /source exploded/,
+      );
+    } finally {
+      s.restore();
+    }
+  });
+
+  it("swallows a source cancel rejection during a size-limit abort", async () => {
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(64));
+      },
+      cancel() {
+        // The wrapper reads from this source, so it is locked by the time the
+        // wrapper cancels it. The platform rejects with a TypeError; the
+        // wrapper must swallow it rather than surface an unhandled rejection.
+        return Promise.reject(new Error("source cancel failed"));
+      },
+    });
+    const transport = {
+      async send(req: KinetexRequest): Promise<RawResponse> {
+        return {
+          status: 200,
+          statusText: "200",
+          headers: { "content-type": "text/plain" },
+          body: source,
+          url: req.url,
+          redirected: false,
+          httpVersion: "HTTP/1.1",
+          alreadyDecompressed: true,
+        } as RawResponse;
+      },
+    };
+    const c = new Kinetex({ baseURL: "https://api.example.test" });
+    const s = withTransport(c, transport);
+    try {
+      await assert.rejects(
+        () =>
+          s.client.get("/big", {
+            maxResponseSize: 8,
+            onDownloadProgress: () => {},
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof SizeLimitError);
+          return true;
+        },
+      );
+    } finally {
+      s.restore();
+    }
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -303,6 +303,33 @@ test("KX-10: URL userinfo becomes Basic auth and is removed from the URL", async
   }
 });
 
+test("KX-10: malformed percent-encoding in userinfo falls back to the raw text", async () => {
+  // `decodeURIComponent` throws on a lone `%` or an incomplete UTF-8 sequence.
+  // The URL parser accepts those bytes in userinfo, so rejecting the request
+  // would turn a bad password into a bad URL; send the literal text instead
+  // and let the server decide.
+  let seenAuth: string | undefined;
+  const server = createServer((req, res) => {
+    seenAuth = req.headers.authorization;
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("userinfo-fallback");
+  });
+  const port = await listen(server);
+  const client = kinetex({ allowPrivateNetwork: true, retry: { maxRetries: 0 }, timeout: 5_000 });
+  try {
+    const res = await client.get(`http://user%ZZ:p%E0%A4%A@127.0.0.1:${port}/path`);
+    assert.equal(res.data, "userinfo-fallback");
+    assert.equal(
+      seenAuth,
+      `Basic ${Buffer.from("user%ZZ:p%E0%A4%A").toString("base64")}`,
+      "undecodable userinfo must be sent without throwing",
+    );
+  } finally {
+    await client.destroy();
+    await closeServer(server);
+  }
+});
+
 test("KX-10: a credential URL is absent from connection errors", async () => {
   const port = await closedPort();
   const client = kinetex({ allowPrivateNetwork: true, retry: { maxRetries: 0 }, timeout: 2_000 });
