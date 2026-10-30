@@ -4486,7 +4486,7 @@ export class Kinetex {
     if (typeof url !== "string" || url.length === 0) {
       throw new KinetexError("request(config) requires a non-empty `url` string", "EVALIDATION");
     }
-    return this.send<T>(url, String(method).toUpperCase() as HTTPMethod, options);
+    return await this.send<T>(url, String(method).toUpperCase() as HTTPMethod, options);
   }
 
   /** Begin a fluent GET chain. */

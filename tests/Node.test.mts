@@ -3857,8 +3857,15 @@ await test("disableDedup() stops coalescing", async () => {
 });
 
 // ============================================================================
-// §38  WEBSOCKET — enterprise features against live echo server
+// §38  WEBSOCKET — enterprise features against the live echo server
 // ============================================================================
+//
+// `echo.websocket.org` is a public third party: it rate-limits, and it is
+// down whenever this host has no outbound TLS route. The HTTP suites above
+// carry their own upstream-drift guards; WebSocket has no equivalent, so the
+// whole suite is skipped when the echo server cannot be reached, and the
+// offline WS behaviour (connect refusal, buffer drain, headers) is covered by
+// the 127.0.0.1 tests below and by ws.test.mts in the runtime suite.
 
 suite("WebSocket");
 
@@ -3867,6 +3874,32 @@ async function waitUntil(predicate: () => boolean, deadlineMs: number): Promise<
   const end = Date.now() + deadlineMs;
   while (!predicate() && Date.now() < end) {
     await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+/**
+ * One shared reachability probe for the live-echo tests. Returns a skip
+ * message or null when `echo.websocket.org` answers. The result is cached so
+ * the suite probes once.
+ */
+let wsReachable: boolean | null = null;
+async function wsSkipReason(): Promise<string | null> {
+  if (wsReachable !== null)
+    return wsReachable ? null : "echo.websocket.org unreachable — live WS tests skipped";
+  try {
+    const { WSClient } = await import("../src/ws.ts");
+    const ws = new WSClient({
+      url: "wss://echo.websocket.org/",
+      pingIntervalMs: 0,
+      connectTimeoutMs: 5_000,
+    });
+    await ws.connect();
+    ws.close(1000);
+    wsReachable = true;
+    return null;
+  } catch {
+    wsReachable = false;
+    return "echo.websocket.org unreachable — live WS tests skipped";
   }
 }
 
@@ -3880,7 +3913,17 @@ async function waitForMatching(
   await waitUntil(() => received.filter(match).length >= count, deadlineMs);
 }
 
-await test("connect(), send(), receive echo — basic round-trip over wss://", async () => {
+/** Run a live-echo WS test, skipping it (with a note) when the echo server is unreachable. */
+async function liveWsTest(name: string, fn: () => Promise<void>): Promise<void> {
+  const skip = await wsSkipReason();
+  if (skip) {
+    console.log(`  ⏭  ${name} — ${skip}`);
+    return;
+  }
+  await test(name, fn);
+}
+
+await liveWsTest("connect(), send(), receive echo — basic round-trip over wss://", async () => {
   const { WSClient } = await import("../src/ws.ts");
   const received: WSMessage[] = [];
 
@@ -3910,7 +3953,7 @@ await test("connect(), send(), receive echo — basic round-trip over wss://", a
   assert.ok(echo!.timestamp > 0, "Message must have a valid timestamp");
 });
 
-await test("sendJSON() echoes back parseable JSON with correct fields", async () => {
+await liveWsTest("sendJSON() echoes back parseable JSON with correct fields", async () => {
   const { WSClient } = await import("../src/ws.ts");
   const received: WSMessage[] = [];
 
@@ -3944,7 +3987,7 @@ await test("sendJSON() echoes back parseable JSON with correct fields", async ()
   assert.deepEqual(j.nested, { ok: true });
 });
 
-await test("sendBinary() echoes back as Uint8Array", async () => {
+await liveWsTest("sendBinary() echoes back as Uint8Array", async () => {
   const { WSClient } = await import("../src/ws.ts");
   const received: WSMessage[] = [];
 
@@ -3976,7 +4019,7 @@ await test("sendBinary() echoes back as Uint8Array", async () => {
   assert.deepEqual(Array.from(msg!.data as Uint8Array), [0x01, 0x02, 0x03, 0xaa, 0xff]);
 });
 
-await test("onMessage() listener returns a working unsubscribe function", async () => {
+await liveWsTest("onMessage() listener returns a working unsubscribe function", async () => {
   const { WSClient } = await import("../src/ws.ts");
   const received: string[] = [];
 
@@ -4009,7 +4052,7 @@ await test("onMessage() listener returns a working unsubscribe function", async 
   assert.strictEqual(afterCount, 0, "No messages must arrive after unsubscribe");
 });
 
-await test("Async iterator terminates cleanly when close() is called", async () => {
+await liveWsTest("Async iterator terminates cleanly when close() is called", async () => {
   const { WSClient } = await import("../src/ws.ts");
   const collected: string[] = [];
 
@@ -4050,7 +4093,7 @@ await test("Async iterator terminates cleanly when close() is called", async () 
   );
 });
 
-await test("request() resolves with correlated reply matching the predicate", async () => {
+await liveWsTest("request() resolves with correlated reply matching the predicate", async () => {
   const { WSClient } = await import("../src/ws.ts");
   const ws = new WSClient({
     url: "wss://echo.websocket.org/",
@@ -4073,7 +4116,7 @@ await test("request() resolves with correlated reply matching the predicate", as
   assert.strictEqual(reply.action, "echo-test");
 });
 
-await test("request() rejects with WSError on timeout when no reply matches", async () => {
+await liveWsTest("request() rejects with WSError on timeout when no reply matches", async () => {
   const { WSClient, WSError } = await import("../src/ws.ts");
   const ws = new WSClient({
     url: "wss://echo.websocket.org/",
@@ -4107,7 +4150,7 @@ await test("request() rejects with WSError on timeout when no reply matches", as
   );
 });
 
-await test("Metrics: messagesSent/bytesReceived increment correctly", async () => {
+await liveWsTest("Metrics: messagesSent/bytesReceived increment correctly", async () => {
   const { WSClient } = await import("../src/ws.ts");
   const ws = new WSClient({
     url: "wss://echo.websocket.org/",
@@ -4170,7 +4213,7 @@ await test("drainBuffer() returns buffered messages and clears the queue", async
   ws.close();
 });
 
-await test("AbortSignal closes the socket permanently", async () => {
+await liveWsTest("AbortSignal closes the socket permanently", async () => {
   const { WSClient } = await import("../src/ws.ts");
   const ctrl = new AbortController();
   const closedWith: Array<{ code: number; will: boolean }> = [];

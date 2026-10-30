@@ -5,6 +5,56 @@ All notable changes to kinetex will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] - 2026-10-31
+
+The 36-finding `v1.5.0` axios-audit closed on `main` across four stacked PRs. Two findings landed this round that the audit did not catch:
+
+- **A 2-digit RFC-850 year was concatenated to the century with the wrong operand order**, so `Sunday, 06-Nov-94` expanded to `194-11-06` instead of `1994-11-06` and the whole date read as invalid.
+- **The obsolete asctime form (`Sun Nov  6 08:49:37 1994`) was mis-parsed by some V8 builds**: the two-digit day field was re-interpreted as a timezone offset and the time was shifted to 03:49 instead of 08:49. Both obsolete forms are now normalised to a strict ISO instant before `Date.parse` sees them.
+
+All 36 findings KX-01 through KX-36 are closed. No new public API.
+
+### Fixed
+
+- **KX-01–KX-04 / KX-27 / KX-28 — packaging and distribution.** `dist/cjs` now emits real CommonJS plus `.d.cts` declarations; the Deno/bun export conditions resolve to published ESM; the browser bundle carries no `node:*` imports (Node-only transports are aliased to browser-only shims); `./package.json` is exported; and the tarball ships `src/` so source maps resolve. The packed tarball smoke-tests on Node 22/24 and passes `@arethetypeswrong`'s checks.
+- **KX-05 / KX-06 — axios config-object API.** `client.request({ url, method, data, headers, params, timeout, signal, responseType, validateStatus, paramsSerializer, maxContentLength, maxBodyLength, ... })` is implemented, including `data` ↔ `body` aliasing, every `responseType`, `validateStatus: null`, and a `paramsSerializer` object form. `httpAgent`/`httpsAgent` are rejected with a clear `EVALIDATION` rather than silently dropped.
+- **KX-07 — ALPN fallback.** `ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL` (and the other h2-negotiation codes) now triggers the HTTP/1.1 fallback; the downgrade is cached per origin and replayed only for replayable bodies.
+- **KX-08 — HTTP/1.1 fallback carried `proxy`, `ca`, `allowPrivateNetwork` and the header callbacks.** The legacy transport now threads them through; `ca`/`proxy` force the Node transport even when the caller also set `httpVersion: "HTTP/1.1"`.
+- **KX-09 — cross-origin credential-header stripping is now case-insensitive.** A redirect that changes host or scheme strips every credential header regardless of casing; redirect `Location`s that carry userinfo are rejected with a redacted error.
+- **KX-10 — URL userinfo becomes Basic auth.** `https://user:pass@host/` is decoded, percent-decoded (malformed sequences fall back to the raw text), converted to a Basic-auth header, and removed from the URL so no error, log or redirect path leaks it.
+- **KX-11 — `timeout` now covers the response body.** A trickling body no longer hangs the caller past the deadline; the total request deadline is enforced through the read, not just the header phase.
+- **KX-12 — `destroy()` settles in-flight requests and body reads.** Callers awaiting a stalled body now receive a rejection instead of parking forever.
+- **KX-13 / KX-14 — interceptor and cache.** Request interceptors can return a synthetic response; cache hits are served again; the cache key includes the auth fingerprint and `Vary`, and `Cache-Control: private` is never stored.
+- **KX-15 — S3 POST policy UTF-8 base64.** `signS3PostPolicy` encodes the policy's UTF-8 bytes with `uint8ArrayToBase64` instead of `btoa` (which threw on non-Latin-1 and mis-encoded Latin-1).
+- **KX-16 — S3 chunked-upload seed signature.** `initChunkedSigning` signs the seed request with the `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` sentinel instead of `SHA256("")`; every chunk signature now chains correctly. Pinned against AWS's published worked example.
+- **KX-17 — `baseURL` query/path joining.** A base like `https://host/v1?key=abc` keeps both the path and the query for relative requests.
+- **KX-18 — header inputs.** `mergeHeaders` accepts plain objects, `Headers`, `HttpHeaders` and `[name, value]` pairs; a `Map` or other unsupported shape now fails with `EVALIDATION` instead of silently sending numeric keys.
+- **KX-19 — query parameter semantics.** Array params default to the axios bracket form; `arrayFormat: "repeat"` restores the older spelling; scalar params append; nested object params are rejected.
+- **KX-20 — explicit text responses.** `responseType: "text"` decodes no-content-type and `application/octet-stream` bodies as strings (axios parity); the binary-preserving default is unchanged.
+- **KX-21 — redirect method/entity rules.** 301/302/303 downgrades only POST to GET; HEAD stays HEAD; `Content-*`/`Transfer-Encoding` entity headers are dropped when the body is discarded.
+- **KX-22 — `HTTPCache.set()` overwrite accounting.** Replacing a key no longer inflates `totalEntries`/`totalSizeBytes` or evicts live entries; a failed storage write restores the previous accounting.
+- **KX-23 — around hooks.** `wrapWithAround` is awaited; a hook that returns a response without calling `next()` is honoured; `safe: true` rejection falls back to the dispatch; `safe: false` rejection reaches the caller instead of becoming an unhandled rejection.
+- **KX-24 — GraphQL per-call headers.** `query()` and `mutate()` now pass `options.headers` through to the request; `mutate()`'s options type gained `headers`.
+- **KX-25 — WebSocket handshake headers.** On Node 22+ the headers reach the `new WebSocket(url, { headers })` constructor; on runtimes without that overload the Deno-style `setHeader` fallback is used; otherwise `WSError` is raised instead of silently dropping them.
+- **KX-26 — `Redactor.redactURL()` strips URL userinfo** from absolute and protocol-relative URLs.
+- **KX-29 — `KinetexResponse.raw` is populated.** The transport's native response object is attached; it is absent on cache/synthetic responses.
+- **KX-30 — circuit-breaker `onOpen` fires once per opening transition.** Concurrent HALF_OPEN failures count individually but the `onOpen` callback fires only when the state actually transitions to OPEN.
+- **KX-31 — progress snapshots on failure.** `failed`/`aborted`/`error` fields are carried on the final snapshot; `complete()` cannot overwrite a failure; wrappers mark errors and aborts instead of reporting 100%.
+- **KX-32 — SSE BOM.** A leading UTF-8 BOM no longer hides the first event, including when the BOM arrives in its own chunk.
+- **KX-33 — `isSafeURL` double-dot paths.** `foo..bar.txt` is allowed; whole `..` segments are still rejected after URL-parser normalisation of `%2e%2e`.
+- **KX-34 — `httpVersion` spellings.** `"http/1.1"`, `"1.1"` and `"HTTP/1.0"` are normalised; an unknown value throws `EVALIDATION` before dialling; `HTTP/1.0` resolves to the HTTP/1.1 path.
+- **KX-35 — one-shot HTTP/2 exit.** Idle HTTP/2 sessions are `unref()`ed, so a one-shot request no longer keeps the process alive; `destroy()` still aborts in-flight requests.
+- **KX-36 — `response.httpVersion` is the protocol that actually answered**, not an `Alt-Svc` capability; `Alt-Svc` is reported separately where a runtime exposes it.
+
+### Added
+
+- **`Kinetex.request(config)` / `validateStatus` / `responseType` / `paramsSerializer` / `maxContentLength` / `maxBodyLength` / `data` ↔ `body` / `arrayFormat`** — the full axios-compatible surface (KX-05/KX-06/KX-17–KX-20) is now part of the public API; see each finding above.
+- **`STREAMING-AWS4-HMAC-SHA256-PAYLOAD` seed + `uint8ArrayToBase64`** for the two S3 signing fixes (KX-15/KX-16).
+- **`response.raw`** (KX-29) — the transport-native response object (`Response`, `IncomingMessage`, etc.) is exposed for callers who need it; cache/synthetic responses have no `raw` and the field is absent.
+- **`ProgressEvent.failed` / `.aborted` / `.error`** (KX-31) — download and upload progress snapshots now report failure and abort state alongside byte counts.
+- **`CircuitBreaker.onOpen` transition guard** (KX-30) — the callback fires on the `HALF_OPEN → OPEN` transition, not on every failing probe.
+- **`signRequest(payloadHash)` override** (KX-16) — internal option used by the chunked seed; ordinary callers do not need it.
+
 ## [1.5.0] - 2026-10-12
 
 Six defects that crossed a tenant, a socket or a process boundary; a cookie jar that silently dropped every `SameSite` session; a HAR export that wrote credentials in clear text; and an HTTP/2 transport that could not upload a stream at all. Coverage 96.44% → 97.59% over 60 test files.
