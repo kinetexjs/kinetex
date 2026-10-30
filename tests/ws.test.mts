@@ -1232,11 +1232,19 @@ class FakeWebSocket {
   /** Make send() throw, to reach the guarded send in _tx()/_startPing(). */
   throwOnSend: Error | null = null;
 
-  constructor(url: string, protocols?: string | string[]) {
+  constructor(url: string, protocols?: string | string[] | { headers?: Record<string, string> }) {
     if (FakeWebSocket.failConstruct) {
       const e = FakeWebSocket.failConstruct;
       FakeWebSocket.failConstruct = null;
       throw e;
+    }
+    // This fake models a runtime with Deno's `setHeader` extension and no
+    // WebSocketInit support: an init object is a TypeError, so the client must
+    // fall back to the plain constructor and then set headers via setHeader.
+    // A fake that silently accepted the object would mark headers as sent and
+    // the setHeader path would never be exercised.
+    if (protocols !== undefined && typeof protocols === "object" && !Array.isArray(protocols)) {
+      throw new TypeError("WebSocketInit is not supported by this runtime");
     }
     this.url = url;
     this.protocols = protocols;

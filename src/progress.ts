@@ -45,6 +45,12 @@ export interface ProgressSnapshot {
   elapsed: number;
   /** Whether the transfer is complete */
   done: boolean;
+  /** Whether the transfer ended in an error rather than completing */
+  failed: boolean;
+  /** Whether the transfer was cancelled or aborted */
+  aborted: boolean;
+  /** The error that ended the transfer, when one is known */
+  error: Error | null;
 }
 
 export interface ProgressOptions {
@@ -92,6 +98,9 @@ export class ProgressTracker {
   private smoothedRate = 0;
   private readonly smoothing: number;
   private _done = false;
+  private _failed = false;
+  private _aborted = false;
+  private _error: Error | null = null;
 
   // Throttle state.
   //
@@ -146,7 +155,32 @@ export class ProgressTracker {
 
   /** Mark transfer as complete. Emits final snapshot regardless of throttle. */
   complete(): ProgressSnapshot {
-    this._done = true;
+    // A failed transfer is terminal. Calling complete() afterwards (for
+    // example from a `finally` block that did not inspect the error) must not
+    // turn a failed download into a 100%-complete one.
+    if (!this._failed) this._done = true;
+    const snap = this._snapshot();
+    this.onProgress?.(snap);
+    return snap;
+  }
+
+  /**
+   * Mark the transfer as failed or aborted.
+   *
+   * The tracker deliberately does not call {@link complete}: `done` and
+   * `percent: 100` describe a transfer that delivered its body, and a broken
+   * stream did not. The failure is surfaced through the final snapshot so
+   * progress listeners can tell why the stream stopped.
+   *
+   * @param error - Underlying failure (a non-Error is wrapped).
+   * @param aborted - True when the transfer was cancelled rather than broken.
+   * @returns The final snapshot.
+   */
+  fail(error: unknown, aborted = false): ProgressSnapshot {
+    if (this._done) return this._snapshot();
+    this._failed = true;
+    this._aborted = aborted;
+    this._error = error instanceof Error ? error : new Error(String(error));
     const snap = this._snapshot();
     this.onProgress?.(snap);
     return snap;
@@ -164,6 +198,18 @@ export class ProgressTracker {
   /** Whether the transfer has been marked complete. */
   get isDone(): boolean {
     return this._done;
+  }
+  /** Whether the transfer ended in an error. */
+  get isFailed(): boolean {
+    return this._failed;
+  }
+  /** Whether the failure was a cancellation/abort. */
+  get isAborted(): boolean {
+    return this._aborted;
+  }
+  /** The error that ended the transfer, or null. */
+  get error(): Error | null {
+    return this._error;
   }
 
   private _snapshot(): ProgressSnapshot {
@@ -205,6 +251,9 @@ export class ProgressTracker {
       eta: this._done ? 0 : eta,
       elapsed,
       done: this._done,
+      failed: this._failed,
+      aborted: this._aborted,
+      error: this._error,
     };
   }
 }
@@ -317,7 +366,9 @@ export function withUploadProgress(
     start(controller) {
       // Handle already-aborted signal immediately
       if (options.signal?.aborted) {
-        controller.error(new DOMException("Upload aborted", "AbortError"));
+        const err = new DOMException("Upload aborted", "AbortError");
+        tracker.fail(err, true);
+        controller.error(err);
         return;
       }
       reader = source.getReader();
@@ -334,7 +385,9 @@ export function withUploadProgress(
         // transfer. The caller learns the real outcome from the AbortError the
         // stream is errored with, which is the same contract
         // `withDownloadProgress` already followed on abort.
-        controller.error(new DOMException("Upload aborted", "AbortError"));
+        const err = new DOMException("Upload aborted", "AbortError");
+        tracker.fail(err, true);
+        controller.error(err);
       };
       // Removed in detach() on close/cancel/error so repeated uploads sharing
       // one signal do not accumulate listeners (leak fix).
@@ -366,7 +419,7 @@ export function withUploadProgress(
       } catch (err) {
         detach();
         if (reader === r) reader = null;
-        if (!aborted) tracker.complete();
+        if (!aborted) tracker.fail(err);
         controller.error(err);
       }
     },
@@ -375,6 +428,7 @@ export function withUploadProgress(
       const r = reader;
       reader = null;
       void r?.cancel(reason).catch(() => {});
+      tracker.fail(new DOMException("Upload cancelled", "AbortError"), true);
     },
   });
 
@@ -438,7 +492,11 @@ export function withDownloadProgress(
     start(controller) {
       if (options.signal?.aborted) {
         aborted = true;
-        controller.error(new DOMException("Download aborted", "AbortError"));
+        const err = new DOMException("Download aborted", "AbortError");
+        // A stream that never delivered its body must not be reported as a
+        // completed 100% download.
+        tracker.fail(err, true);
+        controller.error(err);
         return;
       }
       reader = body.getReader();
@@ -449,7 +507,9 @@ export function withDownloadProgress(
         reader = null;
         // Ensure tracker knows we're aborting (don't wait for complete)
         void r?.cancel("aborted").catch(() => {});
-        controller.error(new DOMException("Download aborted", "AbortError"));
+        const err = new DOMException("Download aborted", "AbortError");
+        tracker.fail(err, true);
+        controller.error(err);
       };
       options.signal?.addEventListener("abort", onAbort, { once: true });
     },
@@ -476,9 +536,10 @@ export function withDownloadProgress(
       } catch (err) {
         detach();
         if (reader === r) reader = null;
-        // Ensure tracker is marked as complete even on error
+        // A failed body read is not a completed download. `done` stays false
+        // and the error is surfaced through the tracker.
         if (!aborted) {
-          tracker.complete();
+          tracker.fail(err);
         }
         controller.error(err);
       }
@@ -488,6 +549,7 @@ export function withDownloadProgress(
       const r = reader;
       reader = null;
       void r?.cancel(reason).catch(() => {});
+      tracker.fail(new DOMException("Download cancelled", "AbortError"), true);
     },
   });
 
@@ -723,6 +785,9 @@ export class MultiPartProgressAggregator {
     let totalBytes = 0;
     let totalRate = 0;
     let allDone = true;
+    let anyFailed = false;
+    let anyAborted = false;
+    let firstError: Error | null = null;
     let maxElapsed = 0;
 
     for (let i = 0; i < this.partCount; i++) {
@@ -735,12 +800,18 @@ export class MultiPartProgressAggregator {
         eta: null,
         elapsed: 0,
         done: false,
+        failed: false,
+        aborted: false,
+        error: null,
       };
       parts.push(snap);
       totalLoaded += snap.loaded;
       if (snap.total !== null) totalBytes += snap.total;
       totalRate += snap.rate;
       if (!snap.done) allDone = false;
+      if (snap.failed) anyFailed = true;
+      if (snap.aborted) anyAborted = true;
+      if (!firstError && snap.error) firstError = snap.error;
       if (snap.elapsed > maxElapsed) maxElapsed = snap.elapsed;
     }
 
@@ -758,14 +829,18 @@ export class MultiPartProgressAggregator {
         : null;
 
     // Use the max elapsed time across all parts as overall elapsed
+    const complete = allDone && !anyFailed;
     const overall: ProgressSnapshot = {
       loaded: totalLoaded,
       total: hasTotal ? totalBytes : null,
-      percent,
+      percent: complete ? (hasTotal ? 100 : null) : percent,
       rate: totalRate,
-      eta: allDone ? 0 : eta,
+      eta: complete ? 0 : eta,
       elapsed: maxElapsed,
-      done: allDone,
+      done: complete,
+      failed: anyFailed,
+      aborted: anyAborted,
+      error: firstError,
     };
 
     return { parts, overall };
@@ -1168,8 +1243,8 @@ export function throttleProgress(
 
   return (snap: ProgressSnapshot) => {
     const now = perfNow();
-    // Always emit final snapshot
-    if (snap.done || now - lastCall >= minInterval) {
+    // Always emit a terminal snapshot, whether it succeeded or failed.
+    if (snap.done || snap.failed || now - lastCall >= minInterval) {
       lastCall = now;
       fn(snap);
     }
