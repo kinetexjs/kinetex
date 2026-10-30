@@ -1020,6 +1020,46 @@ await test("SigV4Signer.signPostPolicy with session token", async () => {
   assert.equal(result.securityToken, "TOKEN");
 });
 
+await test("signS3PostPolicy base64-encodes the policy as UTF-8", async () => {
+  // `btoa` throws InvalidCharacterError on the emoji and would encode "café"
+  // as Latin-1 bytes rather than UTF-8. S3 verifies the signature over the
+  // UTF-8 base64 it receives, so both cases produced an unusable policy.
+  const policy = {
+    expiration: "2030-01-01T00:00:00Z",
+    conditions: [
+      { bucket: "kinetex" },
+      ["starts-with", "$key", "café/😀"] as [string, string, string],
+    ],
+  };
+  const result = await signS3PostPolicy(policy, {
+    credentials: staticCredentials({
+      accessKeyId: "AKIAIOSFODNN7EXAMPLE",
+      secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    }),
+    region: "us-east-1",
+    service: "s3",
+    signingDate: new Date("2030-01-01T00:00:00Z"),
+  });
+
+  // Known answer: base64(UTF-8 bytes) and HMAC-SHA256(signing key, that
+  // base64), computed independently with Node's crypto plus Buffer.
+  assert.equal(
+    result.policy,
+    "eyJleHBpcmF0aW9uIjoiMjAzMC0wMS0wMVQwMDowMDowMFoiLCJjb25kaXRpb25zIjpbeyJidWNrZXQiOiJraW5ldGV4In0sWyJzdGFydHMtd2l0aCIsIiRrZXkiLCJjYWbDqS/wn5iAIl1dfQ==",
+  );
+  assert.equal(
+    result.signature,
+    "d5098b9f661d3fad8750705963f8cca359b8d1485801657881fdfadbf7bceef3",
+  );
+  assert.equal(result.credential, "AKIAIOSFODNN7EXAMPLE/20300101/us-east-1/s3/aws4_request");
+  assert.equal(result.date, "20300101");
+
+  const decoded = new TextDecoder().decode(
+    Uint8Array.from(atob(result.policy), (c) => c.charCodeAt(0)),
+  );
+  assert.equal(decoded, JSON.stringify(policy));
+});
+
 await test("SigV4Signer.initChunked initializes chunked signing", async () => {
   const signer = new SigV4Signer({
     credentials: testCredentials,
@@ -1073,6 +1113,60 @@ await test("signChunk signs a chunk correctly", async () => {
   const sig2 = chunk2.match(/chunk-signature=([a-f0-9]+)/);
   assert.ok(sig1 !== null && sig2 !== null);
   assert.notEqual(sig1[1], sig2[1], "Each chunk must have a unique signature");
+});
+
+await test("chunked signing matches the AWS streaming-upload known answer", async () => {
+  // AWS S3 documentation's worked example: the seed request is signed with
+  // the streaming sentinel as its canonical payload hash, and every chunk
+  // signature chains from that seed. Before the fix the seed hashed an empty
+  // body, so even the first chunk signature was wrong.
+  const { signedRequest, state } = await initChunkedSigning(
+    {
+      method: "PUT",
+      url: "https://s3.amazonaws.com/examplebucket/chunkObject.txt",
+      headers: {
+        "content-encoding": "aws-chunked",
+        "content-length": "66824",
+        "x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "x-amz-decoded-content-length": "66560",
+        "x-amz-storage-class": "REDUCED_REDUNDANCY",
+      },
+      body: null,
+    },
+    {
+      credentials: staticCredentials({
+        accessKeyId: "AKIAIOSFODNN7EXAMPLE",
+        secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      }),
+      region: "us-east-1",
+      service: "s3",
+      signingDate: new Date("2013-05-24T00:00:00Z"),
+    },
+  );
+
+  assert.equal(
+    state.previousSignature,
+    "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
+    "the seed signature must sign STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+  );
+  assert.match(signedRequest.canonicalRequest, /\nSTREAMING-AWS4-HMAC-SHA256-PAYLOAD$/);
+
+  const first = await signChunk("a".repeat(65536), state);
+  assert.equal(
+    first.chunkHeader,
+    "10000;chunk-signature=ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648\r\n",
+  );
+
+  const second = await signChunk("a".repeat(1024), first.newState);
+  assert.equal(
+    second.chunkHeader,
+    "400;chunk-signature=0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497\r\n",
+  );
+
+  assert.equal(
+    await signFinalChunk(second.newState),
+    "0;chunk-signature=b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9\r\n\r\n",
+  );
 });
 
 await test("signFinalChunk terminates chunked upload", async () => {

@@ -23,7 +23,17 @@
 
 // Node.js globals accessed via globalThis for cross-runtime compatibility
 import { KinetexError as _KinetexError, TimeoutError, NetworkError } from "./types.ts";
-import { sha256Hex } from "./utils.ts";
+import { sha256Hex, uint8ArrayToBase64 } from "./utils.ts";
+
+/**
+ * Payload hash sentinel for a SigV4 streaming (chunked) upload.
+ *
+ * The seed request is signed with this literal in the canonical request's
+ * payload-hash position, and the same value is sent as
+ * `x-amz-content-sha256`. AWS derives every chunk signature from that seed
+ * signature, so signing an empty body instead invalidates the whole upload.
+ */
+const STREAMING_PAYLOAD = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 
 /** Convert a Uint8Array to a lowercase hex string. */
 function toHex(bytes: Uint8Array): string {
@@ -667,6 +677,7 @@ async function buildCanonicalRequest(
   unsignedPayload: boolean,
   doubleEncode: boolean,
   unsignedHeaders: string[],
+  payloadHashOverride?: string,
 ): Promise<{
   canonicalRequest: string;
   signedHeaders: string;
@@ -682,8 +693,15 @@ async function buildCanonicalRequest(
   const canonicalQS = canonicalQueryString(parsedUrl.searchParams);
 
   // 4. Payload hash
+  //
+  // `payloadHashOverride` is for protocols whose payload hash is a sentinel
+  // rather than a digest of bytes that exist yet. Chunked uploads sign the
+  // seed request with `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`; hashing their
+  // empty seed body produced a signature AWS could never accept.
   let payloadHash: string;
-  if (unsignedPayload) {
+  if (payloadHashOverride !== undefined) {
+    payloadHash = payloadHashOverride;
+  } else if (unsignedPayload) {
     payloadHash = "UNSIGNED-PAYLOAD";
   } else if (!body) {
     payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"; // SHA256("")
@@ -776,6 +794,14 @@ async function buildStringToSign(
 export async function signRequest(
   request: SignableRequest,
   config: SigningConfig,
+  options: {
+    /**
+     * Sign the canonical request with this payload hash instead of hashing
+     * `request.body`. Used by chunked uploads; ordinary callers should not
+     * need it.
+     */
+    payloadHash?: string;
+  } = {},
 ): Promise<SignedRequest> {
   const credentials = await resolveCredentials(config.credentials);
   const signingDate = resolveSigningDate(config);
@@ -819,6 +845,7 @@ export async function signRequest(
     config.unsignedPayload ?? false,
     doubleEncode,
     unsignedHdrs,
+    options.payloadHash,
   );
 
   // Add content-sha256 header for all requests (unless already set by unsignedPayload)
@@ -989,17 +1016,24 @@ export async function initChunkedSigning(
   /** The initial chunked signing state for subsequent signChunk calls. */
   state: ChunkedSigningState;
 }> {
-  // Override body to empty for the initial request signing
+  // The seed request has no body to hash: its canonical payload hash is the
+  // streaming sentinel, not SHA256(""). The seed signature is what every
+  // chunk signature chains from, so hashing an empty body made the entire
+  // upload unsignable.
   const seedRequest: SignableRequest = { ...request, body: null };
 
   // Set chunked-specific headers
   seedRequest.headers = {
     ...seedRequest.headers,
-    "x-amz-content-sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+    "x-amz-content-sha256": STREAMING_PAYLOAD,
     "content-encoding": "aws-chunked",
   };
 
-  const signedRequest = await signRequest(seedRequest, { ...config, unsignedPayload: false });
+  const signedRequest = await signRequest(
+    seedRequest,
+    { ...config, unsignedPayload: false },
+    { payloadHash: STREAMING_PAYLOAD },
+  );
 
   const credentials = await resolveCredentials(config.credentials);
   const signingDate = resolveSigningDate(config);
@@ -1109,9 +1143,12 @@ export async function signS3PostPolicy(
   const credentialScope = `${dateStamp}/${config.region}/${config.service}/aws4_request`;
   const credential = `${credentials.accessKeyId}/${credentialScope}`;
 
-  // Encode policy as base64
+  // Encode policy as base64 of its UTF-8 bytes. `btoa` only accepts Latin-1
+  // and would throw for any non-Latin-1 condition value (or silently produce
+  // Latin-1 bytes for e.g. "café"), so the signature and policy would not
+  // match what S3 verifies.
   const policyStr = JSON.stringify(policy);
-  const policyBase64 = btoa(policyStr);
+  const policyBase64 = uint8ArrayToBase64(new TextEncoder().encode(policyStr));
 
   // Sign the policy
   const signingKey = await deriveSigningKey(
