@@ -1275,6 +1275,17 @@ await test("regression: redactURL redacts a relative URL's query", async () => {
     r.redactURL("https://example.com/data?token=abc&q=1"),
     "https://example.com/data?token=***&q=1",
   );
+
+  // Userinfo is a credential and must not survive in a log line.
+  for (const u of [
+    "https://alice:hunter2@example.com/data?q=1",
+    "//alice:hunter2@example.com/data?q=1",
+  ]) {
+    const redacted = r.redactURL(u);
+    assert.ok(!redacted.includes("alice"), `${u} leaked the username: ${redacted}`);
+    assert.ok(!redacted.includes("hunter2"), `${u} leaked the password: ${redacted}`);
+    assert.equal(redacted.includes("example.com/data?q=1"), true);
+  }
 });
 
 await test("regression: a structured rejection keeps its message and code", async () => {

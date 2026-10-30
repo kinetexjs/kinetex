@@ -519,7 +519,10 @@ function parseCacheControl(value: string): CacheControlDirectives {
  * Returns `null` when `Vary: *` is present — callers must treat this as "never cache".
  * Returns a deterministic string of field=value pairs for all other Vary headers.
  */
-function buildVaryKey(varyHeader: string, requestHeaders: Record<string, string>): string | null {
+export function buildVaryKey(
+  varyHeader: string,
+  requestHeaders: Record<string, string>,
+): string | null {
   if (!varyHeader) return "";
   // RFC 7231 §7.1.4: Vary: * means the response is uncacheable
   if (varyHeader.trim() === "*") return null;
@@ -1060,12 +1063,39 @@ export class HTTPCache {
 
     const key = await this._key(req);
 
+    // Replacing an existing key must not inflate the gauges or make capacity
+    // look fuller than it is. Take the old entry out of the accounting and the
+    // LRU first, so `_ensureCapacity()` sees the post-replacement size and
+    // cannot evict this very key as a side effect. If the storage write is
+    // rejected, put the old accounting back.
+    const previous = await this.storage.get(key);
+    if (previous) {
+      this.lru.remove(key);
+      this.stats.totalEntries = Math.max(0, this.stats.totalEntries - 1);
+      this.stats.totalSizeBytes = Math.max(0, this.stats.totalSizeBytes - previous.size);
+      for (const tag of previous.tags) {
+        this.tagIndex.get(tag)?.delete(key);
+      }
+    }
+
     // Evict if needed
     await this._ensureCapacity(entry.size);
 
     const stored = await this.storage.set(key, entry);
     // WebStorageAdapter returns false on quota exceeded — don't update stats if not stored
-    if (stored === false) return false;
+    if (stored === false) {
+      if (previous) {
+        this.lru.touch(key);
+        this.stats.totalEntries++;
+        this.stats.totalSizeBytes += previous.size;
+        for (const tag of previous.tags) {
+          const set = this.tagIndex.get(tag) ?? new Set<string>();
+          set.add(key);
+          this.tagIndex.set(tag, set);
+        }
+      }
+      return false;
+    }
 
     this.lru.touch(key);
     this.stats.totalEntries++;

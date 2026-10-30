@@ -275,7 +275,10 @@ await test("parseQuery parses response from kinetex", async () => {
 });
 
 await test("parseQuery repeated keys — verified via kinetex", async () => {
-  const r = await bin.get("/get", { params: { tag: ["a", "b", "c"] } });
+  const r = await bin.get("/get", {
+    params: { tag: ["a", "b", "c"] },
+    arrayFormat: "repeat",
+  });
   const url = (r.data as { url: string }).url;
   console.log("    URL with repeated keys:", url);
   const parsed = parseQuery(url.split("?")[1] || "");
@@ -1446,7 +1449,10 @@ await test("expandTemplate array with kinetex", async () => {
   const result = expandTemplate("{?ids}", { ids: ["1", "2", "3"] });
   assert.equal(result, "?ids=1,2,3", "an array must join with commas in order");
 
-  const r = await bin.get("/get", { params: { ids: ["1", "2", "3"] } });
+  const r = await bin.get("/get", {
+    params: { ids: ["1", "2", "3"] },
+    arrayFormat: "repeat",
+  });
   assert.equal(r.status, 200, "the echoed request must succeed");
   const args = (r.data as { args: Record<string, string | string[]> }).args;
   // httpbin echoes a repeated query parameter as a JSON array; the point is

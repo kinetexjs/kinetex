@@ -157,6 +157,14 @@ export class SSEParser {
    */
   feed(chunk: string): SSEEvent[] {
     const events: SSEEvent[] = [];
+    // A leading U+FEFF is a transport artifact, not part of the first field
+    // name. `TextDecoder` strips it from bytes, but callers that hand the
+    // parser a string (and a BOM split across chunks) still need it removed —
+    // otherwise "\uFEFFdata: x" is read as a field called "\uFEFFdata" and the
+    // event is dropped.
+    if (this.buffer.length === 0 && chunk.charCodeAt(0) === 0xfeff) {
+      chunk = chunk.slice(1);
+    }
     this.buffer += chunk;
 
     // Split on lines — SSE uses CRLF, LF, or CR as line endings

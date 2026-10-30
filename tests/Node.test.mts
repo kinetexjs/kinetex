@@ -2806,6 +2806,7 @@ await test("query params still build correctly without URLSearchParams", async (
     allowPrivateNetwork: true,
     timeout: T,
     params: { a: "1", b: "two words", arr: ["x", "y"] },
+    arrayFormat: "repeat",
   });
   const g = globalThis as Record<string, unknown>;
   const had = g.URLSearchParams;

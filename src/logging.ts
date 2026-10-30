@@ -739,6 +739,13 @@ export class Redactor {
   redactURL(url: string): string {
     try {
       const u = new URL(url);
+      // Userinfo is a credential too. A logger that redacts the query string
+      // but writes `https://user:pass@host/` to disk has leaked the password
+      // just as surely, so strip it before serialising.
+      if (u.username || u.password) {
+        u.username = "";
+        u.password = "";
+      }
       for (const key of [...u.searchParams.keys()]) {
         if (this.paramSet.has(key.toLowerCase())) {
           u.searchParams.set(key, "***");
@@ -752,6 +759,11 @@ export class Redactor {
 
   /** Redact the query string of a URL the `URL` constructor cannot parse. */
   private _redactRelativeQuery(url: string): string {
+    // Protocol-relative URLs (`//user:pass@host/path`) are the one relative
+    // shape that can carry userinfo.
+    url = url.replace(/^([a-z][a-z0-9+.-]*:)?\/\/[^/?#]*@/i, (_m, scheme: string | undefined) => {
+      return `${scheme ?? ""}//`;
+    });
     const q = url.indexOf("?");
     if (q === -1) return url;
     const base = url.slice(0, q);
