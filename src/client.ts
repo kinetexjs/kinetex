@@ -615,13 +615,11 @@ class HARRecorder {
       ) {
         // getEntriesByName narrows the buffer instead of scanning every resource
         // entry for each recorded request (was O(entries) per request).
-        const entries = (
-          typeof performance.getEntriesByName === "function"
-            ? performance.getEntriesByName(res.url)
-            : (performance.getEntriesByType("resource") as unknown as ResourceTimingEntry[]).filter(
-                (e) => e.name === res.url,
-              )
-        ) as unknown as ResourceTimingEntry[];
+        const entries = (typeof performance.getEntriesByName === "function"
+          ? performance.getEntriesByName(res.url)
+          : (performance.getEntriesByType("resource") as unknown as ResourceTimingEntry[]).filter(
+              (e) => e.name === res.url,
+            )) as unknown as ResourceTimingEntry[];
         // Most recent entry for this URL. Entries are startTime-ordered, so the
         // last one is the most recent — and, unlike a name-only match, we also
         // require it to be recent enough to actually belong to this request.

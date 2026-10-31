@@ -4,7 +4,8 @@
 
 // Dynamic imports for cross-runtime compatibility
 // Use globalThis to avoid static imports that fail in edge runtimes
-type NodeProcess = typeof globalThis extends { process: infer P } ? P
+type NodeProcess = typeof globalThis extends { process: infer P }
+  ? P
   : { hrtime: () => [number, number] };
 
 let _process: NodeProcess | undefined;

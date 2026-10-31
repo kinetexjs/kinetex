@@ -20,7 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Verified working on Node.js 22, Deno 2.0, Bun 1.4.4
 
-
 ## [1.5.1] - 2026-10-31
 
 The 36-finding `v1.5.0` axios-audit closed on `main` across four stacked PRs. Two findings landed this round that the audit did not catch:
