@@ -48,7 +48,7 @@
     ".": {
       "types": {
         "import": "./dist/types/mod.d.ts",
-        "require": "./dist/cjs/mod.d.ts"
+        "require": "./dist/cjs/types/mod.d.cts"
       },
       "workerd": "./dist/esm/mod.js",
       "worker": "./dist/esm/mod.js",
@@ -70,7 +70,7 @@
     "./cache": {
       "types": {
         "import": "./dist/types/cache.d.ts",
-        "require": "./dist/cjs/cache.d.ts"
+        "require": "./dist/cjs/types/cache.d.cts"
       },
       "import": "./dist/esm/cache.js",
       "require": "./dist/cjs/cache.js"
@@ -78,7 +78,7 @@
     "./sse": {
       "types": {
         "import": "./dist/types/sse.d.ts",
-        "require": "./dist/cjs/sse.d.ts"
+        "require": "./dist/cjs/types/sse.d.cts"
       },
       "import": "./dist/esm/sse.js",
       "require": "./dist/cjs/sse.js"
@@ -86,7 +86,7 @@
     "./graphql": {
       "types": {
         "import": "./dist/types/graphql.d.ts",
-        "require": "./dist/cjs/graphql.d.ts"
+        "require": "./dist/cjs/types/graphql.d.cts"
       },
       "import": "./dist/esm/graphql.js",
       "require": "./dist/cjs/graphql.js"
@@ -94,7 +94,7 @@
     "./pagination": {
       "types": {
         "import": "./dist/types/pagination.d.ts",
-        "require": "./dist/cjs/pagination.d.ts"
+        "require": "./dist/cjs/types/pagination.d.cts"
       },
       "import": "./dist/esm/pagination.js",
       "require": "./dist/cjs/pagination.js"
@@ -102,7 +102,7 @@
     "./progress": {
       "types": {
         "import": "./dist/types/progress.d.ts",
-        "require": "./dist/cjs/progress.d.ts"
+        "require": "./dist/cjs/types/progress.d.cts"
       },
       "import": "./dist/esm/progress.js",
       "require": "./dist/cjs/progress.js"
@@ -110,7 +110,7 @@
     "./logging": {
       "types": {
         "import": "./dist/types/logging.d.ts",
-        "require": "./dist/cjs/logging.d.ts"
+        "require": "./dist/cjs/types/logging.d.cts"
       },
       "import": "./dist/esm/logging.js",
       "require": "./dist/cjs/logging.js"
@@ -118,7 +118,7 @@
     "./response": {
       "types": {
         "import": "./dist/types/response.d.ts",
-        "require": "./dist/cjs/response.d.ts"
+        "require": "./dist/cjs/types/response.d.cts"
       },
       "import": "./dist/esm/response.js",
       "require": "./dist/cjs/response.js"
@@ -126,7 +126,7 @@
     "./headers": {
       "types": {
         "import": "./dist/types/headers.d.ts",
-        "require": "./dist/cjs/headers.d.ts"
+        "require": "./dist/cjs/types/headers.d.cts"
       },
       "import": "./dist/esm/headers.js",
       "require": "./dist/cjs/headers.js"
@@ -134,7 +134,7 @@
     "./url": {
       "types": {
         "import": "./dist/types/url.d.ts",
-        "require": "./dist/cjs/url.d.ts"
+        "require": "./dist/cjs/types/url.d.cts"
       },
       "import": "./dist/esm/url.js",
       "require": "./dist/cjs/url.js"
@@ -142,7 +142,7 @@
     "./aws-sigv4": {
       "types": {
         "import": "./dist/types/aws-sigv4.d.ts",
-        "require": "./dist/cjs/aws-sigv4.d.ts"
+        "require": "./dist/cjs/types/aws-sigv4.d.cts"
       },
       "import": "./dist/esm/aws-sigv4.js",
       "require": "./dist/cjs/aws-sigv4.js"
@@ -150,7 +150,7 @@
     "./socks5": {
       "types": {
         "import": "./dist/types/socks5.d.ts",
-        "require": "./dist/cjs/socks5.d.ts"
+        "require": "./dist/cjs/types/socks5.d.cts"
       },
       "import": "./dist/esm/socks5.js",
       "require": "./dist/cjs/socks5.js"
@@ -158,7 +158,7 @@
     "./cookiejar": {
       "types": {
         "import": "./dist/types/cookiejar.d.ts",
-        "require": "./dist/cjs/cookiejar.d.ts"
+        "require": "./dist/cjs/types/cookiejar.d.cts"
       },
       "import": "./dist/esm/cookiejar.js",
       "require": "./dist/cjs/cookiejar.js"
@@ -166,7 +166,7 @@
     "./circuit-breaker": {
       "types": {
         "import": "./dist/types/circuit-breaker.d.ts",
-        "require": "./dist/cjs/circuit-breaker.d.ts"
+        "require": "./dist/cjs/types/circuit-breaker.d.cts"
       },
       "import": "./dist/esm/circuit-breaker.js",
       "require": "./dist/cjs/circuit-breaker.js"
@@ -174,7 +174,7 @@
     "./dedup": {
       "types": {
         "import": "./dist/types/dedup.d.ts",
-        "require": "./dist/cjs/dedup.d.ts"
+        "require": "./dist/cjs/types/dedup.d.cts"
       },
       "import": "./dist/esm/dedup.js",
       "require": "./dist/cjs/dedup.js"
@@ -182,7 +182,7 @@
     "./digest": {
       "types": {
         "import": "./dist/types/digest.d.ts",
-        "require": "./dist/cjs/digest.d.ts"
+        "require": "./dist/cjs/types/digest.d.cts"
       },
       "import": "./dist/esm/digest.js",
       "require": "./dist/cjs/digest.js"
@@ -190,7 +190,7 @@
     "./ws": {
       "types": {
         "import": "./dist/types/ws.d.ts",
-        "require": "./dist/cjs/ws.d.ts"
+        "require": "./dist/cjs/types/ws.d.cts"
       },
       "import": "./dist/esm/ws.js",
       "require": "./dist/cjs/ws.js"
@@ -198,7 +198,7 @@
     "./lifecycle": {
       "types": {
         "import": "./dist/types/lifecycle.d.ts",
-        "require": "./dist/cjs/lifecycle.d.ts"
+        "require": "./dist/cjs/types/lifecycle.d.cts"
       },
       "import": "./dist/esm/lifecycle.js",
       "require": "./dist/cjs/lifecycle.js"
@@ -206,7 +206,7 @@
     "./interceptors": {
       "types": {
         "import": "./dist/types/interceptors.d.ts",
-        "require": "./dist/cjs/interceptors.d.ts"
+        "require": "./dist/cjs/types/interceptors.d.cts"
       },
       "import": "./dist/esm/interceptors.js",
       "require": "./dist/cjs/interceptors.js"
@@ -214,7 +214,7 @@
     "./core": {
       "types": {
         "import": "./dist/types/core.d.ts",
-        "require": "./dist/cjs/core.d.ts"
+        "require": "./dist/cjs/types/core.d.cts"
       },
       "import": "./dist/esm/core.js",
       "require": "./dist/cjs/core.js"
@@ -222,7 +222,7 @@
     "./cookie-parser": {
       "types": {
         "import": "./dist/types/cookie-parser.d.ts",
-        "require": "./dist/cjs/cookie-parser.d.ts"
+        "require": "./dist/cjs/types/cookie-parser.d.cts"
       },
       "import": "./dist/esm/cookie-parser.js",
       "require": "./dist/cjs/cookie-parser.js"
