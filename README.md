@@ -30,6 +30,7 @@ Works in **Node.js 22+** (LTS lines: 22, 24, 26), **Deno**, **Bun**, **browsers*
 ## Table of Contents
 
 - [Installation](#installation)
+- [Migrating from 1.4.x](#migrating-from-14x)
 - [Quick Start](#quick-start)
 - [Client Configuration](#client-configuration)
 - [Basic HTTP Methods](#basic-http-methods)
@@ -100,6 +101,37 @@ bun add kinetex
 ```ts
 import { kinetex } from "jsr:@kinetexjs/kinetex";
 ```
+
+---
+
+## Migrating from 1.4.x
+
+1.5.0 contains three breaking changes. Each has a one-line opt-out, so none of them requires you to change anything unless the new default breaks you.
+
+**`maxResponseSize` now defaults to 100 MB** instead of unlimited. The body is read in full before you see any of it, so an unbounded default let a single response exhaust the heap. If you legitimately receive responses over 100 MB:
+
+```ts
+kinetex({ maxResponseSize: 0 }); // 0 has always meant "no limit"
+```
+
+**`totalTimeoutMs` now defaults to the effective `timeout`.** `timeout` bounds one attempt, and the backoff between attempts was not bounded by anything — `timeout: 1_000` with `maxRetries: 5` could hold the caller for roughly 37 seconds. The whole-request ceiling now defaults to `timeout`, so if you were relying on retries outliving `timeout`, raise it or remove it:
+
+```ts
+kinetex({ timeout: 1_000, totalTimeoutMs: 0 }); // unbounded retries, as in 1.4.x
+```
+
+**`URLBuilderOptions` is removed.** It was exported from `kinetex/url` but no constructor, factory or method accepted it, so it could never have been passed anywhere. If you imported the name as a type, drop it — `from()` takes a base URL directly, and `sortParams` is a real method.
+
+Behaviour changes that are not breaking, but will change what you observe:
+
+- A request carrying an `Idempotency-Key` is now retried whatever its method. An unkeyed POST is still attempted exactly once.
+- `Cache-Control: private` responses are no longer cached. This cache is a `Map` in your process, shared across every request it makes, so storing a per-user response served it to whoever asked next. `honorCacheControl: false` opts out.
+- `SameSite=Lax` and `SameSite=Strict` cookies are now sent. The client stated no SameSite context, which by design sends only `Unset` and `None`, so most real sessions were going out without their cookie.
+- A 307/308 redirect carrying a stream or `Blob` body is now refused with a clear `EVALIDATION` rather than failing later as an opaque `ENETWORK`. Those methods preserve the body, and a one-shot body is spent after the first attempt. 301/302/303 are unaffected — they downgrade to GET.
+- A `WebSocket.send()` on a socket that is not OPEN, with `bufferMessages: false`, now reports through `onError` instead of dropping the message silently.
+- A caller-supplied `fetch` is exempt from the pre-flight DNS screen and owns its own resolution. The lexical screen still applies to the initial URL and every redirect hop.
+
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full list, including the defects this release fixes.
 
 ---
 

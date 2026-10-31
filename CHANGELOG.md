@@ -5,22 +5,6 @@ All notable changes to kinetex will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-##[Unreleased]
-
-- Added .d.cts type declarations and fix browser bundle node: imports
-- Generate .d.cts files in dist/cjs/types/ for proper CJS TypeScript support (KX-01-04)
-- Post-process browser bundles to replace node:* imports with browser-shim code
-- Update package.json exports to reference .d.cts files for CJS type imports
-- Browser bundles now work correctly in browsers without node: protocol errors
-
-### Fixed
-
-- TypeScript CJS consumers got wrong type inference
-- Browser bundles failed with 'Cannot find module node:http' errors
-
-Verified working on Node.js 22, Deno 2.0, Bun 1.4.4
-
-
 ## [1.5.1] - 2026-10-31
 
 The 36-finding `v1.5.0` axios-audit closed on `main` across four stacked PRs. Two findings landed this round that the audit did not catch:

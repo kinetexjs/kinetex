@@ -93,15 +93,6 @@ import {
   type RawResponse,
 } from "./core.ts";
 
-/** A resource-timing entry: the fetch timing fields the breakdown reads. */
-interface ResourceTimingEntry {
-  name: string;
-  startTime: number;
-  requestStart: number;
-  responseStart: number;
-  responseEnd: number;
-}
-
 /**
  * Hard ceiling on redirect hops followed by the manual redirect follower.
  * Overridable per client / per request with `maxRedirects`.
@@ -618,10 +609,10 @@ class HARRecorder {
         const entries = (
           typeof performance.getEntriesByName === "function"
             ? performance.getEntriesByName(res.url)
-            : (performance.getEntriesByType("resource") as unknown as ResourceTimingEntry[]).filter(
+            : (performance.getEntriesByType("resource") as PerformanceResourceTiming[]).filter(
                 (e) => e.name === res.url,
               )
-        ) as unknown as ResourceTimingEntry[];
+        ) as PerformanceResourceTiming[];
         // Most recent entry for this URL. Entries are startTime-ordered, so the
         // last one is the most recent — and, unlike a name-only match, we also
         // require it to be recent enough to actually belong to this request.
