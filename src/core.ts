@@ -1440,7 +1440,15 @@ export class NodeHTTP2Transport implements Transport {
       //
       // The tunnel is already TLS-wrapped for an https origin, which is
       // exactly what https.Agent expects createConnection to return.
-      agent.createConnection = ((
+      //
+      // `Agent` in @types/node does not declare the createConnection seam this
+      // code assigns (it is internal to the runtime), so the instance is cast
+      // to a structural type that declares it.
+      type ProxiedCreateConnection = (
+        opts: import("node:tls").ConnectionOptions & { protocol?: string },
+        oncreate: (err: Error | null, socket?: import("node:net").Socket) => void,
+      ) => void;
+      (agent as unknown as { createConnection: ProxiedCreateConnection }).createConnection = (
         opts: import("node:tls").ConnectionOptions & { protocol?: string },
         oncreate: (err: Error | null, socket?: import("node:net").Socket) => void,
       ) => {
@@ -1464,7 +1472,7 @@ export class NodeHTTP2Transport implements Transport {
           (err: Error) => oncreate(err),
         );
         return undefined;
-      }) as unknown as typeof import("node:https").Agent.prototype.createConnection;
+      };
     }
     return agent;
   }

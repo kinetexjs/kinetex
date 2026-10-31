@@ -21,6 +21,14 @@
 import { KinetexError } from "./types.ts";
 import type { ProxyConfig } from "./types.ts";
 
+// Node's Buffer via `globalThis` — no bare global and no static `node:` import,
+// so the browser bundle (which aliases `node:` imports to shims) is unaffected.
+const g = globalThis as {
+  Buffer?: {
+    from: (bytes: Uint8Array | string, encoding?: string) => { toString(encoding: string): string };
+  };
+};
+
 /**
  * True when `host` is an IPv4/IPv6 literal rather than a DNS name.
  *
@@ -78,7 +86,7 @@ function proxyAuthHeader(proxy: ProxyConfig): string | undefined {
     typeof globalThis.btoa === "function"
       ? globalThis.btoa(binary)
       : // Node without btoa (or a non-Latin1 username) — encode explicitly.
-        Buffer.from(bytes).toString("base64");
+        g.Buffer!.from(bytes).toString("base64");
   return `Basic ${b64}`;
 }
 
@@ -221,7 +229,7 @@ export async function connectThroughProxy(
       // drained and `readable` will fire again when more arrives.
       const drain = (): void => {
         for (;;) {
-          const chunk = baseSocket.read() as Buffer | null;
+          const chunk = baseSocket.read() as { toString(encoding: string): string } | null;
           if (chunk === null) return;
           head += chunk.toString("latin1");
         }
@@ -263,7 +271,7 @@ export async function connectThroughProxy(
           // handing the socket on. latin1 round-trips the bytes exactly, which
           // is how `head` was built.
           const tail = head.slice(end + 4);
-          if (tail.length > 0) baseSocket.unshift(Buffer.from(tail, "latin1"));
+          if (tail.length > 0) baseSocket.unshift(g.Buffer!.from(tail, "latin1"));
           resolve({ ok: true });
           return;
         }
