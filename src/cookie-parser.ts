@@ -2233,10 +2233,13 @@ export function formatSetCookieHeader(cookie: ParsedCookie): string {
     cookie.value.includes(";") ||
     cookie.value.includes(",") ||
     cookie.value.includes(" ") ||
-    cookie.value.includes('"')
+    cookie.value.includes('"') ||
+    cookie.value.includes("\\")
   ) {
-    // Quote value if it contains special characters
-    parts.push(`${cookie.name}="${cookie.value.replace(/"/g, '\\"')}"`);
+    // Quote value if it contains special characters. RFC 6265 §4.1:
+    // a quoted-value may contain DQUOTE and backslash only as escape
+    // sequences, so both the quote and the backslash must be escaped.
+    parts.push(`${cookie.name}="${cookie.value.replace(/([\\"])/g, "\\$1")}"`);
   } else {
     parts.push(`${cookie.name}=${cookie.value}`);
   }
@@ -2406,7 +2409,8 @@ export function splitSetCookieHeaders(raw: string): string[] {
       // `a=1; Expires=Thu`, silently losing its expiry, and a collapsed
       // two-cookie header was shredded into fragments such as
       // `01 Jan 2099 00:00:00 GMT; Path=/; HttpOnly`.
-      if (!startsNewCookie(raw, i + 1)) {
+      const newCookie = startsNewCookie(raw, i + 1);
+      if (!newCookie) {
         buffer += char;
         i++;
         continue;

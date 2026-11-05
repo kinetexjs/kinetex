@@ -895,6 +895,10 @@ function encodeValue(
     return named ? `${name}=${joined}` : joined;
   }
 
+  // After the scalar and array checks above, `value` is one of
+  // `Record<string, string>`, `null`, or `undefined`. `typeof` reports
+  // `"object"` for both `null` and the record, and the record is the only
+  // object shape left in `TemplateVars`, so `value !== null` narrows to it.
   if (typeof value === "object" && value !== null) {
     const entries = Object.entries(value as Record<string, string>);
     if (entries.length === 0) return null;
