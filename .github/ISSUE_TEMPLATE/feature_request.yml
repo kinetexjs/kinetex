@@ -1,0 +1,104 @@
+name: Feature Request
+description: Suggest a new feature or improvement for kinetex
+title: "[Feature] "
+labels: ["enhancement", "needs-triage"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Please describe the problem you're trying to solve and your proposed solution.
+
+  - type: dropdown
+    id: module
+    attributes:
+      label: Affected Module(s)
+      description: Which part of kinetex does this feature relate to?
+      multiple: true
+      options:
+        - Client / FluentRequest
+        - Transport (HTTP/1.1 / HTTP/2 / HTTP/3)
+        - Interceptors / Lifecycle Hooks
+        - Cache
+        - Cookie Jar
+        - SSE / Streaming
+        - WebSocket
+        - GraphQL
+        - Pagination
+        - Progress Tracking
+        - Auth (new auth scheme)
+        - Proxy (SOCKS5 / HTTP)
+        - Circuit Breaker
+        - Request Deduplication
+        - HAR / Logging / OpenTelemetry
+        - URL Builder / Headers
+        - Response Parsing
+        - New Runtime Support
+        - Build / Release
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What problem does this feature solve? What pain point are you experiencing?
+      placeholder: "I always have to write boilerplate code for X because kinetex doesn't support Y."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the API, behavior, or configuration you'd like to see.
+      placeholder: |
+        ```typescript
+        const client = kinetex({
+          // new config option
+          experimental: { enableHTTP3: true }
+        });
+        ```
+      render: typescript
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Other approaches or workarounds you've thought about.
+      placeholder: "I considered using X instead, but it has limitations because..."
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: How important is this feature to you?
+      options:
+        - Critical (blocking my project)
+        - High (significant improvement)
+        - Medium (nice to have)
+        - Low (would be nice eventually)
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission Checklist
+      options:
+        - label: I have searched existing issues and feature requests for duplicates
+          required: true
+        - label: I have checked the documentation and README
+          required: true
+        - label: I am willing to contribute a PR for this feature
+          required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Links to prior art, other libraries with this feature, use cases, etc.

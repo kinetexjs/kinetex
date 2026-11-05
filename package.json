@@ -1,0 +1,288 @@
+{
+  "name": "kinetex",
+  "version": "1.5.1",
+  "description": "Feature-rich, universal TypeScript HTTP client.",
+  "author": "kinetexjs",
+  "license": "MIT",
+  "homepage": "https://github.com/kinetexjs/kinetex",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kinetexjs/kinetex.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kinetexjs/kinetex/issues"
+  },
+  "keywords": [
+    "http",
+    "http2",
+    "fetch",
+    "client",
+    "graphql",
+    "sse",
+    "pagination",
+    "retry",
+    "interceptors",
+    "aws",
+    "sigv4",
+    "socks5",
+    "proxy",
+    "cache",
+    "cookie",
+    "websocket",
+    "circuit-breaker",
+    "dedup",
+    "opentelemetry",
+    "otel"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./dist/cjs/mod.js",
+  "module": "./dist/esm/mod.js",
+  "browser": "./dist/browser/kinetex.esm.js",
+  "unpkg": "./dist/browser/kinetex.min.js",
+  "jsdelivr": "./dist/browser/kinetex.min.js",
+  "types": "./dist/types/mod.d.ts",
+  "exports": {
+    ".": {
+      "types": {
+        "import": "./dist/types/mod.d.ts",
+        "require": "./dist/cjs/types/mod.d.cts"
+      },
+      "workerd": "./dist/esm/mod.js",
+      "worker": "./dist/esm/mod.js",
+      "browser": "./dist/browser/kinetex.esm.js",
+      "deno": "./dist/esm/mod.js",
+      "bun": "./dist/esm/mod.js",
+      "import": "./dist/esm/mod.js",
+      "require": "./dist/cjs/mod.js"
+    },
+    "./worker": {
+      "types": "./dist/types/worker.d.ts",
+      "import": "./dist/esm/worker.js"
+    },
+    "./browser": {
+      "types": "./dist/types/mod.d.ts",
+      "import": "./dist/browser/kinetex.esm.js",
+      "script": "./dist/browser/kinetex.min.js"
+    },
+    "./cache": {
+      "types": {
+        "import": "./dist/types/cache.d.ts",
+        "require": "./dist/cjs/types/cache.d.cts"
+      },
+      "import": "./dist/esm/cache.js",
+      "require": "./dist/cjs/cache.js"
+    },
+    "./sse": {
+      "types": {
+        "import": "./dist/types/sse.d.ts",
+        "require": "./dist/cjs/types/sse.d.cts"
+      },
+      "import": "./dist/esm/sse.js",
+      "require": "./dist/cjs/sse.js"
+    },
+    "./graphql": {
+      "types": {
+        "import": "./dist/types/graphql.d.ts",
+        "require": "./dist/cjs/types/graphql.d.cts"
+      },
+      "import": "./dist/esm/graphql.js",
+      "require": "./dist/cjs/graphql.js"
+    },
+    "./pagination": {
+      "types": {
+        "import": "./dist/types/pagination.d.ts",
+        "require": "./dist/cjs/types/pagination.d.cts"
+      },
+      "import": "./dist/esm/pagination.js",
+      "require": "./dist/cjs/pagination.js"
+    },
+    "./progress": {
+      "types": {
+        "import": "./dist/types/progress.d.ts",
+        "require": "./dist/cjs/types/progress.d.cts"
+      },
+      "import": "./dist/esm/progress.js",
+      "require": "./dist/cjs/progress.js"
+    },
+    "./logging": {
+      "types": {
+        "import": "./dist/types/logging.d.ts",
+        "require": "./dist/cjs/types/logging.d.cts"
+      },
+      "import": "./dist/esm/logging.js",
+      "require": "./dist/cjs/logging.js"
+    },
+    "./response": {
+      "types": {
+        "import": "./dist/types/response.d.ts",
+        "require": "./dist/cjs/types/response.d.cts"
+      },
+      "import": "./dist/esm/response.js",
+      "require": "./dist/cjs/response.js"
+    },
+    "./headers": {
+      "types": {
+        "import": "./dist/types/headers.d.ts",
+        "require": "./dist/cjs/types/headers.d.cts"
+      },
+      "import": "./dist/esm/headers.js",
+      "require": "./dist/cjs/headers.js"
+    },
+    "./url": {
+      "types": {
+        "import": "./dist/types/url.d.ts",
+        "require": "./dist/cjs/types/url.d.cts"
+      },
+      "import": "./dist/esm/url.js",
+      "require": "./dist/cjs/url.js"
+    },
+    "./aws-sigv4": {
+      "types": {
+        "import": "./dist/types/aws-sigv4.d.ts",
+        "require": "./dist/cjs/types/aws-sigv4.d.cts"
+      },
+      "import": "./dist/esm/aws-sigv4.js",
+      "require": "./dist/cjs/aws-sigv4.js"
+    },
+    "./socks5": {
+      "types": {
+        "import": "./dist/types/socks5.d.ts",
+        "require": "./dist/cjs/types/socks5.d.cts"
+      },
+      "import": "./dist/esm/socks5.js",
+      "require": "./dist/cjs/socks5.js"
+    },
+    "./cookiejar": {
+      "types": {
+        "import": "./dist/types/cookiejar.d.ts",
+        "require": "./dist/cjs/types/cookiejar.d.cts"
+      },
+      "import": "./dist/esm/cookiejar.js",
+      "require": "./dist/cjs/cookiejar.js"
+    },
+    "./circuit-breaker": {
+      "types": {
+        "import": "./dist/types/circuit-breaker.d.ts",
+        "require": "./dist/cjs/types/circuit-breaker.d.cts"
+      },
+      "import": "./dist/esm/circuit-breaker.js",
+      "require": "./dist/cjs/circuit-breaker.js"
+    },
+    "./dedup": {
+      "types": {
+        "import": "./dist/types/dedup.d.ts",
+        "require": "./dist/cjs/types/dedup.d.cts"
+      },
+      "import": "./dist/esm/dedup.js",
+      "require": "./dist/cjs/dedup.js"
+    },
+    "./digest": {
+      "types": {
+        "import": "./dist/types/digest.d.ts",
+        "require": "./dist/cjs/types/digest.d.cts"
+      },
+      "import": "./dist/esm/digest.js",
+      "require": "./dist/cjs/digest.js"
+    },
+    "./ws": {
+      "types": {
+        "import": "./dist/types/ws.d.ts",
+        "require": "./dist/cjs/types/ws.d.cts"
+      },
+      "import": "./dist/esm/ws.js",
+      "require": "./dist/cjs/ws.js"
+    },
+    "./lifecycle": {
+      "types": {
+        "import": "./dist/types/lifecycle.d.ts",
+        "require": "./dist/cjs/types/lifecycle.d.cts"
+      },
+      "import": "./dist/esm/lifecycle.js",
+      "require": "./dist/cjs/lifecycle.js"
+    },
+    "./interceptors": {
+      "types": {
+        "import": "./dist/types/interceptors.d.ts",
+        "require": "./dist/cjs/types/interceptors.d.cts"
+      },
+      "import": "./dist/esm/interceptors.js",
+      "require": "./dist/cjs/interceptors.js"
+    },
+    "./core": {
+      "types": {
+        "import": "./dist/types/core.d.ts",
+        "require": "./dist/cjs/types/core.d.cts"
+      },
+      "import": "./dist/esm/core.js",
+      "require": "./dist/cjs/core.js"
+    },
+    "./cookie-parser": {
+      "types": {
+        "import": "./dist/types/cookie-parser.d.ts",
+        "require": "./dist/cjs/types/cookie-parser.d.cts"
+      },
+      "import": "./dist/esm/cookie-parser.js",
+      "require": "./dist/cjs/cookie-parser.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "lint-staged": {
+    "*.{ts,mts}": [
+      "prettier --check",
+      "bash -c 'tsc -p tsconfig.check.json --noEmit'"
+    ],
+    "*.{json,md,yml,yaml}": [
+      "prettier --check"
+    ]
+  },
+  "scripts": {
+    "build": "tsx scripts/build.ts",
+    "rebuild": "npm run clean && npm run build",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "clean": "node -e \"import('node:fs').then(f=>f.default.rmSync('dist',{recursive:true,force:true}))\"",
+    "test": "tsx --test --test-concurrency=1 $(find tests -maxdepth 1 -name '*.test.mts' ! -name 'perf.test.mts' | tr '\n' ' ')",
+    "test:all": "tsx --test --test-concurrency=1 $(find tests -maxdepth 1 -name '*.test.mts' ! -name 'perf.test.mts' | tr '\\n' ' ')",
+    "perf": "tsx tests/perf.test.mts",
+    "node:battle": "tsx tests/Node.test.mts",
+    "deno:battle": "deno run --allow-net --allow-env --allow-read --allow-sys tests/runtime/deno/Deno.test.mts",
+    "bun:battle": "bun tests/runtime/bun/Bun.test.mts",
+    "lint": "tsc -p tsconfig.check.json --noEmit",
+    "prepublishOnly": "npm run clean && npm run build",
+    "release": "tsx scripts/release.ts",
+    "release:minor": "tsx scripts/release.ts minor",
+    "release:major": "tsx scripts/release.ts major",
+    "coverage": "c8 --exclude='dist/**' --report-dir=coverage --reporter=lcov --reporter=text node --import tsx --test --test-concurrency=1 --test-reporter=spec $(find tests -maxdepth 1 -name '*.test.mts' ! -name 'perf.test.mts' | tr '\\n' ' ')",
+    "coverage:summary": "c8 --exclude='dist/**' --report-dir=coverage --reporter=text-summary node --import tsx --test --test-concurrency=1 $(find tests -maxdepth 1 -name '*.test.mts' ! -name 'perf.test.mts' | tr '\\n' ' ')",
+    "type-coverage": "type-coverage --strict -p tsconfig.check.json",
+    "docs": "typedoc",
+    "prepare": "husky || true",
+    "typecheck:tests": "tsx scripts/typecheck-tests.ts",
+    "typecheck:all": "npm run typecheck && npm run typecheck:tests"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.6",
+    "c8": "^12.0.0",
+    "esbuild": "^0.28.2",
+    "husky": "^9.1.0",
+    "lint-staged": "^17.5.1",
+    "prettier": "3.9.6",
+    "tsx": "^4.23.13",
+    "type-coverage": "^2.30.1",
+    "typedoc": "^0.28.20",
+    "typedoc-plugin-markdown": "^4.13.0",
+    "typescript": "^5.8.3"
+  },
+  "overrides": {
+    "markdown-it": "^14.3.1"
+  }
+}

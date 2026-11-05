@@ -1,0 +1,321 @@
+name: CI / CD
+
+on:
+  push:
+    branches: [main, master, develop]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master, develop]
+  schedule:
+    # Run tests every night at 02:00 UTC to catch upstream API changes
+    - cron: "0 2 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  DENO_VERSION: "v2.x"
+  BUN_VERSION: "latest"
+
+defaults:
+  run:
+    shell: bash
+
+# ── JOB 1 — Type-Check (Node + Deno) ──────────────────────────
+
+jobs:
+  typecheck:
+    name: TypeScript strict check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Deno check
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      - run: deno task check
+
+      - name: TSC strict check
+        run: npm run typecheck
+
+      - name: Test suite type ratchet
+        # tsconfig.check.json only covers src/, so a type error in the ~61k
+        # lines under tests/ used to be invisible. This fails when the count
+        # rises above the committed baseline; the backlog only shrinks.
+        run: npm run typecheck:tests
+
+      - name: Type coverage
+        run: npx type-coverage --strict -p tsconfig.check.json
+
+  # ── JOB 2 — Lint ──────────────────────────────────────────────
+
+  lint:
+    name: Lint (Deno)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      - run: deno lint
+
+      # prettier, not `deno fmt`. The two disagree — `deno fmt --check src/`
+      # wanted to rewrite 26 of 27 files — and this repository is formatted with
+      # prettier (`.prettierrc`, and the lint-staged hook). Running two
+      # formatters where one does not apply is how the check became decorative.
+      # This is repo-wide; lint-staged only ever saw staged files.
+      #
+      # `npm ci` first, or `npx` resolves prettier from the registry and checks
+      # the tree against whatever is newest — it installed 3.9.10 against the
+      # pinned 3.9.6 and failed the job on formatting the pinned version is
+      # happy with. The gate was reporting a formatter upgrade, not a defect,
+      # and it would do so on every commit including main.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Check formatting
+        run: npx prettier --check "**/*.{ts,mts,json,md,yml,yaml}"
+
+  # ── JOB 3 — Security Audit ────────────────────────────────────
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      # Blocking, and scoped to `--omit=dev` on purpose. This package has no
+      # runtime dependencies at all, so `--omit=dev` audits exactly the code a
+      # consumer installs — currently zero third-party packages, and any future
+      # one added by mistake. That is the audit that can be held to a hard
+      # gate, because it can pass.
+      #
+      # The full audit below it includes devDependencies and cannot be blocking:
+      # `type-coverage` reaches `braces` through `fast-glob`, and GHSA-vfj7-8cjw
+      # affects every published version of `braces`, so there is no fix to
+      # upgrade to. A ReDoS in a file-globbing linter that only runs in CI is
+      # not a vulnerability in the published library, but it must stay visible
+      # so a *new* dev advisory is noticed.
+      - name: npm audit (shipped dependencies)
+        run: npm audit --omit=dev --audit-level=low
+
+      - name: npm audit (full, informational)
+        run: npm audit || echo "::warning::devDependency advisories present; see the comment above on braces/type-coverage"
+
+      - name: Gitleaks secret scan
+        run: |
+          # gitleaks renamed its release assets from `linux_amd64` to
+          # `linux_x64`. The old URL 404s, `tar` fails on the empty body, and
+          # the job exits 2 — which is a red check, but the secret scan never
+          # ran. A security gate that cannot start is worse than no gate,
+          # because it reads as covered. Verified against the v8.24.3 release
+          # asset list before pinning.
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar xz
+          sudo mv gitleaks /usr/local/bin/
+          gitleaks detect --source . --redact -v --report-format sarif --report-path gitleaks-report.sarif
+
+  # ── JOB 4 — Tests (Node.js — Matrix: Node versions × OS) ─────
+
+  unit-node:
+    name: Tests / Node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: [typecheck, lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        # Only supported lines. Node 18 (EOL Apr 2025) and 20 (EOL Apr 2026)
+        # receive no upstream security patches, so testing them would imply a
+        # support promise for runtimes that cannot be patched — the opposite of
+        # what this library is for. `engines` in package.json enforces the same
+        # floor at install time.
+        node: ["22", "24", "26"]
+        os: [ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run all tests
+        run: npm run test:all
+
+      - name: Coverage report
+        if: matrix.node == '22' && matrix.os == 'ubuntu-latest'
+        run: npm run coverage
+
+      - name: Upload coverage to Codecov
+        if: matrix.node == '22' && matrix.os == 'ubuntu-latest'
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info
+          flags: unittests,integration
+          name: kinetex-coverage
+          fail_ci_if_error: false
+          verbose: true
+
+  # ── JOB 5 — Performance / load benchmarks ──────────────────────────
+  # Excluded from `test:all` because its timing assertions would make the main
+  # suite flaky — but that left it with no runner at all, so the correctness
+  # assertions in it (most of the file) ran nowhere. Its own job keeps a
+  # benchmark failure from also cancelling the coverage upload in unit-node.
+
+  perf:
+    name: Perf / load benchmarks
+    runs-on: ubuntu-latest
+    needs: [typecheck, lint]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run performance benchmarks
+        run: npm run perf
+        timeout-minutes: 10
+
+  # ── JOB 6 — Tests (Deno) ──────────────────────────────────────
+
+  unit-deno:
+    name: Tests / Deno
+    runs-on: ubuntu-latest
+    needs: [typecheck, lint]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      - name: Run Deno battle tests
+        run: deno run --allow-net --allow-env --allow-read --allow-sys tests/runtime/deno/Deno.test.mts
+
+      - name: Run Deno cross-runtime tests
+        run: deno run --allow-net --allow-env --allow-read --allow-sys tests/runtime/deno/cross-runtime-deno.test.mts
+
+  # ── JOB 6 — Tests (Bun) ───────────────────────────────────────
+
+  unit-bun:
+    name: Tests / Bun
+    runs-on: ubuntu-latest
+    needs: [typecheck, lint]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - run: bun install
+
+      - name: Run Bun battle tests
+        run: bun tests/runtime/bun/Bun.test.mts
+
+      - name: Run Bun cross-runtime tests
+        run: bun tests/runtime/bun/cross-runtime-bun.test.mts
+
+  # ── JOB 7 — Nightly Regression ────────────────────────────────
+
+  nightly-regression:
+    name: Nightly regression
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    # Must exceed the sum of the per-step budgets below (15 + 5 + 5 + 15 + 5 +
+    # 5 + 5 = 55). At 20 the job was cancelled partway through its own schedule,
+    # so the steps after the first slow one could never report — the per-step
+    # timeouts were unreachable and the nightly's coverage depended on which
+    # test happened to be quick.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run Node standard tests
+        run: npm run test:all
+        timeout-minutes: 15
+
+      - name: Run Node battle tests
+        run: npx tsx tests/Node.test.mts
+        timeout-minutes: 5
+
+      - name: Run Node cross-runtime tests
+        run: npx tsx tests/cross-runtime-node.test.mts
+        timeout-minutes: 5
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      - name: Run Deno battle tests
+        run: deno run --allow-net --allow-env --allow-read --allow-sys tests/runtime/deno/Deno.test.mts
+        timeout-minutes: 15
+
+      - name: Run Deno cross-runtime tests
+        run: deno run --allow-net --allow-env --allow-read --allow-sys tests/runtime/deno/cross-runtime-deno.test.mts
+        timeout-minutes: 5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Run Bun battle tests
+        run: bun tests/runtime/bun/Bun.test.mts
+        timeout-minutes: 5
+
+      - name: Run Bun cross-runtime tests
+        run: bun tests/runtime/bun/cross-runtime-bun.test.mts
+        timeout-minutes: 5
+
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v9
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `Nightly regression failed — ${new Date().toISOString().slice(0, 10)}`,
+              body:  `Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['regression', 'ci'],
+            });

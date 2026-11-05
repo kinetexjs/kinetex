@@ -1,0 +1,32 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/mod.ts"],
+  "tsconfig": "tsconfig.check.json",
+  "out": "docs",
+  "name": "kinetex",
+  "includeVersion": true,
+  "excludeInternal": true,
+  "excludePrivate": true,
+  "excludeNotDocumented": false,
+  "hideGenerator": true,
+  "githubPages": true,
+  "readme": "README.md",
+  "sort": ["source-order", "static-first"],
+  "categorizeByGroup": true,
+  "searchInComments": true,
+  "validation": {
+    "notExported": false,
+    "invalidLink": true,
+    "notDocumented": false
+  },
+  "plugin": [],
+  "sidebarLinks": {
+    "GitHub": "https://github.com/kinetexjs/kinetex",
+    "npm": "https://www.npmjs.com/package/kinetex",
+    "JSR": "https://jsr.io/@kinetexjs/kinetex"
+  },
+  "navigation": {
+    "includeCategories": true,
+    "includeGroups": true
+  }
+}

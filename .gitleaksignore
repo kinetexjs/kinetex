@@ -1,0 +1,18 @@
+# Two findings from the published 1.0.0-rc.1 commit, predating the secret scan
+# being able to run at all (see the note in .gitleaks.toml and ci.yml).
+#
+# The value is AWS's documented dummy session token — a placeholder, not a
+# credential — but it failed the gate on every branch including main. Rewriting
+# published history to drop a placeholder is not a trade worth making, so the two
+# findings are named precisely instead: commit, path, rule and line, which is
+# what a fingerprint is.
+#
+# The value has since been replaced with an obvious placeholder in the working
+# tree, and the Scoped line in this file reflects the original in that commit.
+# These entries suppress those two historic occurrences only. The same value
+# reintroduced today carries a different commit and a different line, so it is
+# still caught.
+#
+#   Scoped
+504cdf418ec70fb412c3772d262bde91d3082af4:tests/awssigv4.test.mts:generic-api-key:140
+504cdf418ec70fb412c3772d262bde91d3082af4:tests/awssigv4.test.mts:generic-api-key:144

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question / Discussion
+    url: https://github.com/kinetexjs/kinetex/discussions
+    about: For questions and general discussion, please use GitHub Discussions.
+  - name: Security Vulnerability
+    url: https://github.com/kinetexjs/kinetex/security/advisories/new
+    about: Please report security vulnerabilities via GitHub Security Advisory.
+  - name: kinetex Documentation
+    url: https://github.com/kinetexjs/kinetex#readme
+    about: Check the README for usage examples and API docs.
