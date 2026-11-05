@@ -811,14 +811,17 @@ export class Redactor {
   } {
     const shouldLog = isResponse ? this.logResBody : this.logReqBody;
 
+    // `body` is truthy here except for `null`/`""`/`undefined`, and all three
+    // carry no bytes, so `size` is `null` in exactly the cases the guard
+    // admits.
     if (!shouldLog || !body) {
-      return { body: null, size: body ? bodySize(body) : null };
+      return { body: null, size: body === null ? null : bodySize(body) };
     }
 
     const ct = contentType ?? "";
     const allowed = this.allowedTypes.some((t) => ct.startsWith(t));
     if (!allowed) {
-      return { body: `[${ct || "binary"}]`, size: body ? bodySize(body) : null };
+      return { body: `[${ct || "binary"}]`, size: bodySize(body) };
     }
 
     // The size of the body *as received*, measured before any lossy decoding.

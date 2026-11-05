@@ -1136,12 +1136,10 @@ function buildURL(
   } catch (err) {
     if (err instanceof KinetexError) throw err;
 
-    // If URL parsing fails, try building params manually
-    if (full.includes("?")) {
-      full += "&";
-    } else {
-      full += "?";
-    }
+    // If URL parsing fails, build the query string by hand. `full` still
+    // carries no params at this point, so a `?` already present means the
+    // params continue the existing query with `&`.
+    full += full.includes("?") ? "&" : "?";
     const paramParts: string[] = [];
     forEachQueryParam(params ?? {}, (key, value, fromArray) => {
       const name = fromArray ? arrayKey(key) : key;
