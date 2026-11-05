@@ -1062,9 +1062,11 @@ describe("client pre-flight guards", () => {
   it("rejects unparseable URLs after param merging (redactUserInfo fallback)", async () => {
     // "99999" is a reserved/bad port — URL parsing throws both in buildURL and
     // in the safety check, forcing the manual-fallback + regex-redaction path.
+    // Params are required so the manual-concat fallback (not the no-params
+    // early return) is the code under test.
     const client = new Kinetex({ baseURL: "https://api.example.com" });
     await assert.rejects(
-      () => client.get("https://api.example.com:99999/p"),
+      () => client.get("https://api.example.com:99999/p", { params: { x: "1" } }),
       /safety check|EVALIDATION/i,
     );
     client.destroy();
