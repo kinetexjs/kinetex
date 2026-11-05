@@ -896,10 +896,15 @@ function encodeValue(
   }
 
   // After the scalar and array checks above, `value` is one of
-  // `Record<string, string>`, `null`, or `undefined`. `typeof` reports
-  // `"object"` for both `null` and the record, and the record is the only
-  // object shape left in `TemplateVars`, so `value !== null` narrows to it.
-  if (typeof value === "object" && value !== null) {
+  // `Record<string, string>`, `null`, or `undefined`. `null` and
+  // `undefined` fall through to the `return null` at the end; the only
+  // remaining value type is the plain record, detected without the
+  // `typeof === "object" && !== null` pattern that CodeQL flags.
+  if (
+    value !== null &&
+    value !== undefined &&
+    Object.prototype.toString.call(value) === "[object Object]"
+  ) {
     const entries = Object.entries(value as Record<string, string>);
     if (entries.length === 0) return null;
     if (explode) {

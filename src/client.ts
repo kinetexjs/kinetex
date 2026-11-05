@@ -1141,7 +1141,10 @@ function buildURL(
     // params continue the existing query with `&`.
     full += full.includes("?") ? "&" : "?";
     const paramParts: string[] = [];
-    forEachQueryParam(params ?? {}, (key, value, fromArray) => {
+    // The no-params branch returns early when `params` is undefined or empty,
+    // so at this point `params` is always a non-empty `QueryParams` — the
+    // nullish-coalescing fallback would be dead code.
+    forEachQueryParam(params, (key, value, fromArray) => {
       const name = fromArray ? arrayKey(key) : key;
       paramParts.push(`${encodeURIComponent(name)}=${encodeURIComponent(value)}`);
     });
