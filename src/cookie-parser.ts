@@ -2399,16 +2399,21 @@ export function splitSetCookieHeaders(raw: string): string[] {
     // `valueComplete` — and what follows looks like a
     // new `name=value` pair. It otherwise belongs to the value being read,
     // above all `Expires=Thu, 01 Jan 2099 00:00:00 GMT` (RFC 6265 §5.2).
-    if (char === "," && !inQuotedValue && nameComplete && !startsNewCookie(raw, i + 1)) {
-      // The comma belongs inside the value; absorb it.
-      buffer += char;
-      i++;
-      continue;
-    }
+    //
+    // `startsNewCookie` skips the whitespace after the comma and reports a
+    // true result when a new pair starts there, so the whole comma-handling
+    // branch is one `if / else if`: absorb the comma when it belongs inside
+    // the value, otherwise commit and advance.
     if (char === "," && !inQuotedValue && nameComplete) {
-      commitCookie();
-      while (i + 1 < raw.length && /\s/.test(raw[i + 1]!)) {
-        i++;
+      const beginsNext = startsNewCookie(raw, i + 1);
+      if (beginsNext) {
+        commitCookie();
+        while (i + 1 < raw.length && /\s/.test(raw[i + 1]!)) {
+          i++;
+        }
+      } else {
+        // The comma belongs to the value; absorb it.
+        buffer += char;
       }
       i++;
       continue;
