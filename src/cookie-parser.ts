@@ -2320,25 +2320,22 @@ export function formatSetCookieHeader(cookie: ParsedCookie): string {
  * @returns Array of individual Set-Cookie strings
  */
 /**
- * Decide whether a comma at `from` separates two cookies or is part of the
- * value currently being read.
+ * Decide whether a comma at `from` still belongs to the value currently
+ * being read.
  *
  * Looks ahead to the next `,` or `;` — the rest of the current value or
- * attribute — and reports whether that segment opens a `name=` pair. A
- * trailing comma with nothing after it also separates, so the empty tail is
- * dropped rather than kept as a value.
+ * attribute. A `;` or `,` in between means the segment still belongs to
+ * the value; a `name=` pair or a bare end of input separates.
  */
-function startsNewCookie(raw: string, from: number): boolean {
+function valueContinuesAfterComma(raw: string, from: number): boolean {
   let j = from;
   while (j < raw.length && (raw[j] === " " || raw[j] === "\t")) j++;
-  // Nothing but whitespace after the comma: a trailing separator.
-  if (j >= raw.length) return true;
   for (; j < raw.length; j++) {
     const c = raw[j]!;
-    if (c === ";" || c === ",") return false;
-    if (c === "=") return true;
+    if (c === ";" || c === ",") return true;
+    if (c === "=") return false;
   }
-  return false;
+  return true;
 }
 
 export function splitSetCookieHeaders(raw: string): string[] {
@@ -2349,7 +2346,6 @@ export function splitSetCookieHeaders(raw: string): string[] {
   let escaped = false;
   let nameComplete = false;
   let valueComplete = false;
-  let afterSemicolon = false;
 
   const commitCookie = () => {
     if (nameComplete && valueComplete && buffer.trim()) {
@@ -2358,7 +2354,6 @@ export function splitSetCookieHeaders(raw: string): string[] {
     buffer = "";
     nameComplete = false;
     valueComplete = false;
-    afterSemicolon = false;
   };
 
   while (i < raw.length) {
@@ -2397,27 +2392,25 @@ export function splitSetCookieHeaders(raw: string): string[] {
       continue;
     }
 
-    if (char === "," && !inQuotedValue && (afterSemicolon || valueComplete || nameComplete)) {
-      // A comma only separates cookies when what follows looks like a new
-      // `name=value` pair. It otherwise belongs to the value being read —
-      // above all `Expires=Thu, 01 Jan 2099 00:00:00 GMT`, the RFC 6265 §5.2
-      // date format, which is the reason this function exists at all.
-      //
-      // The test used to be "have we seen a value or an attribute yet", and
-      // that is true the instant the first `=` is read, so it committed on
-      // EVERY comma: a single cookie carrying an Expires was truncated to
-      // `a=1; Expires=Thu`, silently losing its expiry, and a collapsed
-      // two-cookie header was shredded into fragments such as
-      // `01 Jan 2099 00:00:00 GMT; Path=/; HttpOnly`.
-      const newCookie = startsNewCookie(raw, i + 1);
-      if (!newCookie) {
+    // Comma only separates cookies when `nameComplete` — which subsumes
+    // `valueComplete` — and what follows looks like a
+    // new `name=value` pair. It otherwise belongs to the value being read,
+    // above all `Expires=Thu, 01 Jan 2099 00:00:00 GMT` (RFC 6265 §5.2).
+    //
+    // `valueContinuesAfterComma` skips the whitespace after the comma and
+    // reports whether the segment that follows still belongs to the value
+    // being read; the branch is one positive test, so absorb the comma when
+    // the value continues, otherwise commit and advance.
+    if (char === "," && !inQuotedValue && nameComplete) {
+      const valueContinues = valueContinuesAfterComma(raw, i + 1);
+      if (valueContinues) {
+        // The comma belongs to the value; absorb it.
         buffer += char;
-        i++;
-        continue;
-      }
-      commitCookie();
-      while (i + 1 < raw.length && /\s/.test(raw[i + 1]!)) {
-        i++;
+      } else {
+        commitCookie();
+        while (i + 1 < raw.length && /\s/.test(raw[i + 1]!)) {
+          i++;
+        }
       }
       i++;
       continue;
@@ -2425,7 +2418,6 @@ export function splitSetCookieHeaders(raw: string): string[] {
 
     if (char === ";") {
       if (!nameComplete) nameComplete = true;
-      if (valueComplete) afterSemicolon = true;
       buffer += char;
       i++;
       continue;
