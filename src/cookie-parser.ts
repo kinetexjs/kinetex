@@ -2320,25 +2320,25 @@ export function formatSetCookieHeader(cookie: ParsedCookie): string {
  * @returns Array of individual Set-Cookie strings
  */
 /**
- * Decide whether a comma at `from` separates two cookies or is part of the
- * value currently being read.
+ * Decide whether a comma at `from` still belongs to the value currently
+ * being read.
  *
  * Looks ahead to the next `,` or `;` — the rest of the current value or
- * attribute — and reports whether that segment opens a `name=` pair. A
- * trailing comma with nothing after it also separates, so the empty tail is
- * dropped rather than kept as a value.
+ * attribute — and reports whether that segment continues the value. A
+ * trailing comma with nothing after it does not continue, so the empty
+ * tail is dropped rather than kept as a value.
  */
-function startsNewCookie(raw: string, from: number): boolean {
+function continuesCurrentCookie(raw: string, from: number): boolean {
   let j = from;
   while (j < raw.length && (raw[j] === " " || raw[j] === "\t")) j++;
   // Nothing but whitespace after the comma: a trailing separator.
-  if (j >= raw.length) return true;
+  if (j >= raw.length) return false;
   for (; j < raw.length; j++) {
     const c = raw[j]!;
-    if (c === ";" || c === ",") return false;
-    if (c === "=") return true;
+    if (c === ";" || c === ",") return true;
+    if (c === "=") return false;
   }
-  return false;
+  return true;
 }
 
 export function splitSetCookieHeaders(raw: string): string[] {
@@ -2400,20 +2400,20 @@ export function splitSetCookieHeaders(raw: string): string[] {
     // new `name=value` pair. It otherwise belongs to the value being read,
     // above all `Expires=Thu, 01 Jan 2099 00:00:00 GMT` (RFC 6265 §5.2).
     //
-    // `startsNewCookie` skips the whitespace after the comma and reports a
-    // true result when a new pair starts there, so the whole comma-handling
-    // branch is one `if / else if`: absorb the comma when it belongs inside
-    // the value, otherwise commit and advance.
+    // `continuesCurrentCookie` skips the whitespace after the comma and
+    // reports whether the segment that follows still belongs to the value
+    // being read; the branch is one positive test, so absorb the comma when
+    // the value continues, otherwise commit and advance.
     if (char === "," && !inQuotedValue && nameComplete) {
-      const beginsNext = startsNewCookie(raw, i + 1);
-      if (beginsNext) {
+      const continues = continuesCurrentCookie(raw, i + 1);
+      if (continues) {
+        // The comma belongs to the value; absorb it.
+        buffer += char;
+      } else {
         commitCookie();
         while (i + 1 < raw.length && /\s/.test(raw[i + 1]!)) {
           i++;
         }
-      } else {
-        // The comma belongs to the value; absorb it.
-        buffer += char;
       }
       i++;
       continue;
