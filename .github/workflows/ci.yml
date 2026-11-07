@@ -9,6 +9,7 @@ on:
   schedule:
     # Run tests every night at 02:00 UTC to catch upstream API changes
     - cron: "0 2 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
