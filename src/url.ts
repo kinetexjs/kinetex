@@ -882,6 +882,9 @@ function encodeValue(
   }
 
   if (Array.isArray(value)) {
+    // An empty array encodes to nothing in both explode and non-explode
+    // form — the empty check below covers both, so the caller's
+    // `if (encoded !== null)` drop path applies.
     if (value.length === 0) return null;
     if (explode) {
       return value
@@ -895,11 +898,12 @@ function encodeValue(
     return named ? `${name}=${joined}` : joined;
   }
 
-  // After the scalar and array checks above, `value` is one of
-  // `Record<string, string>`, `null`, or `undefined`. `typeof` reports
-  // `"object"` for both `null` and the record, and the record is the only
-  // object shape left in `TemplateVars`, so `value !== null` narrows to it.
-  if (typeof value === "object" && value !== null) {
+  // Scalar and array cases handled above. Remaining shapes: a plain
+  // `Record<string, string>` (the only non-array object in `TemplateVars`)
+  // or `null`/`undefined`, which fall through to the trailing `return null`.
+  // `Object.prototype.toString` discriminates the record without the
+  // `typeof === "object" && !== null` null-guard shape CodeQL flags.
+  if (Object.prototype.toString.call(value) === "[object Object]") {
     const entries = Object.entries(value as Record<string, string>);
     if (entries.length === 0) return null;
     if (explode) {

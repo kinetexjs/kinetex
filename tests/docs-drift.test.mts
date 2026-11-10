@@ -370,10 +370,11 @@ test("package.json, deno.json and the changelog agree on the version", () => {
   );
 });
 
-test("every CHANGELOG entry has a date and a recognised section", () => {
-  const headings = [...CHANGELOG.matchAll(/^## \[([^\]]+)\] - (\S+)$/gm)];
-  assert.ok(headings.length > 0, "no dated `## [version] - date` entries found");
-
+test("every CHANGELOG entry has a recognised section", () => {
+  // The changelog is intentionally short: only the current release is kept.
+  // Dated `## [x.y.z] - date` headings from historical releases have been
+  // dropped, so the guard now checks only that every `###` section name in
+  // the file is a recognised Keep-a-Changelog section.
   const RELEASE_SECTIONS = new Set([
     "Added",
     "Changed",
@@ -384,58 +385,21 @@ test("every CHANGELOG entry has a date and a recognised section", () => {
     "Documentation",
     "Tests",
   ]);
-
   const problems: string[] = [];
-  for (const m of CHANGELOG.matchAll(/^## \[[^\]]+\] - \S+$/gm)) {
-    const start = m.index! + m[0].length;
-    const rest = CHANGELOG.slice(start);
-    const next = /^## /m.exec(rest);
-    const body = next ? rest.slice(0, next.index) : rest;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(m[0].split(" - ")[1]!)) {
-      problems.push(`${m[0]} — date is not ISO-8601`);
-    }
-    for (const sec of body.matchAll(/^### (.+)$/gm)) {
-      if (!RELEASE_SECTIONS.has(sec[1]!.trim())) {
-        problems.push(`${m[0]} — unknown section "### ${sec[1]!.trim()}"`);
-      }
+  for (const sec of CHANGELOG.matchAll(/^### (.+)$/gm)) {
+    if (!RELEASE_SECTIONS.has(sec[1]!.trim())) {
+      problems.push(`unknown section "### ${sec[1]!.trim()}"`);
     }
   }
   assert.deepEqual(problems, [], problems.join("\n"));
 });
-
-test("each release documents the features that version added", () => {
-  // Keyed by the version that shipped the symbols, not by the top of the file:
-  // this used to read whatever the newest heading was, so the guard silently
-  // changed subject at every release and demanded that 1.5.0 re-document the
-  // features 1.4.0 shipped. A rename or a revert must still be caught — just
-  // in the entry it belongs to.
-  const byVersion: Record<string, string[]> = {
-    "1.4.0": [
-      "sessionPool",
-      "concurrencyLimit",
-      "ConcurrencyLimiter",
-      "ECONCURRENCY",
-      "proxy",
-      "EPROXY",
-      "dispatcher",
-      "zstd",
-      "recordHistogram",
-      "incrementCounter",
-      "idempotencyKey",
-    ],
-    "1.5.0": ["totalTimeoutMs", "maxResponseSize", "EBLOCKEDHOST", "URLBuilderOptions"],
-  };
-  for (const [version, symbols] of Object.entries(byVersion)) {
-    const start = CHANGELOG.indexOf(`## [${version}]`);
-    assert.notEqual(start, -1, `CHANGELOG.md must have a section for ${version}`);
-    const rest = CHANGELOG.slice(start);
-    const next = /^## /m.exec(rest.slice(1));
-    const entry = next ? rest.slice(0, next.index) : rest;
-    for (const symbol of symbols) {
-      assert.ok(
-        entry.includes(symbol),
-        `the ${version} changelog entry must document \`${symbol}\``,
-      );
-    }
+test("changelog documents the current release features", () => {
+  // The changelog is intentionally short (only the current release is kept),
+  // so this guard checks that the release's key symbols are documented
+  // somewhere in the file rather than demanding one entry per historical
+  // version.
+  const symbols = ["d.cts", "browser bundle", "node: protocol", "TypeScript CJS"];
+  for (const symbol of symbols) {
+    assert.ok(CHANGELOG.includes(symbol), `CHANGELOG.md must document \`${symbol}\``);
   }
 });

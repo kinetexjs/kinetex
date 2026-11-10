@@ -2324,12 +2324,15 @@ export function formatSetCookieHeader(cookie: ParsedCookie): string {
  * being read.
  *
  * Looks ahead to the next `,` or `;` — the rest of the current value or
- * attribute. A `;` or `,` in between means the segment still belongs to
- * the value; a `name=` pair or a bare end of input separates.
+ * attribute — and reports whether that segment continues the value. A
+ * trailing comma with nothing after it does not continue, so the empty
+ * tail is dropped rather than kept as a value.
  */
-function valueContinuesAfterComma(raw: string, from: number): boolean {
+function continuesCurrentCookie(raw: string, from: number): boolean {
   let j = from;
   while (j < raw.length && (raw[j] === " " || raw[j] === "\t")) j++;
+  // Nothing but whitespace after the comma: a trailing separator.
+  if (j >= raw.length) return false;
   for (; j < raw.length; j++) {
     const c = raw[j]!;
     if (c === ";" || c === ",") return true;
@@ -2397,13 +2400,13 @@ export function splitSetCookieHeaders(raw: string): string[] {
     // new `name=value` pair. It otherwise belongs to the value being read,
     // above all `Expires=Thu, 01 Jan 2099 00:00:00 GMT` (RFC 6265 §5.2).
     //
-    // `valueContinuesAfterComma` skips the whitespace after the comma and
+    // `continuesCurrentCookie` skips the whitespace after the comma and
     // reports whether the segment that follows still belongs to the value
     // being read; the branch is one positive test, so absorb the comma when
     // the value continues, otherwise commit and advance.
     if (char === "," && !inQuotedValue && nameComplete) {
-      const valueContinues = valueContinuesAfterComma(raw, i + 1);
-      if (valueContinues) {
+      const continues = continuesCurrentCookie(raw, i + 1);
+      if (continues) {
         // The comma belongs to the value; absorb it.
         buffer += char;
       } else {
